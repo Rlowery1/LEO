@@ -1,0 +1,20 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "AAA Traffic",
+  "Description": "AAA_Traffic plugin.",
+  "Category": "Gameplay",
+  "CreatedBy": "Rlowery1",
+  "CreatedByURL": "https://github.com/Rlowery1/LEO",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "AAA_Traffic",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ]
+}

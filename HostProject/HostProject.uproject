@@ -1,0 +1,19 @@
+{
+  "FileVersion": 3,
+  "EngineAssociation": "5.7",
+  "Category": "",
+  "Description": "Minimal host project used for building the AAA_Traffic plugin in CI.",
+  "Plugins": [
+    {
+      "Name": "AAA_Traffic",
+      "Enabled": true
+    },
+    {
+      "Name": "EnhancedInput",
+      "Enabled": true
+    }
+  ],
+  "AdditionalPluginDirectories": [
+    "../Plugins"
+  ]
+}

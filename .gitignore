@@ -1,0 +1,35 @@
+# Unreal Engine / Visual Studio
+.vs/
+
+# Build outputs
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Plugin build outputs
+Plugins/**/Binaries/
+Plugins/**/Intermediate/
+
+# IDE / user settings
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+.vsconfig
+
+# OS cruft
+Thumbs.db
+.DS_Store
+
+# Common generated
+*.log
+
+# Never commit UE content in this repo (code-only plugin)
+*.uasset
+*.umap
