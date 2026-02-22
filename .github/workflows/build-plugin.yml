@@ -1,0 +1,65 @@
+name: Build AAA_Traffic Plugin
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+  workflow_dispatch:
+
+jobs:
+  build-win64:
+    name: Build (Win64)
+
+    # Security: this repo is public; do not run untrusted fork PR code on a self-hosted machine.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+    runs-on: [self-hosted, windows, x64, ue5-7]
+
+    env:
+      UE_ROOT: C:\Program Files\Epic Games\UE_5.7
+      PLUGIN_UPLUGIN: ${{ github.workspace }}\Plugins\AAA_Traffic\AAA_Traffic.uplugin
+      PACKAGE_DIR: ${{ github.workspace }}\Artifacts\AAA_Traffic
+      ZIP_PATH: ${{ github.workspace }}\Artifacts\AAA_Traffic_Win64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Unreal Automation Tool
+        shell: pwsh
+        run: |
+          $uat = Join-Path $env:UE_ROOT 'Engine\Build\BatchFiles\RunUAT.bat'
+          if (-not (Test-Path $uat)) {
+            throw "RunUAT not found at: $uat. Update UE_ROOT in the workflow to match your UE install."
+          }
+          if (-not (Test-Path $env:PLUGIN_UPLUGIN)) {
+            throw "Plugin descriptor not found at: $env:PLUGIN_UPLUGIN"
+          }
+
+      - name: BuildPlugin (Win64)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $env:PACKAGE_DIR) | Out-Null
+          $uat = Join-Path $env:UE_ROOT 'Engine\Build\BatchFiles\RunUAT.bat'
+
+          & $uat BuildPlugin `
+            -Rocket `
+            -Plugin="$env:PLUGIN_UPLUGIN" `
+            -Package="$env:PACKAGE_DIR" `
+            -TargetPlatforms=Win64
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Zip packaged plugin
+        shell: pwsh
+        run: |
+          if (Test-Path $env:ZIP_PATH) { Remove-Item -Force $env:ZIP_PATH }
+          Compress-Archive -Path "$env:PACKAGE_DIR\*" -DestinationPath $env:ZIP_PATH -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AAA_Traffic_Win64
+          path: ${{ env.ZIP_PATH }}
+          if-no-files-found: error

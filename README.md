@@ -11,6 +11,11 @@ Public, code-only plugin repo.
 
 - Unreal Engine 5.7 (or compatible)
 
+## CI (GitHub Actions)
+
+This repo is set up to build on a **self-hosted Windows runner** with UE 5.7 installed.
+The workflow expects UE at `C:\\Program Files\\Epic Games\\UE_5.7` (see `.github/workflows/build-plugin.yml`).
+
 ## Local build (manual)
 
 Open `HostProject/HostProject.uproject` in Unreal Editor and let it compile.
