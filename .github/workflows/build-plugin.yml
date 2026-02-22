@@ -19,12 +19,24 @@ jobs:
     env:
       UE_ROOT: C:\Program Files\Epic Games\UE_5.7
       PLUGIN_UPLUGIN: ${{ github.workspace }}\Plugins\AAA_Traffic\AAA_Traffic.uplugin
-      PACKAGE_DIR: ${{ github.workspace }}\Artifacts\AAA_Traffic
-      ZIP_PATH: ${{ github.workspace }}\Artifacts\AAA_Traffic_Win64.zip
+      ARTIFACTS_DIR: ${{ github.workspace }}\Artifacts
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Determine channel (dev vs main)
+        shell: pwsh
+        run: |
+          # For push: use the branch that was pushed.
+          # For PR: use the target branch (base) so PRs into dev build as 'dev', etc.
+          $channel = if ($env:GITHUB_EVENT_NAME -eq 'pull_request') { $env:GITHUB_BASE_REF } else { $env:GITHUB_REF_NAME }
+          if ([string]::IsNullOrWhiteSpace($channel)) { $channel = 'unknown' }
+
+          "CHANNEL=$channel" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PACKAGE_DIR=$($env:ARTIFACTS_DIR)\\AAA_Traffic_$channel" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ZIP_PATH=$($env:ARTIFACTS_DIR)\\AAA_Traffic_Win64_$channel.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ARTIFACT_NAME=AAA_Traffic_Win64_$channel" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Verify Unreal Automation Tool
         shell: pwsh
@@ -36,11 +48,11 @@ jobs:
           if (-not (Test-Path $env:PLUGIN_UPLUGIN)) {
             throw "Plugin descriptor not found at: $env:PLUGIN_UPLUGIN"
           }
+          New-Item -ItemType Directory -Force -Path $env:ARTIFACTS_DIR | Out-Null
 
       - name: BuildPlugin (Win64)
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $env:PACKAGE_DIR) | Out-Null
           $uat = Join-Path $env:UE_ROOT 'Engine\Build\BatchFiles\RunUAT.bat'
 
           & $uat BuildPlugin `
@@ -60,6 +72,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AAA_Traffic_Win64
+          name: ${{ env.ARTIFACT_NAME }}
           path: ${{ env.ZIP_PATH }}
           if-no-files-found: error
