@@ -2,12 +2,30 @@
 
 These instructions are **non-negotiable**. They are derived from `System.md` in this repo and exist so Copilot follows the same contract automatically.
 
+Canonical contract source: `System.md` (repo root).
+
 ## Authority & Verification
 - Never claim a build/package is successful unless verified by CI logs/artifacts.
 - Use these statuses:
   - **VERIFIED**: CI exit code == 0 and no fatal/compiler errors in artifacts
   - **FAILED**: CI exit code != 0 or compiler errors in artifacts
   - **UNVERIFIED**: CI not executed or no artifacts available
+
+## Response Protocol (Required)
+Before finalizing any implementation response, internally simulate these passes:
+
+- **PASS 1 — ARCHITECT**: validate structural fit, module impact, acceptance criteria
+- **PASS 2 — IMPLEMENTER**: minimal diffs only; avoid unrelated refactors
+- **PASS 3 — REVIEWER**: check reflection macros, module boundaries, determinism, perf safety, marketplace compliance
+- **PASS 4 — OPERATIONS**: predict CI impact; assign **VERIFIED / FAILED / UNVERIFIED**
+
+Final output must contain the following sections (even if brief):
+
+- Summary
+- Assumptions (if any)
+- File-by-file patch (what changed, where)
+- CI Impact
+- Verification Status (**VERIFIED / FAILED / UNVERIFIED**)
 
 ## Structural Boundaries (Repo Layout)
 - Treat this layout as authoritative:
@@ -17,6 +35,21 @@ These instructions are **non-negotiable**. They are derived from `System.md` in 
   - `.github/workflows/`
 - Do **not** invent modules/folders or casually rename public API symbols.
 - Do not modify `.uplugin` structure without clear justification.
+
+## Workflow (Local Dev + Export)
+
+This repo (`PublicRepoExport/`) is the published GitHub repo snapshot.
+It is the source of truth for what gets pushed and what CI builds.
+
+Local development may happen in the larger outer Unreal workspace (with extra local-only plugins).
+In that case, use this workflow to avoid mixing:
+
+1) Develop + integration-test in the outer project (`AAA_Traffic.uproject`) if it needs extra plugins.
+2) Export/copy only the shippable plugin changes into this repo under `Plugins/AAA_Traffic/`.
+3) CI validation runs by building `HostProject/HostProject.uproject` in a clean environment.
+
+Rule:
+- Treat `HostProject` as the clean build harness (CI). Treat the outer project as the integration sandbox.
 
 ## Engineering Requirements (UE 5.7+)
 - Core simulation/runtime logic must be in **C++**.
@@ -29,7 +62,7 @@ These instructions are **non-negotiable**. They are derived from `System.md` in 
 ## Determinism Requirements
 - With the same seed + initial state + config, the system must produce identical decisions.
 - Randomness:
-  - Forbidden: `FMath::Rand*`, unseeded randomness.
+  - Forbidden: `FMath::Rand()` family functions, unseeded randomness.
   - Required: `FRandomStream` with an explicit, configurable/stable seed.
 - Frame independence:
   - Avoid frame-rate dependent decision logic.
