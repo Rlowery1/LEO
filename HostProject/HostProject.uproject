@@ -3,6 +3,13 @@
   "EngineAssociation": "5.7",
   "Category": "",
   "Description": "Minimal host project used for building the AAA_Traffic plugin in CI.",
+  "Modules": [
+    {
+      "Name": "HostProject",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ],
   "Plugins": [
     {
       "Name": "AAA_Traffic",

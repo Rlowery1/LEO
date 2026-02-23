@@ -86,7 +86,7 @@ Heavy runtime logic in Blueprint is prohibited unless explicitly requested.
 Runtime modules must not:
 - Include editor headers
 - Depend on editor modules
-- Leak WITH_EDITOR code paths into runtime builds
+- Allow WITH_EDITOR code paths to execute in runtime builds
 
 Editor functionality must be isolated or explicitly guarded.
 
@@ -112,7 +112,7 @@ The traffic system must produce identical decisions.
 4.2 Randomness Restrictions
 
 Forbidden:
-- FMath::Rand* usage
+- FMath::Rand() and related functions usage
 - Unseeded randomness
 
 Required:
