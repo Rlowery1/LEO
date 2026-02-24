@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
+#include "Engine/TimerHandle.h"
 #include "TrafficSubsystem.generated.h"
 
 class ITrafficRoadProvider;
@@ -22,6 +23,8 @@ class AAA_TRAFFIC_API UTrafficSubsystem : public UWorldSubsystem
 	GENERATED_BODY()
 
 public:
+	UTrafficSubsystem();
+
 	// --- USubsystem interface ---
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;

@@ -158,7 +158,10 @@ void ATrafficSpawner::SpawnVehicles()
 			float FinalSpeed = VehicleSpeed;
 			if (SpeedVariation > KINDA_SMALL_NUMBER)
 			{
-				FRandomStream SpeedRng(SpawnSeed + i + 10000);
+				// Offset keeps this RNG stream disjoint from the controller RNG (SpawnSeed + i),
+				// improving seed hygiene and avoiding accidental cross-stream collisions.
+				constexpr int32 SpeedVariationSeedOffset = 10000;
+				FRandomStream SpeedRng(SpawnSeed + i + SpeedVariationSeedOffset);
 				const float VariationFraction = SpeedVariation / 100.0f;
 				const float Offset = SpeedRng.FRandRange(-VariationFraction, VariationFraction);
 				FinalSpeed = VehicleSpeed * (1.0f + Offset);

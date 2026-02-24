@@ -11,14 +11,16 @@
 
 DEFINE_LOG_CATEGORY(LogAAATraffic);
 
+UTrafficSubsystem::UTrafficSubsystem()
+	: DespawnDistance(50000.f)		// 500m
+	, DespawnCheckInterval(1.0f)		// once per second
+	, bDespawnDeadEndVehicles(true)
+{
+}
+
 void UTrafficSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
-
-	// Set defaults.
-	DespawnDistance = 50000.f;		// 500m
-	DespawnCheckInterval = 1.0f;		// once per second
-	bDespawnDeadEndVehicles = true;
 }
 
 void UTrafficSubsystem::Deinitialize()
@@ -141,13 +143,12 @@ void UTrafficSubsystem::PerformDespawnSweep()
 		}
 	}
 
-	// If no players, skip — don't despawn everything.
-	if (PlayerPositions.IsEmpty()) return;
-
 	const float DespawnDistSq = DespawnDistance * DespawnDistance;
+	const bool bHasPlayers = !PlayerPositions.IsEmpty();
 
 	// Collect vehicles to despawn (can't modify set during iteration).
 	TArray<ATrafficVehicleController*> ToDespawn;
+	TArray<FString> DespawnReasons;
 
 	for (auto It = ActiveVehicles.CreateIterator(); It; ++It)
 	{
@@ -172,32 +173,35 @@ void UTrafficSubsystem::PerformDespawnSweep()
 			if (Speed < 10.0f) // Nearly stopped
 			{
 				ToDespawn.Add(Controller);
+				DespawnReasons.Add(TEXT("dead-end stopped"));
 				continue;
 			}
 		}
 
-		// Check 2: distance from nearest player.
+		// Check 2: distance from nearest player (skip if no players present).
+		if (!bHasPlayers) continue;
+
 		const FVector VehicleLoc = VehiclePawn->GetActorLocation();
-		bool bInRange = false;
+		float NearestDistSq = MAX_flt;
 		for (const FVector& PlayerLoc : PlayerPositions)
 		{
-			if (FVector::DistSquared(VehicleLoc, PlayerLoc) < DespawnDistSq)
-			{
-				bInRange = true;
-				break;
-			}
+			NearestDistSq = FMath::Min(NearestDistSq, FVector::DistSquared(VehicleLoc, PlayerLoc));
 		}
 
-		if (!bInRange)
+		if (NearestDistSq >= DespawnDistSq)
 		{
 			ToDespawn.Add(Controller);
+			DespawnReasons.Add(FString::Printf(TEXT("%.0f cm from nearest player"), FMath::Sqrt(NearestDistSq)));
 		}
 	}
 
 	// Destroy collected vehicles.
-	for (ATrafficVehicleController* Controller : ToDespawn)
+	for (int32 Idx = 0; Idx < ToDespawn.Num(); ++Idx)
 	{
+		ATrafficVehicleController* Controller = ToDespawn[Idx];
 		APawn* VehiclePawn = Controller->GetPawn();
+		const FString VehicleName = VehiclePawn ? VehiclePawn->GetName() : TEXT("unknown");
+
 		Controller->UnPossess();
 
 		if (VehiclePawn)
@@ -206,6 +210,8 @@ void UTrafficSubsystem::PerformDespawnSweep()
 		}
 		Controller->Destroy();
 
-		UE_LOG(LogAAATraffic, Log, TEXT("TrafficSubsystem: Despawned vehicle."));
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("TrafficSubsystem: Despawned vehicle '%s' — reason: %s."),
+			*VehicleName, *DespawnReasons[Idx]);
 	}
 }
