@@ -31,7 +31,14 @@ void ATrafficSpawner::SpawnVehicles()
 		return;
 	}
 
-	UTrafficSubsystem* TrafficSub = GetWorld()->GetSubsystem<UTrafficSubsystem>();
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error, TEXT("TrafficSpawner: World is null in SpawnVehicles."));
+		return;
+	}
+
+	UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>();
 	ITrafficRoadProvider* Provider = TrafficSub ? TrafficSub->GetProvider() : nullptr;
 	if (!Provider)
 	{
@@ -60,7 +67,6 @@ void ATrafficSpawner::SpawnVehicles()
 		return;
 	}
 
-	FRandomStream SpawnRandom(SpawnSeed);
 	const int32 SpawnCount = FMath::Min(VehicleCount, AllLanes.Num());
 
 	UE_LOG(LogTemp, Log,
@@ -90,7 +96,7 @@ void ATrafficSpawner::SpawnVehicles()
 		SpawnParams.SpawnCollisionHandlingOverride =
 			ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
 
-		APawn* Vehicle = GetWorld()->SpawnActor<APawn>(VehicleClass, SpawnTransform, SpawnParams);
+		APawn* Vehicle = World->SpawnActor<APawn>(VehicleClass, SpawnTransform, SpawnParams);
 		if (!Vehicle)
 		{
 			UE_LOG(LogTemp, Warning,
@@ -100,9 +106,10 @@ void ATrafficSpawner::SpawnVehicles()
 
 		// Spawn our AI controller and possess the vehicle.
 		ATrafficVehicleController* Controller =
-			GetWorld()->SpawnActor<ATrafficVehicleController>();
+			World->SpawnActor<ATrafficVehicleController>();
 		if (Controller)
 		{
+			Controller->SetTargetSpeed(VehicleSpeed);
 			Controller->Possess(Vehicle);
 			Controller->InitializeLaneFollowing(Lane);
 

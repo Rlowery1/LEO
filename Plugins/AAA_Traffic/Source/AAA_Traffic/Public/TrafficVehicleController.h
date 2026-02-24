@@ -29,6 +29,9 @@ public:
 	 */
 	void InitializeLaneFollowing(const FTrafficLaneHandle& InLane);
 
+	/** Set the target speed for this controller (cm/s). */
+	void SetTargetSpeed(float InSpeed);
+
 protected:
 	virtual void OnPossess(APawn* InPawn) override;
 	virtual void Tick(float DeltaSeconds) override;
@@ -67,10 +70,16 @@ private:
 	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "100"))
 	float LookAheadDistance;
 
-	/** Seed for deterministic random decisions. */
+	/**
+	 * Seed for deterministic random decisions.
+	 * Reserved for future use (e.g. lane choice at intersections).
+	 */
 	UPROPERTY(EditAnywhere, Category = "Traffic")
 	int32 RandomSeed;
 
-	/** Deterministic random stream (seeded from RandomSeed). */
+	/**
+	 * Deterministic random stream (seeded from RandomSeed).
+	 * Reserved for future lane-choice / gap-acceptance randomization.
+	 */
 	FRandomStream RandomStream;
 };

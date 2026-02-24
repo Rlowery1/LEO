@@ -15,12 +15,23 @@ ATrafficVehicleController::ATrafficVehicleController()
 	PrimaryActorTick.bCanEverTick = true;
 }
 
+void ATrafficVehicleController::SetTargetSpeed(float InSpeed)
+{
+	TargetSpeed = FMath::Max(0.0f, InSpeed);
+}
+
 void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle& InLane)
 {
 	CurrentLane = InLane;
 	bLaneDataReady = false;
 
-	UTrafficSubsystem* TrafficSub = GetWorld()->GetSubsystem<UTrafficSubsystem>();
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("TrafficVehicleController: World is null, cannot initialize lane following."));
+		return;
+	}
+	UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>();
 	ITrafficRoadProvider* Provider = TrafficSub ? TrafficSub->GetProvider() : nullptr;
 	if (!Provider)
 	{
@@ -93,6 +104,15 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	const float SteeringInput = FMath::Clamp(CrossZ * 2.0f, -1.0f, 1.0f);
 
 	// --- Throttle / Brake ---
+	// Guard against TargetSpeed == 0 to prevent division by zero.
+	if (TargetSpeed <= KINDA_SMALL_NUMBER)
+	{
+		VehicleMovement->SetThrottleInput(0.0f);
+		VehicleMovement->SetSteeringInput(SteeringInput);
+		VehicleMovement->SetBrakeInput(1.0f);
+		return;
+	}
+
 	const float SpeedError = TargetSpeed - FMath::Abs(CurrentSpeed);
 	float ThrottleInput = FMath::Clamp(SpeedError / TargetSpeed, 0.0f, 1.0f);
 	float BrakeInput = 0.0f;

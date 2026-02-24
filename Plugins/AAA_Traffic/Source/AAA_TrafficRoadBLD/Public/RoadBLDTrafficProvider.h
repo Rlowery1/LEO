@@ -24,7 +24,7 @@ class UDynamicRoadLane;
  * but does nothing — ShouldCreateSubsystem returns false.
  */
 UCLASS()
-class URoadBLDTrafficProvider : public UWorldSubsystem, public ITrafficRoadProvider
+class AAA_TRAFFICROADBLD_API URoadBLDTrafficProvider : public UWorldSubsystem, public ITrafficRoadProvider
 {
 	GENERATED_BODY()
 

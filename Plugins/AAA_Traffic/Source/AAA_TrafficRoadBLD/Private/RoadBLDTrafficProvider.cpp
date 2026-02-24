@@ -8,6 +8,7 @@
 #include "DynamicRoadNetwork.h"
 #include "DynamicRoadLane.h"
 #include "EdgeCurve.h"
+#include "ClothoidCurve.h"       // UCurveObject (base of UEdgeCurve, UReferenceLine)
 #include "RoadUtilityLibrary.h"
 #include "EngineUtils.h"         // TActorIterator
 #endif
@@ -37,9 +38,12 @@ void URoadBLDTrafficProvider::Initialize(FSubsystemCollectionBase& Collection)
 void URoadBLDTrafficProvider::Deinitialize()
 {
 #if WITH_ROADBLD
-	if (UTrafficSubsystem* TrafficSub = GetWorld()->GetSubsystem<UTrafficSubsystem>())
+	if (UWorld* World = GetWorld())
 	{
-		TrafficSub->UnregisterProvider(this);
+		if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
+		{
+			TrafficSub->UnregisterProvider(this);
+		}
 	}
 
 	RoadHandleMap.Empty();
@@ -86,13 +90,30 @@ void URoadBLDTrafficProvider::CacheRoadData()
 		break;
 	}
 
+	// Collect all roads and sort by name for deterministic handle assignment.
+	// TActorIterator order is non-deterministic — sorting ensures stable IDs
+	// across runs with the same world state (System.md §4.4).
+	TArray<ADynamicRoad*> SortedRoads;
 	for (TActorIterator<ADynamicRoad> It(World); It; ++It)
 	{
-		ADynamicRoad* Road = *It;
+		SortedRoads.Add(*It);
+	}
+	SortedRoads.Sort([](const ADynamicRoad* A, const ADynamicRoad* B)
+	{
+		return A->GetName() < B->GetName();
+	});
+
+	for (ADynamicRoad* Road : SortedRoads)
+	{
 		const int32 RoadId = NextHandleId++;
 		RoadHandleMap.Add(RoadId, Road);
 
 		TArray<UDynamicRoadLane*> Lanes = Road->GetAllLanes();
+		// Sort lanes by name for deterministic ordering.
+		Lanes.Sort([](const UDynamicRoadLane* A, const UDynamicRoadLane* B)
+		{
+			return A->GetName() < B->GetName();
+		});
 		for (UDynamicRoadLane* Lane : Lanes)
 		{
 			if (!Lane) continue;
@@ -153,15 +174,18 @@ bool URoadBLDTrafficProvider::GetLanePath(
 
 	OutWidth = static_cast<float>(RoadLane->LaneWidth);
 
+	// Build centerline from the lane's own left/right edge curves.
+	// The midpoint of the two edges at each sample gives the true lane center,
+	// avoiding the P1 bug where all lanes shared the road reference line.
+	UEdgeCurve* LeftEdge = RoadLane->LeftEdgeCurve;
+	UEdgeCurve* RightEdge = RoadLane->RightEdgeCurve;
+
 	ADynamicRoad* Road = GetRoadForLane(RoadLane);
 	if (!Road) return false;
 
 	const double RoadLength = Road->GetLength();
 	if (RoadLength <= 0.0) return false;
 
-	// Sample the road reference line at 1-meter intervals.
-	// TODO: Offset each sample laterally to the lane's actual centerline
-	//       once we confirm the edge-curve midpoint sampling API.
 	const double SampleInterval = 100.0; // 1 m in UE units (cm)
 	const int32 NumSamples = FMath::Max(2, FMath::CeilToInt(RoadLength / SampleInterval) + 1);
 
@@ -172,7 +196,37 @@ bool URoadBLDTrafficProvider::GetLanePath(
 			RoadLength,
 			(RoadLength * static_cast<double>(i)) / static_cast<double>(NumSamples - 1));
 
-		const FVector Pos = Road->GetWorldPositionAtDistance(Distance);
+		FVector Pos;
+
+		if (LeftEdge && RightEdge && Road->ReferenceLine)
+		{
+			// Convert distance from reference-line space to each edge curve's space.
+			const double LeftDist = Road->ConvertDistanceBetweenCurves(
+				Road->ReferenceLine, LeftEdge, Distance);
+			const double RightDist = Road->ConvertDistanceBetweenCurves(
+				Road->ReferenceLine, RightEdge, Distance);
+
+			// UCurveObject::Get3DPositionAtDistance returns FVector (3D world pos).
+			const FVector LeftPos = LeftEdge->Get3DPositionAtDistance(
+				Road->ReferenceLine, LeftDist);
+			const FVector RightPos = RightEdge->Get3DPositionAtDistance(
+				Road->ReferenceLine, RightDist);
+
+			Pos = (LeftPos + RightPos) * 0.5;
+		}
+		else if (Road->ReferenceLine)
+		{
+			// Fallback: use road reference line if edge curves unavailable.
+			Pos = Road->ReferenceLine->Get3DPositionAtDistance(
+				Road->ReferenceLine, Distance);
+		}
+		else
+		{
+			// Last-resort fallback: 2D position from road actor.
+			const FVector2D Pos2D = Road->GetWorldPositionAtDistance(Distance);
+			Pos = FVector(Pos2D.X, Pos2D.Y, Road->GetActorLocation().Z);
+		}
+
 		OutPoints.Add(Pos);
 	}
 
@@ -202,9 +256,14 @@ TArray<FTrafficLaneHandle> URoadBLDTrafficProvider::GetConnectedLanes(const FTra
 
 FTrafficLaneHandle URoadBLDTrafficProvider::GetLaneAtLocation(const FVector& Location)
 {
-	for (const auto& Pair : RoadHandleMap)
+	// Sort road handle keys for deterministic iteration order (System.md §4.4).
+	TArray<int32> Keys;
+	RoadHandleMap.GetKeys(Keys);
+	Keys.Sort();
+
+	for (const int32 Key : Keys)
 	{
-		ADynamicRoad* Road = Pair.Value.Get();
+		ADynamicRoad* Road = RoadHandleMap[Key].Get();
 		if (!Road) continue;
 
 		UDynamicRoadLane* Lane = URoadUtilityLibrary::GetLaneAtLocation(Road, Location);
