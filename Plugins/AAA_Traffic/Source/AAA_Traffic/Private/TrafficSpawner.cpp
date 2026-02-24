@@ -8,6 +8,10 @@
 #include "Engine/World.h"
 #include "TimerManager.h"
 
+#if ENABLE_DRAW_DEBUG
+#include "DrawDebugHelpers.h"
+#endif
+
 ATrafficSpawner::ATrafficSpawner()
 	: VehicleCount(1)
 	, VehicleSpeed(1500.f)
@@ -16,7 +20,8 @@ ATrafficSpawner::ATrafficSpawner()
 	, SpawnSpacing(1500.f)
 	, SpeedVariation(15.f)
 {
-	PrimaryActorTick.bCanEverTick = false;
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bStartWithTickEnabled = false;
 }
 
 void ATrafficSpawner::BeginPlay()
@@ -25,7 +30,111 @@ void ATrafficSpawner::BeginPlay()
 
 	// Defer to next tick so adapter subsystems have finished OnWorldBeginPlay registration.
 	GetWorldTimerManager().SetTimerForNextTick(this, &ATrafficSpawner::SpawnVehicles);
+
+#if ENABLE_DRAW_DEBUG
+	if (bDebugDrawLanes)
+	{
+		SetActorTickEnabled(true);
+	}
+#endif
 }
+
+void ATrafficSpawner::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+
+#if ENABLE_DRAW_DEBUG
+	if (!bDebugDrawLanes)
+	{
+		return;
+	}
+
+	if (!bDebugCacheReady)
+	{
+		CacheDebugLaneData();
+	}
+
+	if (bDebugCacheReady)
+	{
+		DrawDebugLanes();
+	}
+#endif
+}
+
+#if ENABLE_DRAW_DEBUG
+void ATrafficSpawner::CacheDebugLaneData()
+{
+	UWorld* World = GetWorld();
+	if (!World) { return; }
+
+	UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>();
+	ITrafficRoadProvider* Provider = TrafficSub ? TrafficSub->GetProvider() : nullptr;
+	if (!Provider) { return; }
+
+	TArray<FTrafficRoadHandle> Roads = Provider->GetAllRoads();
+	if (Roads.IsEmpty()) { return; }
+
+	DebugLanes.Reset();
+
+	for (const FTrafficRoadHandle& Road : Roads)
+	{
+		TArray<FTrafficLaneHandle> Lanes = Provider->GetLanesForRoad(Road);
+		for (const FTrafficLaneHandle& Lane : Lanes)
+		{
+			TArray<FVector> Points;
+			float Width;
+			if (!Provider->GetLanePath(Lane, Points, Width) || Points.Num() < 2)
+			{
+				continue;
+			}
+
+			const FVector Dir = Provider->GetLaneDirection(Lane);
+			// A "reverse" lane has its direction roughly opposite to the polyline
+			// direction (start→end). Used only for coloring.
+			const FVector PolyDir = (Points.Last() - Points[0]).GetSafeNormal();
+			const bool bReverse = FVector::DotProduct(Dir, PolyDir) < 0.0f;
+
+			FDebugLaneData& Entry = DebugLanes.AddDefaulted_GetRef();
+			Entry.Points = MoveTemp(Points);
+			Entry.bIsReverseLane = bReverse;
+		}
+	}
+
+	bDebugCacheReady = DebugLanes.Num() > 0;
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("TrafficSpawner: Cached %d lane polylines for debug draw."),
+		DebugLanes.Num());
+}
+
+void ATrafficSpawner::DrawDebugLanes() const
+{
+	UWorld* World = GetWorld();
+	if (!World) { return; }
+
+	// Cyan = forward lanes, Orange = reverse lanes.  Slight Z lift to avoid
+	// z-fighting with road surface.
+	static constexpr float ZLift = 5.0f;
+
+	for (const FDebugLaneData& Lane : DebugLanes)
+	{
+		const FColor Color = Lane.bIsReverseLane
+			? FColor(255, 140, 0)   // Orange
+			: FColor(0, 255, 255);  // Cyan
+
+		for (int32 i = 0; i < Lane.Points.Num() - 1; ++i)
+		{
+			const FVector A = Lane.Points[i]   + FVector(0, 0, ZLift);
+			const FVector B = Lane.Points[i+1] + FVector(0, 0, ZLift);
+			DrawDebugLine(World, A, B, Color,
+				/*bPersistentLines=*/ false,
+				/*LifeTime=*/ -1.0f,
+				/*DepthPriority=*/ 0,
+				/*Thickness=*/ 3.0f);
+		}
+	}
+}
+#endif // ENABLE_DRAW_DEBUG
 
 void ATrafficSpawner::SpawnVehicles()
 {

@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "TrafficRoadProvider.h"
 #include "TrafficSpawner.generated.h"
 
 /**
@@ -12,6 +13,10 @@
  * On BeginPlay it queries the active ITrafficRoadProvider for lanes,
  * spawns vehicles of the configured class, and assigns each one an
  * ATrafficVehicleController that drives along its lane.
+ *
+ * Enable bDebugDrawLanes to visualize the sampled lane centerlines during
+ * Play-In-Editor — useful for verifying that the adapter path data aligns
+ * with the painted road markings.
  */
 UCLASS()
 class AAA_TRAFFIC_API ATrafficSpawner : public AActor
@@ -21,12 +26,35 @@ class AAA_TRAFFIC_API ATrafficSpawner : public AActor
 public:
 	ATrafficSpawner();
 
+	virtual void Tick(float DeltaSeconds) override;
+
 protected:
 	virtual void BeginPlay() override;
 
 private:
 	/** Deferred to next tick so all subsystems (including adapters) are initialized. */
 	void SpawnVehicles();
+
+#if ENABLE_DRAW_DEBUG
+	/** Cache lane polylines from the provider so debug draw doesn't re-query every frame. */
+	void CacheDebugLaneData();
+
+	/** Draw cached lane centerlines using DrawDebugLine. */
+	void DrawDebugLanes() const;
+
+	/** Whether the lane cache has been populated. */
+	bool bDebugCacheReady = false;
+
+	/** Cached per-lane polylines for debug rendering. */
+	struct FDebugLaneData
+	{
+		TArray<FVector> Points;
+		bool bIsReverseLane = false;
+	};
+	TArray<FDebugLaneData> DebugLanes;
+#endif // ENABLE_DRAW_DEBUG
+
+	// ── Traffic Config ──────────────────────────────────────────────
 
 	/** Vehicle pawn class to spawn (e.g. a DD_Vehicles Blueprint). */
 	UPROPERTY(EditAnywhere, Category = "Traffic")
@@ -59,4 +87,14 @@ private:
 	 */
 	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0", ClampMax = "100"))
 	float SpeedVariation;
+
+	// ── Debug ───────────────────────────────────────────────────────
+
+	/**
+	 * When true, draws sampled lane centerlines in the viewport during PIE.
+	 * Forward-direction lanes are drawn in cyan, reverse lanes in orange.
+	 * Stripped from Shipping builds automatically.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")
+	bool bDebugDrawLanes = false;
 };

@@ -3,9 +3,21 @@ name: Build AAA_Traffic Plugin
 on:
   push:
     branches: [ main, dev ]
+    paths:
+      - 'Plugins/**'
+      - 'HostProject/**'
+      - '.github/workflows/**'
   pull_request:
     branches: [ main, dev ]
+    paths:
+      - 'Plugins/**'
+      - 'HostProject/**'
+      - '.github/workflows/**'
   workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-win64:
