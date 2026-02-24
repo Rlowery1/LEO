@@ -13,6 +13,7 @@ ATrafficSpawner::ATrafficSpawner()
 	, VehicleSpeed(1500.f)
 	, SpawnSeed(42)
 	, SpawnZOffset(50.f)
+	, SpawnSpacing(1500.f)
 {
 	PrimaryActorTick.bCanEverTick = false;
 }
@@ -75,6 +76,9 @@ void ATrafficSpawner::SpawnVehicles()
 		TEXT("TrafficSpawner: Spawning %d vehicles across %d available lanes."),
 		SpawnCount, AllLanes.Num());
 
+	// Track how many vehicles have been placed on each lane for staggered positioning.
+	TMap<int32, int32> LaneOccupancy;
+
 	for (int32 i = 0; i < SpawnCount; ++i)
 	{
 		const FTrafficLaneHandle& Lane = AllLanes[i % AllLanes.Num()];
@@ -89,9 +93,30 @@ void ATrafficSpawner::SpawnVehicles()
 			continue;
 		}
 
-		// Spawn at lane start, oriented along the lane.
-		const FVector SpawnLocation = LanePoints[0] + FVector(0.0, 0.0, SpawnZOffset);
-		const FRotator SpawnRotation = (LanePoints[1] - LanePoints[0]).Rotation();
+		// Stagger spawn position along the lane based on how many vehicles already placed on it.
+		const int32 SlotIndex = LaneOccupancy.FindOrAdd(Lane.HandleId, 0);
+		LaneOccupancy[Lane.HandleId] = SlotIndex + 1;
+		const float TargetOffset = SlotIndex * SpawnSpacing;
+
+		// Walk along lane points to find the staggered spawn position.
+		FVector SpawnPos = LanePoints[0];
+		FVector SpawnDir = (LanePoints[1] - LanePoints[0]).GetSafeNormal();
+		float AccumulatedDist = 0.0f;
+		for (int32 p = 0; p < LanePoints.Num() - 1; ++p)
+		{
+			const float SegLen = FVector::Dist(LanePoints[p], LanePoints[p + 1]);
+			if (AccumulatedDist + SegLen >= TargetOffset)
+			{
+				const float Alpha = (TargetOffset - AccumulatedDist) / FMath::Max(SegLen, KINDA_SMALL_NUMBER);
+				SpawnPos = FMath::Lerp(LanePoints[p], LanePoints[p + 1], Alpha);
+				SpawnDir = (LanePoints[p + 1] - LanePoints[p]).GetSafeNormal();
+				break;
+			}
+			AccumulatedDist += SegLen;
+		}
+
+		const FVector SpawnLocation = SpawnPos + FVector(0.0, 0.0, SpawnZOffset);
+		const FRotator SpawnRotation = SpawnDir.Rotation();
 		const FTransform SpawnTransform(SpawnRotation, SpawnLocation);
 
 		FActorSpawnParameters SpawnParams;

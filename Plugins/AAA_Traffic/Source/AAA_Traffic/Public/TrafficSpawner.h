@@ -47,4 +47,8 @@ private:
 	/** Vertical offset added to lane start position when spawning (cm). */
 	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0"))
 	float SpawnZOffset;
+
+	/** Spacing between vehicles spawned on the same lane (cm). */
+	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "200"))
+	float SpawnSpacing;
 };

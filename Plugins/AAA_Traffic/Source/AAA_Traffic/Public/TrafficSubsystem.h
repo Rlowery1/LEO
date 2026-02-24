@@ -7,6 +7,7 @@
 #include "TrafficSubsystem.generated.h"
 
 class ITrafficRoadProvider;
+class ATrafficVehicleController;
 
 /**
  * World subsystem that holds a reference to the active road provider.
@@ -27,8 +28,20 @@ public:
 	/** Get the currently active road provider, or nullptr if none is registered. */
 	ITrafficRoadProvider* GetProvider() const;
 
+	/** Register an active traffic vehicle controller. */
+	void RegisterVehicle(ATrafficVehicleController* InController);
+
+	/** Unregister a traffic vehicle controller. */
+	void UnregisterVehicle(ATrafficVehicleController* InController);
+
+	/** Get the set of all currently active vehicle controllers. */
+	const TSet<TWeakObjectPtr<ATrafficVehicleController>>& GetActiveVehicles() const { return ActiveVehicles; }
+
 private:
 	/** The UObject that implements ITrafficRoadProvider. Kept as UObject* to prevent GC. */
 	UPROPERTY()
 	TObjectPtr<UObject> ActiveProviderObject;
+
+	/** Set of all active traffic vehicle controllers in the world. */
+	TSet<TWeakObjectPtr<ATrafficVehicleController>> ActiveVehicles;
 };

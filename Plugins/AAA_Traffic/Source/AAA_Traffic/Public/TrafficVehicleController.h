@@ -37,6 +37,7 @@ public:
 
 protected:
 	virtual void OnPossess(APawn* InPawn) override;
+	virtual void OnUnPossess() override;
 	virtual void Tick(float DeltaSeconds) override;
 
 private:
@@ -57,6 +58,13 @@ private:
 	 * Queries connected lanes and transitions, or flags dead-end for braking.
 	 */
 	void CheckLaneTransition();
+
+	/**
+	 * Detect the nearest vehicle ahead via a sphere sweep along the lane direction.
+	 * Returns the distance to the leader (cm), or -1.0 if no leader detected.
+	 * OutLeaderSpeed receives the leader's forward speed if found.
+	 */
+	float GetLeaderDistance(float& OutLeaderSpeed) const;
 
 	// ----- State -----
 
@@ -93,6 +101,14 @@ private:
 	/** Distance ahead on the lane path (cm) used as the steering target. */
 	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "100"))
 	float LookAheadDistance;
+
+	/** Minimum safe following distance behind a leader (cm). */
+	UPROPERTY(EditAnywhere, Category = "Traffic|Proximity", meta = (ClampMin = "100"))
+	float FollowingDistance;
+
+	/** Maximum forward detection range for vehicles ahead (cm). */
+	UPROPERTY(EditAnywhere, Category = "Traffic|Proximity", meta = (ClampMin = "500"))
+	float DetectionDistance;
 
 	/**
 	 * Seed for deterministic random decisions.
