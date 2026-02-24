@@ -60,9 +60,19 @@ private:
 	void CheckLaneTransition();
 
 	/**
-	 * Detect the nearest vehicle ahead via a sphere sweep along the lane direction.
+	 * Detect the nearest traffic vehicle ahead via a sphere sweep along the lane direction.
 	 * Returns the distance to the leader (cm), or -1.0 if no leader detected.
 	 * OutLeaderSpeed receives the leader's forward speed if found.
+	 *
+	 * NOTE — Physics boundary (System.md §4.5): sweep results depend on Chaos physics
+	 * state, which is not guaranteed deterministic across machines. This is acceptable
+	 * because proximity detection is a reactive safety system, not a decision-logic
+	 * path — minor variations affect smoothness, not correctness.
+	 *
+	 * Performance: O(N) sweeps per frame where N is number of active vehicles.
+	 * Acceptable for traffic counts up to low hundreds; if hotspot profiling shows
+	 * this dominating frame time, consider switching to analytical lane-position
+	 * checks via the vehicle registry.
 	 */
 	float GetLeaderDistance(float& OutLeaderSpeed) const;
 

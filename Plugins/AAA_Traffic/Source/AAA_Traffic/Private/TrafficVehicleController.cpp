@@ -194,8 +194,12 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 				(LeaderDist - FollowingDistance) / FMath::Max(FollowingDistance, 1.0f),
 				0.0f, 1.0f);
 			const float GapSpeed = TargetSpeed * GapFactor;
-			// Also match leader speed when gap is moderate.
-			EffectiveTargetSpeed = FMath::Min(GapSpeed, FMath::Max(LeaderSpeed, 0.0f));
+			// Blend between leader speed (close) and gap-based speed (far).
+			// At GapFactor=0 (FollowingDistance): match leader speed.
+			// At GapFactor=1 (2x FollowingDistance): use full gap-based speed.
+			// This prevents hard-braking for a distant stopped leader.
+			const float ClampedLeaderSpeed = FMath::Max(LeaderSpeed, 0.0f);
+			EffectiveTargetSpeed = FMath::Lerp(ClampedLeaderSpeed, GapSpeed, GapFactor);
 			EffectiveTargetSpeed = FMath::Min(EffectiveTargetSpeed, TargetSpeed);
 		}
 	}
@@ -369,7 +373,7 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 
 	// Use direction toward the look-ahead point (lane-aligned) instead of
 	// the vehicle's forward vector, which may be temporarily misaligned.
-	FVector SweepDirection = FVector::ForwardVector;
+	FVector SweepDirection = ControlledPawn->GetActorForwardVector();
 	if (LanePoints.Num() >= 2)
 	{
 		const int32 ClosestIdx = FindClosestPointIndex(VehicleLocation);
@@ -382,8 +386,15 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 	}
 
 	// Sphere sweep along the lane direction.
-	const float SweepRadius = FMath::Max(LaneWidth * 0.4f, 50.0f);
-	const FVector SweepStart = VehicleLocation + SweepDirection * (SweepRadius + 10.0f); // start just ahead of self
+	// Sweep radius is 40% of lane width — wide enough to catch same-lane vehicles
+	// without reaching into adjacent lanes (which are typically 100% width apart).
+	const float SweepRadiusFraction = 0.4f;
+	const float MinSweepRadius = 50.0f;
+	const float SweepRadius = FMath::Max(LaneWidth * SweepRadiusFraction, MinSweepRadius);
+
+	// Small offset to push sweep start past our own collision shape.
+	const float SelfCollisionBuffer = 10.0f;
+	const FVector SweepStart = VehicleLocation + SweepDirection * (SweepRadius + SelfCollisionBuffer);
 	const FVector SweepEnd = SweepStart + SweepDirection * DetectionDistance;
 
 	FHitResult HitResult;
@@ -405,9 +416,10 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 		return -1.0f;
 	}
 
-	// Check if the hit actor is a pawn (another vehicle).
+	// Verify the hit actor is a traffic vehicle (controlled by ATrafficVehicleController)
+	// to avoid false positives from player characters or other non-traffic pawns.
 	const APawn* HitPawn = Cast<APawn>(HitResult.GetActor());
-	if (!HitPawn)
+	if (!HitPawn || !Cast<ATrafficVehicleController>(HitPawn->GetController()))
 	{
 		return -1.0f;
 	}

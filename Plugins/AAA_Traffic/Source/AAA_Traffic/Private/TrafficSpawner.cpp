@@ -70,7 +70,9 @@ void ATrafficSpawner::SpawnVehicles()
 		return;
 	}
 
-	const int32 SpawnCount = FMath::Min(VehicleCount, AllLanes.Num());
+	// Allow VehicleCount to exceed lane count — vehicles share lanes with
+	// staggered positioning via SpawnSpacing.
+	const int32 SpawnCount = VehicleCount;
 
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("TrafficSpawner: Spawning %d vehicles across %d available lanes."),
@@ -113,6 +115,19 @@ void ATrafficSpawner::SpawnVehicles()
 				break;
 			}
 			AccumulatedDist += SegLen;
+		}
+
+		// If the requested offset exceeds the lane length, clamp to the lane end
+		// instead of leaving SpawnPos/SpawnDir at the lane start.
+		if (TargetOffset > AccumulatedDist && LanePoints.Num() >= 2)
+		{
+			const int32 LastIdx = LanePoints.Num() - 1;
+			SpawnPos = LanePoints[LastIdx];
+			SpawnDir = (LanePoints[LastIdx] - LanePoints[LastIdx - 1]).GetSafeNormal();
+
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("TrafficSpawner: TargetOffset %.2f exceeds length %.2f of lane %d, clamping to lane end."),
+				TargetOffset, AccumulatedDist, Lane.HandleId);
 		}
 
 		const FVector SpawnLocation = SpawnPos + FVector(0.0, 0.0, SpawnZOffset);

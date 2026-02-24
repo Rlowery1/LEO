@@ -42,6 +42,23 @@ private:
 	UPROPERTY()
 	TObjectPtr<UObject> ActiveProviderObject;
 
-	/** Set of all active traffic vehicle controllers in the world. */
+	/**
+	 * Registry of all active traffic vehicle controllers in the world.
+	 *
+	 * NOTE:
+	 * - The proximity detection system currently relies on direct physics sweeps and does not
+	 *   query this registry for neighbor detection.
+	 * - This registry exists to support future despawn / lifecycle management and potential
+	 *   debugging / analytics features.
+	 *
+	 * Per System.md Section 8 (minimalism), this is treated as bounded technical debt:
+	 * - Keep registration / unregistration overhead minimal and free of heavy per-tick work.
+	 * - If this set becomes a performance hotspot or remains unused by concrete features,
+	 *   either wire it into those features or remove it instead of growing its responsibilities.
+	 *
+	 * Not marked UPROPERTY: TSet<TWeakObjectPtr<T>> is not supported by UHT reflection.
+	 * GC safety is already guaranteed by TWeakObjectPtr, which nullifies automatically
+	 * when the referenced UObject is collected.
+	 */
 	TSet<TWeakObjectPtr<ATrafficVehicleController>> ActiveVehicles;
 };
