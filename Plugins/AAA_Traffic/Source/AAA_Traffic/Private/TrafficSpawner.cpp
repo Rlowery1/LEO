@@ -14,6 +14,7 @@ ATrafficSpawner::ATrafficSpawner()
 	, SpawnSeed(42)
 	, SpawnZOffset(50.f)
 	, SpawnSpacing(1500.f)
+	, SpeedVariation(15.f)
 {
 	PrimaryActorTick.bCanEverTick = false;
 }
@@ -152,7 +153,19 @@ void ATrafficSpawner::SpawnVehicles()
 		if (Controller)
 		{
 			Controller->SetRandomSeed(SpawnSeed + i);
-			Controller->SetTargetSpeed(VehicleSpeed);
+
+			// Apply deterministic per-vehicle speed variation.
+			float FinalSpeed = VehicleSpeed;
+			if (SpeedVariation > KINDA_SMALL_NUMBER)
+			{
+				FRandomStream SpeedRng(SpawnSeed + i + 10000);
+				const float VariationFraction = SpeedVariation / 100.0f;
+				const float Offset = SpeedRng.FRandRange(-VariationFraction, VariationFraction);
+				FinalSpeed = VehicleSpeed * (1.0f + Offset);
+				FinalSpeed = FMath::Max(FinalSpeed, 0.0f);
+			}
+			Controller->SetTargetSpeed(FinalSpeed);
+
 			Controller->Possess(Vehicle);
 			Controller->InitializeLaneFollowing(Lane);
 

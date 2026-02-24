@@ -51,4 +51,12 @@ private:
 	/** Spacing between vehicles spawned on the same lane (cm). */
 	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "200"))
 	float SpawnSpacing;
+
+	/**
+	 * Maximum percentage of speed variation applied per vehicle (0-100).
+	 * Each vehicle gets a deterministic random offset in [-SpeedVariation, +SpeedVariation]%
+	 * of VehicleSpeed, using SpawnSeed for reproducibility.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0", ClampMax = "100"))
+	float SpeedVariation;
 };

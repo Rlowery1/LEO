@@ -35,6 +35,9 @@ public:
 	/** Set the random seed before possession (determines RandomStream). */
 	void SetRandomSeed(int32 InSeed);
 
+	/** Returns true if the vehicle has reached a dead-end with no connected lanes. */
+	bool IsAtDeadEnd() const { return bAtDeadEnd; }
+
 protected:
 	virtual void OnPossess(APawn* InPawn) override;
 	virtual void OnUnPossess() override;
