@@ -14,11 +14,25 @@
     {
       "Name": "EnhancedInput",
       "Enabled": true
+    },
+    {
+      "Name": "ChaosVehiclesPlugin",
+      "Enabled": true
+    },
+    {
+      "Name": "RoadBLD",
+      "Enabled": true,
+      "Optional": true
     }
   ],
   "Modules": [
     {
       "Name": "AAA_Traffic",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "AAA_TrafficRoadBLD",
       "Type": "Runtime",
       "LoadingPhase": "Default"
     }
