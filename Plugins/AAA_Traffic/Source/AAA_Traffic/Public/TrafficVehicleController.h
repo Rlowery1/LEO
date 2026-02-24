@@ -78,6 +78,12 @@ private:
 	/** True when vehicle has reached lane-end with no connected lanes. */
 	bool bAtDeadEnd;
 
+	/** Cumulative distance traveled on the current lane (prevents short-lane transition loops). */
+	float DistanceTraveledOnLane;
+
+	/** Previous vehicle location for distance tracking. */
+	FVector PreviousVehicleLocation;
+
 	// ----- Tuning -----
 
 	/** Target speed in cm/s (default ~54 km/h). */

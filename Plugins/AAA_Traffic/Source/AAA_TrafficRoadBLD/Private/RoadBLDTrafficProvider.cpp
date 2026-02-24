@@ -152,6 +152,12 @@ void URoadBLDTrafficProvider::BuildLaneConnectivity()
 		{
 			if (const int32* Handle = LaneToHandleMap.Find(Left))
 			{
+				if (OutHandles.Contains(*Handle))
+				{
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("RoadBLDTrafficProvider: Lane '%s' (handle %d) appears multiple times on edge '%s'."),
+						*Left->GetName(), *Handle, *GetNameSafe(Edge));
+				}
 				OutHandles.AddUnique(*Handle);
 			}
 		}
@@ -159,6 +165,12 @@ void URoadBLDTrafficProvider::BuildLaneConnectivity()
 		{
 			if (const int32* Handle = LaneToHandleMap.Find(Right))
 			{
+				if (OutHandles.Contains(*Handle))
+				{
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("RoadBLDTrafficProvider: Lane '%s' (handle %d) appears multiple times on edge '%s'."),
+						*Right->GetName(), *Handle, *GetNameSafe(Edge));
+				}
 				OutHandles.AddUnique(*Handle);
 			}
 		}
@@ -174,7 +186,9 @@ void URoadBLDTrafficProvider::BuildLaneConnectivity()
 		CollectLaneHandles(Corner.StartEdge, StartLaneHandles);
 		CollectLaneHandles(Corner.EndEdge, EndLaneHandles);
 
-		// Connect lanes on the StartEdge side to lanes on the EndEdge side (bidirectional).
+		// Connect lanes on StartEdge to lanes on EndEdge (forward only).
+		// FRoadNetworkCorner is directional: StartEdge flows into EndEdge.
+		// Reverse links are intentionally omitted to prevent wrong-way traversal.
 		for (const int32 SrcHandle : StartLaneHandles)
 		{
 			TArray<FTrafficLaneHandle>& SrcConnections = LaneConnectionMap.FindOrAdd(SrcHandle);
@@ -182,15 +196,6 @@ void URoadBLDTrafficProvider::BuildLaneConnectivity()
 			{
 				if (SrcHandle == DstHandle) continue;
 				SrcConnections.AddUnique(FTrafficLaneHandle(DstHandle));
-			}
-		}
-		for (const int32 DstHandle : EndLaneHandles)
-		{
-			TArray<FTrafficLaneHandle>& DstConnections = LaneConnectionMap.FindOrAdd(DstHandle);
-			for (const int32 SrcHandle : StartLaneHandles)
-			{
-				if (SrcHandle == DstHandle) continue;
-				DstConnections.AddUnique(FTrafficLaneHandle(SrcHandle));
 			}
 		}
 	}

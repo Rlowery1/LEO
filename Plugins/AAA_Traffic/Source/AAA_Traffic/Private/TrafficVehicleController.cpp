@@ -11,6 +11,8 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, bLaneDataReady(false)
 	, CachedProvider(nullptr)
 	, bAtDeadEnd(false)
+	, DistanceTraveledOnLane(0.0f)
+	, PreviousVehicleLocation(FVector::ZeroVector)
 	, TargetSpeed(1500.f)
 	, LookAheadDistance(500.f)
 	, RandomSeed(0)
@@ -33,6 +35,8 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 	CurrentLane = InLane;
 	bLaneDataReady = false;
 	bAtDeadEnd = false;
+	DistanceTraveledOnLane = 0.0f;
+	PreviousVehicleLocation = FVector::ZeroVector;
 
 	UWorld* World = GetWorld();
 	if (!World)
@@ -101,6 +105,13 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	const FVector VehicleForward = ControlledPawn->GetActorForwardVector();
 	const float CurrentSpeed = VehicleMovement->GetForwardSpeed();
 
+	// Track cumulative distance traveled on this lane to prevent short-lane transition loops.
+	if (!PreviousVehicleLocation.IsZero())
+	{
+		DistanceTraveledOnLane += FVector::Dist(PreviousVehicleLocation, VehicleLocation);
+	}
+	PreviousVehicleLocation = VehicleLocation;
+
 	// Find where we are on the lane and where to aim
 	const int32 ClosestIndex = FindClosestPointIndex(VehicleLocation);
 
@@ -108,7 +119,10 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	if (!bAtDeadEnd)
 	{
 		const float RemainingDist = GetRemainingDistance(ClosestIndex);
-		if (RemainingDist < LookAheadDistance)
+		// Use speed-based look-ahead so fast vehicles get more advance notice.
+		const float ReactionTime = 1.0f; // seconds
+		const float TransitionThreshold = FMath::Max(LookAheadDistance, FMath::Abs(CurrentSpeed) * ReactionTime);
+		if (RemainingDist < TransitionThreshold && DistanceTraveledOnLane > TransitionThreshold)
 		{
 			CheckLaneTransition();
 			if (!bLaneDataReady || !GetPawn())
@@ -222,8 +236,35 @@ FVector ATrafficVehicleController::GetLookAheadPoint(
 
 float ATrafficVehicleController::GetRemainingDistance(int32 FromIndex) const
 {
+	// Need at least two lane points to measure any distance.
+	if (LanePoints.Num() < 2)
+	{
+		return 0.0f;
+	}
+
+	// Clamp to valid range so FromIndex + 1 is a valid index.
+	if (FromIndex < 0)
+	{
+		FromIndex = 0;
+	}
+	if (FromIndex >= LanePoints.Num() - 1)
+	{
+		return 0.0f; // Already at or past the last point.
+	}
+
 	float Distance = 0.0f;
-	for (int32 i = FromIndex; i < LanePoints.Num() - 1; ++i)
+
+	// Use the vehicle's actual location for the first partial segment so
+	// the measurement reflects how far the vehicle truly is from the next point.
+	const APawn* ControlledPawn = GetPawn();
+	const FVector StartPos = (ControlledPawn != nullptr)
+		? ControlledPawn->GetActorLocation()
+		: LanePoints[FromIndex];
+
+	Distance += FVector::Dist(StartPos, LanePoints[FromIndex + 1]);
+
+	// Sum remaining full segments.
+	for (int32 i = FromIndex + 1; i < LanePoints.Num() - 1; ++i)
 	{
 		Distance += FVector::Dist(LanePoints[i], LanePoints[i + 1]);
 	}
@@ -252,9 +293,7 @@ void ATrafficVehicleController::CheckLaneTransition()
 	}
 
 	// Deterministic lane selection using seeded RandomStream.
-	const int32 LaneIndex = (Connected.Num() == 1)
-		? 0
-		: RandomStream.RandRange(0, Connected.Num() - 1);
+	const int32 LaneIndex = RandomStream.RandRange(0, Connected.Num() - 1);
 
 	const FTrafficLaneHandle NextLane = Connected[LaneIndex];
 
@@ -263,4 +302,14 @@ void ATrafficVehicleController::CheckLaneTransition()
 		CurrentLane.HandleId, NextLane.HandleId, Connected.Num());
 
 	InitializeLaneFollowing(NextLane);
+
+	// If lane following could not be initialized for the selected connected lane,
+	// treat this as a dead end so braking logic engages.
+	if (!bLaneDataReady)
+	{
+		bAtDeadEnd = true;
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("TrafficVehicleController: Failed to initialize lane following for lane %d from lane %d — treating as dead end."),
+			NextLane.HandleId, CurrentLane.HandleId);
+	}
 }
