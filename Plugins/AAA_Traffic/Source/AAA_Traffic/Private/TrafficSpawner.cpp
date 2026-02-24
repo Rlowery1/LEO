@@ -16,8 +16,12 @@ ATrafficSpawner::ATrafficSpawner()
 	, SpawnSpacing(1500.f)
 	, SpeedVariation(15.f)
 {
+#if ENABLE_DRAW_DEBUG
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.bStartWithTickEnabled = false;
+#else
+	PrimaryActorTick.bCanEverTick = false;
+#endif
 }
 
 void ATrafficSpawner::BeginPlay()
@@ -28,7 +32,7 @@ void ATrafficSpawner::BeginPlay()
 	GetWorldTimerManager().SetTimerForNextTick(this, &ATrafficSpawner::SpawnVehicles);
 
 #if ENABLE_DRAW_DEBUG
-	if (bDebugDrawLanes)
+	if (bDebugDrawLanes && GetWorld() && GetWorld()->WorldType == EWorldType::PIE)
 	{
 		SetActorTickEnabled(true);
 	}
@@ -45,7 +49,7 @@ void ATrafficSpawner::Tick(float DeltaSeconds)
 		return;
 	}
 
-	if (!bDebugCacheReady)
+	if (!bDebugCacheReady && !bDebugCacheAttempted)
 	{
 		CacheDebugLaneData();
 	}
@@ -96,11 +100,20 @@ void ATrafficSpawner::CacheDebugLaneData()
 		}
 	}
 
+	bDebugCacheAttempted = true;
 	bDebugCacheReady = DebugLanes.Num() > 0;
 
-	UE_LOG(LogAAATraffic, Log,
-		TEXT("TrafficSpawner: Cached %d lane polylines for debug draw."),
-		DebugLanes.Num());
+	if (bDebugCacheReady)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("TrafficSpawner: Cached %d lane polylines for debug draw."),
+			DebugLanes.Num());
+	}
+	else
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("TrafficSpawner: Debug draw enabled but no lane data available from provider."));
+	}
 }
 
 void ATrafficSpawner::DrawDebugLanes() const

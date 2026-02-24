@@ -5,7 +5,6 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "DrawDebugHelpers.h"
-#include "TrafficRoadProvider.h"
 #include "TrafficSpawner.generated.h"
 
 /**
@@ -45,6 +44,9 @@ private:
 
 	/** Whether the lane cache has been populated. */
 	bool bDebugCacheReady = false;
+
+	/** Whether a cache attempt has been made (prevents re-querying every frame on failure). */
+	bool bDebugCacheAttempted = false;
 
 	/** Cached per-lane polylines for debug rendering. */
 	struct FDebugLaneData
@@ -92,9 +94,10 @@ private:
 	// ── Debug ───────────────────────────────────────────────────────
 
 	/**
-	 * When true, draws sampled lane centerlines in the viewport during PIE.
+	 * When true (in non-Shipping builds), draws sampled lane centerlines in the viewport during PIE.
 	 * Forward-direction lanes are drawn in cyan, reverse lanes in orange.
-	 * Stripped from Shipping builds automatically.
+	 * In Shipping builds this flag has no effect because the debug drawing code is compiled out
+	 * via ENABLE_DRAW_DEBUG.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")
 	bool bDebugDrawLanes = false;
