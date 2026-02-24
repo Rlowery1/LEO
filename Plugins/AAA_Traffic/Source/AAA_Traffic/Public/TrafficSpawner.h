@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "DrawDebugHelpers.h"
 #include "TrafficRoadProvider.h"
 #include "TrafficSpawner.generated.h"
 

@@ -8,10 +8,6 @@
 #include "Engine/World.h"
 #include "TimerManager.h"
 
-#if ENABLE_DRAW_DEBUG
-#include "DrawDebugHelpers.h"
-#endif
-
 ATrafficSpawner::ATrafficSpawner()
 	: VehicleCount(1)
 	, VehicleSpeed(1500.f)
