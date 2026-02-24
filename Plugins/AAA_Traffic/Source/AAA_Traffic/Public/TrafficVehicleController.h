@@ -49,6 +49,15 @@ private:
 	/** Walk forward along lane points by LookAheadDistance and return the target point. */
 	FVector GetLookAheadPoint(const FVector& VehicleLocation, int32 ClosestIndex) const;
 
+	/** Compute remaining path distance from a point index to the lane end. */
+	float GetRemainingDistance(int32 FromIndex) const;
+
+	/**
+	 * Called when the vehicle is nearing lane-end.
+	 * Queries connected lanes and transitions, or flags dead-end for braking.
+	 */
+	void CheckLaneTransition();
+
 	// ----- State -----
 
 	/** Handle to the lane currently being followed. */
@@ -62,6 +71,18 @@ private:
 
 	/** Set to true once lane data has been fetched from the provider. */
 	bool bLaneDataReady;
+
+	/** Cached road provider pointer for lane transition queries. */
+	ITrafficRoadProvider* CachedProvider;
+
+	/** True when vehicle has reached lane-end with no connected lanes. */
+	bool bAtDeadEnd;
+
+	/** Cumulative distance traveled on the current lane (prevents short-lane transition loops). */
+	float DistanceTraveledOnLane;
+
+	/** Previous vehicle location for distance tracking. */
+	FVector PreviousVehicleLocation;
 
 	// ----- Tuning -----
 

@@ -48,6 +48,9 @@ private:
 	/** Scan the world for RoadBLD actors and build internal handle maps. */
 	void CacheRoadData();
 
+	/** Build the lane connectivity table from RoadBLD corner data. */
+	void BuildLaneConnectivity();
+
 	/** Resolve a road handle back to the live RoadBLD actor. */
 	ADynamicRoad* ResolveRoad(const FTrafficRoadHandle& Handle) const;
 
@@ -73,6 +76,9 @@ private:
 
 	/** Cached road network actor (used for corner traversal). */
 	TWeakObjectPtr<ADynamicRoadNetwork> CachedRoadNetwork;
+
+	/** Pre-built lane connectivity: lane handle ID → list of connected lane handles. */
+	TMap<int32, TArray<FTrafficLaneHandle>> LaneConnectionMap;
 
 	/** True once CacheRoadData() has run. */
 	bool bCached;
