@@ -2,6 +2,7 @@
 
 #include "RoadBLDTrafficProvider.h"
 #include "TrafficSubsystem.h"
+#include "TrafficLog.h"
 
 #if WITH_ROADBLD
 #include "DynamicRoad.h"
@@ -64,7 +65,7 @@ void URoadBLDTrafficProvider::OnWorldBeginPlay(UWorld& InWorld)
 	if (UTrafficSubsystem* TrafficSub = InWorld.GetSubsystem<UTrafficSubsystem>())
 	{
 		TrafficSub->RegisterProvider(this);
-		UE_LOG(LogTemp, Log,
+		UE_LOG(LogAAATraffic, Log,
 			TEXT("RoadBLDTrafficProvider: Registered — %d roads, %d lanes cached."),
 			RoadHandleMap.Num(), LaneHandleMap.Num());
 	}
@@ -161,6 +162,12 @@ TArray<FTrafficLaneHandle> URoadBLDTrafficProvider::GetLanesForRoad(const FTraff
 			Result.Emplace(*HandleId);
 		}
 	}
+
+	// Sort by HandleId for deterministic output order (System.md §4.4).
+	Result.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
+	{
+		return A.HandleId < B.HandleId;
+	});
 	return Result;
 }
 
@@ -251,6 +258,8 @@ TArray<FTrafficLaneHandle> URoadBLDTrafficProvider::GetConnectedLanes(const FTra
 	//   2. ADynamicRoadNetwork::GetNextCornerConnection() at lane end
 	//   3. Corner → connecting edge curves → lanes on connected road
 	//   4. Deterministic matching sorted by corner GUID with stable tie-breaks
+	UE_LOG(LogAAATraffic, Warning,
+		TEXT("RoadBLDTrafficProvider::GetConnectedLanes — not yet implemented; returning empty array."));
 	return TArray<FTrafficLaneHandle>();
 }
 

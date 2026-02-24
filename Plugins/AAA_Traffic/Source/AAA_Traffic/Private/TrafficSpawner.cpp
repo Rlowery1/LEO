@@ -4,6 +4,7 @@
 #include "TrafficSubsystem.h"
 #include "TrafficRoadProvider.h"
 #include "TrafficVehicleController.h"
+#include "TrafficLog.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
 
@@ -11,6 +12,7 @@ ATrafficSpawner::ATrafficSpawner()
 	: VehicleCount(1)
 	, VehicleSpeed(1500.f)
 	, SpawnSeed(42)
+	, SpawnZOffset(50.f)
 {
 	PrimaryActorTick.bCanEverTick = false;
 }
@@ -27,14 +29,14 @@ void ATrafficSpawner::SpawnVehicles()
 {
 	if (!VehicleClass)
 	{
-		UE_LOG(LogTemp, Error, TEXT("TrafficSpawner: No VehicleClass assigned."));
+		UE_LOG(LogAAATraffic, Error, TEXT("TrafficSpawner: No VehicleClass assigned."));
 		return;
 	}
 
 	UWorld* World = GetWorld();
 	if (!World)
 	{
-		UE_LOG(LogTemp, Error, TEXT("TrafficSpawner: World is null in SpawnVehicles."));
+		UE_LOG(LogAAATraffic, Error, TEXT("TrafficSpawner: World is null in SpawnVehicles."));
 		return;
 	}
 
@@ -42,7 +44,7 @@ void ATrafficSpawner::SpawnVehicles()
 	ITrafficRoadProvider* Provider = TrafficSub ? TrafficSub->GetProvider() : nullptr;
 	if (!Provider)
 	{
-		UE_LOG(LogTemp, Error,
+		UE_LOG(LogAAATraffic, Error,
 			TEXT("TrafficSpawner: No road provider registered. Is a road-kit adapter module loaded?"));
 		return;
 	}
@@ -51,7 +53,7 @@ void ATrafficSpawner::SpawnVehicles()
 	TArray<FTrafficRoadHandle> Roads = Provider->GetAllRoads();
 	if (Roads.IsEmpty())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("TrafficSpawner: No roads found by the provider."));
+		UE_LOG(LogAAATraffic, Warning, TEXT("TrafficSpawner: No roads found by the provider."));
 		return;
 	}
 
@@ -63,13 +65,13 @@ void ATrafficSpawner::SpawnVehicles()
 
 	if (AllLanes.IsEmpty())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("TrafficSpawner: No lanes found on any road."));
+		UE_LOG(LogAAATraffic, Warning, TEXT("TrafficSpawner: No lanes found on any road."));
 		return;
 	}
 
 	const int32 SpawnCount = FMath::Min(VehicleCount, AllLanes.Num());
 
-	UE_LOG(LogTemp, Log,
+	UE_LOG(LogAAATraffic, Log,
 		TEXT("TrafficSpawner: Spawning %d vehicles across %d available lanes."),
 		SpawnCount, AllLanes.Num());
 
@@ -81,14 +83,14 @@ void ATrafficSpawner::SpawnVehicles()
 		float LaneWidth;
 		if (!Provider->GetLanePath(Lane, LanePoints, LaneWidth) || LanePoints.Num() < 2)
 		{
-			UE_LOG(LogTemp, Warning,
+			UE_LOG(LogAAATraffic, Warning,
 				TEXT("TrafficSpawner: Could not get path for lane %d — skipping."),
 				Lane.HandleId);
 			continue;
 		}
 
 		// Spawn at lane start, oriented along the lane.
-		const FVector SpawnLocation = LanePoints[0] + FVector(0.0, 0.0, 50.0);
+		const FVector SpawnLocation = LanePoints[0] + FVector(0.0, 0.0, SpawnZOffset);
 		const FRotator SpawnRotation = (LanePoints[1] - LanePoints[0]).Rotation();
 		const FTransform SpawnTransform(SpawnRotation, SpawnLocation);
 
@@ -99,7 +101,7 @@ void ATrafficSpawner::SpawnVehicles()
 		APawn* Vehicle = World->SpawnActor<APawn>(VehicleClass, SpawnTransform, SpawnParams);
 		if (!Vehicle)
 		{
-			UE_LOG(LogTemp, Warning,
+			UE_LOG(LogAAATraffic, Warning,
 				TEXT("TrafficSpawner: Failed to spawn vehicle %d."), i);
 			continue;
 		}
@@ -109,11 +111,12 @@ void ATrafficSpawner::SpawnVehicles()
 			World->SpawnActor<ATrafficVehicleController>();
 		if (Controller)
 		{
+			Controller->SetRandomSeed(SpawnSeed + i);
 			Controller->SetTargetSpeed(VehicleSpeed);
 			Controller->Possess(Vehicle);
 			Controller->InitializeLaneFollowing(Lane);
 
-			UE_LOG(LogTemp, Log,
+			UE_LOG(LogAAATraffic, Log,
 				TEXT("TrafficSpawner: Vehicle %d spawned on lane %d."),
 				i, Lane.HandleId);
 		}

@@ -2,6 +2,9 @@
 
 #include "TrafficSubsystem.h"
 #include "TrafficRoadProvider.h"
+#include "TrafficLog.h"
+
+DEFINE_LOG_CATEGORY(LogAAATraffic);
 
 void UTrafficSubsystem::RegisterProvider(UObject* InProvider)
 {
@@ -12,7 +15,7 @@ void UTrafficSubsystem::RegisterProvider(UObject* InProvider)
 
 	if (!InProvider->GetClass()->ImplementsInterface(UTrafficRoadProvider::StaticClass()))
 	{
-		UE_LOG(LogTemp, Warning,
+		UE_LOG(LogAAATraffic, Warning,
 			TEXT("TrafficSubsystem: Object '%s' does not implement ITrafficRoadProvider."),
 			*InProvider->GetName());
 		return;
@@ -20,13 +23,13 @@ void UTrafficSubsystem::RegisterProvider(UObject* InProvider)
 
 	if (ActiveProviderObject && ActiveProviderObject != InProvider)
 	{
-		UE_LOG(LogTemp, Warning,
+		UE_LOG(LogAAATraffic, Warning,
 			TEXT("TrafficSubsystem: Replacing existing provider '%s' with '%s'."),
 			*ActiveProviderObject->GetName(), *InProvider->GetName());
 	}
 
 	ActiveProviderObject = InProvider;
-	UE_LOG(LogTemp, Log, TEXT("TrafficSubsystem: Provider registered — %s"), *InProvider->GetName());
+	UE_LOG(LogAAATraffic, Log, TEXT("TrafficSubsystem: Provider registered — %s"), *InProvider->GetName());
 }
 
 void UTrafficSubsystem::UnregisterProvider(UObject* InProvider)
@@ -34,7 +37,7 @@ void UTrafficSubsystem::UnregisterProvider(UObject* InProvider)
 	if (ActiveProviderObject == InProvider)
 	{
 		ActiveProviderObject = nullptr;
-		UE_LOG(LogTemp, Log, TEXT("TrafficSubsystem: Provider unregistered."));
+		UE_LOG(LogAAATraffic, Log, TEXT("TrafficSubsystem: Provider unregistered."));
 	}
 }
 

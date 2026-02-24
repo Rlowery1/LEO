@@ -43,4 +43,8 @@ private:
 	/** Seed for deterministic spawn decisions (lane assignment, ordering). */
 	UPROPERTY(EditAnywhere, Category = "Traffic")
 	int32 SpawnSeed;
+
+	/** Vertical offset added to lane start position when spawning (cm). */
+	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0"))
+	float SpawnZOffset;
 };

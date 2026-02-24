@@ -2,6 +2,7 @@
 
 #include "TrafficVehicleController.h"
 #include "TrafficSubsystem.h"
+#include "TrafficLog.h"
 #include "ChaosWheeledVehicleMovementComponent.h"
 #include "GameFramework/Pawn.h"
 
@@ -20,6 +21,11 @@ void ATrafficVehicleController::SetTargetSpeed(float InSpeed)
 	TargetSpeed = FMath::Max(0.0f, InSpeed);
 }
 
+void ATrafficVehicleController::SetRandomSeed(int32 InSeed)
+{
+	RandomSeed = InSeed;
+}
+
 void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle& InLane)
 {
 	CurrentLane = InLane;
@@ -28,14 +34,14 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 	UWorld* World = GetWorld();
 	if (!World)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("TrafficVehicleController: World is null, cannot initialize lane following."));
+		UE_LOG(LogAAATraffic, Warning, TEXT("TrafficVehicleController: World is null, cannot initialize lane following."));
 		return;
 	}
 	UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>();
 	ITrafficRoadProvider* Provider = TrafficSub ? TrafficSub->GetProvider() : nullptr;
 	if (!Provider)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("TrafficVehicleController: No road provider available."));
+		UE_LOG(LogAAATraffic, Warning, TEXT("TrafficVehicleController: No road provider available."));
 		return;
 	}
 
@@ -43,13 +49,13 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 	if (Provider->GetLanePath(CurrentLane, LanePoints, LaneWidth) && LanePoints.Num() >= 2)
 	{
 		bLaneDataReady = true;
-		UE_LOG(LogTemp, Log,
+		UE_LOG(LogAAATraffic, Log,
 			TEXT("TrafficVehicleController: Lane loaded — %d points, width %.1f cm."),
 			LanePoints.Num(), LaneWidth);
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("TrafficVehicleController: Failed to load lane path data."));
+		UE_LOG(LogAAATraffic, Warning, TEXT("TrafficVehicleController: Failed to load lane path data."));
 	}
 }
 

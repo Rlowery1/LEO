@@ -32,6 +32,9 @@ public:
 	/** Set the target speed for this controller (cm/s). */
 	void SetTargetSpeed(float InSpeed);
 
+	/** Set the random seed before possession (determines RandomStream). */
+	void SetRandomSeed(int32 InSeed);
+
 protected:
 	virtual void OnPossess(APawn* InPawn) override;
 	virtual void Tick(float DeltaSeconds) override;
