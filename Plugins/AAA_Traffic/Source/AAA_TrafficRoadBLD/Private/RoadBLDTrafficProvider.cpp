@@ -50,6 +50,7 @@ void URoadBLDTrafficProvider::Deinitialize()
 	RoadHandleMap.Empty();
 	LaneHandleMap.Empty();
 	LaneToHandleMap.Empty();
+	LaneConnectionMap.Empty();
 	CachedRoadNetwork = nullptr;
 	bCached = false;
 #endif
@@ -125,6 +126,92 @@ void URoadBLDTrafficProvider::CacheRoadData()
 	}
 
 	bCached = true;
+
+	BuildLaneConnectivity();
+}
+
+void URoadBLDTrafficProvider::BuildLaneConnectivity()
+{
+	LaneConnectionMap.Empty();
+
+	ADynamicRoadNetwork* Network = CachedRoadNetwork.Get();
+	if (!Network)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("RoadBLDTrafficProvider: No road network found — lane connectivity unavailable."));
+		return;
+	}
+
+	const TArray<FRoadNetworkCorner>& Corners = Network->RoadNetworkCorners;
+
+	// Helper: collect lane handles adjacent to an edge curve.
+	auto CollectLaneHandles = [this](UEdgeCurve* Edge, TArray<int32>& OutHandles)
+	{
+		if (!Edge) return;
+		if (UDynamicRoadLane* Left = Edge->LeftLane)
+		{
+			if (const int32* Handle = LaneToHandleMap.Find(Left))
+			{
+				OutHandles.AddUnique(*Handle);
+			}
+		}
+		if (UDynamicRoadLane* Right = Edge->RightLane)
+		{
+			if (const int32* Handle = LaneToHandleMap.Find(Right))
+			{
+				OutHandles.AddUnique(*Handle);
+			}
+		}
+	};
+
+	for (const FRoadNetworkCorner& Corner : Corners)
+	{
+		if (Corner.bStale) continue;
+		if (!Corner.StartEdge || !Corner.EndEdge) continue;
+
+		TArray<int32> StartLaneHandles;
+		TArray<int32> EndLaneHandles;
+		CollectLaneHandles(Corner.StartEdge, StartLaneHandles);
+		CollectLaneHandles(Corner.EndEdge, EndLaneHandles);
+
+		// Connect lanes on the StartEdge side to lanes on the EndEdge side (bidirectional).
+		for (const int32 SrcHandle : StartLaneHandles)
+		{
+			TArray<FTrafficLaneHandle>& SrcConnections = LaneConnectionMap.FindOrAdd(SrcHandle);
+			for (const int32 DstHandle : EndLaneHandles)
+			{
+				if (SrcHandle == DstHandle) continue;
+				SrcConnections.AddUnique(FTrafficLaneHandle(DstHandle));
+			}
+		}
+		for (const int32 DstHandle : EndLaneHandles)
+		{
+			TArray<FTrafficLaneHandle>& DstConnections = LaneConnectionMap.FindOrAdd(DstHandle);
+			for (const int32 SrcHandle : StartLaneHandles)
+			{
+				if (SrcHandle == DstHandle) continue;
+				DstConnections.AddUnique(FTrafficLaneHandle(SrcHandle));
+			}
+		}
+	}
+
+	// Sort each connection list by HandleId for deterministic selection (System.md §4.4).
+	for (auto& Pair : LaneConnectionMap)
+	{
+		Pair.Value.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
+		{
+			return A.HandleId < B.HandleId;
+		});
+	}
+
+	int32 ConnectedLaneCount = 0;
+	for (const auto& Pair : LaneConnectionMap)
+	{
+		ConnectedLaneCount += Pair.Value.Num();
+	}
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDTrafficProvider: Built lane connectivity — %d lanes with connections, %d total links."),
+		LaneConnectionMap.Num(), ConnectedLaneCount);
 }
 
 TArray<FTrafficRoadHandle> URoadBLDTrafficProvider::GetAllRoads()
@@ -253,13 +340,10 @@ FVector URoadBLDTrafficProvider::GetLaneDirection(const FTrafficLaneHandle& Lane
 
 TArray<FTrafficLaneHandle> URoadBLDTrafficProvider::GetConnectedLanes(const FTrafficLaneHandle& Lane)
 {
-	// TODO: Implement intersection lane-to-lane connectivity using:
-	//   1. Lane → edge curves
-	//   2. ADynamicRoadNetwork::GetNextCornerConnection() at lane end
-	//   3. Corner → connecting edge curves → lanes on connected road
-	//   4. Deterministic matching sorted by corner GUID with stable tie-breaks
-	UE_LOG(LogAAATraffic, Warning,
-		TEXT("RoadBLDTrafficProvider::GetConnectedLanes — not yet implemented; returning empty array."));
+	if (const TArray<FTrafficLaneHandle>* Connected = LaneConnectionMap.Find(Lane.HandleId))
+	{
+		return *Connected;
+	}
 	return TArray<FTrafficLaneHandle>();
 }
 
