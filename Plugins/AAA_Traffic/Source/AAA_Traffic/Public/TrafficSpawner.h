@@ -32,8 +32,8 @@ private:
 	UPROPERTY(EditAnywhere, Category = "Traffic")
 	TSubclassOf<APawn> VehicleClass;
 
-	/** Number of vehicles to spawn. Capped to available lane count. */
-	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "1", ClampMax = "100"))
+	/** Number of vehicles to spawn. May exceed lane count (vehicles share lanes via SpawnSpacing). */
+	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "1"))
 	int32 VehicleCount;
 
 	/** Target speed for spawned vehicles (cm/s). */
@@ -47,4 +47,8 @@ private:
 	/** Vertical offset added to lane start position when spawning (cm). */
 	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0"))
 	float SpawnZOffset;
+
+	/** Spacing between vehicles spawned on the same lane (cm). */
+	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "200"))
+	float SpawnSpacing;
 };

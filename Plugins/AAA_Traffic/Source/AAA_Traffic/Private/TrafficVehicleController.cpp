@@ -5,6 +5,7 @@
 #include "TrafficLog.h"
 #include "ChaosWheeledVehicleMovementComponent.h"
 #include "GameFramework/Pawn.h"
+#include "Engine/World.h"
 
 ATrafficVehicleController::ATrafficVehicleController()
 	: LaneWidth(0.f)
@@ -15,6 +16,8 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, PreviousVehicleLocation(FVector::ZeroVector)
 	, TargetSpeed(1500.f)
 	, LookAheadDistance(500.f)
+	, FollowingDistance(300.f)
+	, DetectionDistance(2000.f)
 	, RandomSeed(0)
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -72,6 +75,26 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 {
 	Super::OnPossess(InPawn);
 	RandomStream.Initialize(RandomSeed);
+
+	if (UWorld* World = GetWorld())
+	{
+		if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
+		{
+			TrafficSub->RegisterVehicle(this);
+		}
+	}
+}
+
+void ATrafficVehicleController::OnUnPossess()
+{
+	if (UWorld* World = GetWorld())
+	{
+		if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
+		{
+			TrafficSub->UnregisterVehicle(this);
+		}
+	}
+	Super::OnUnPossess();
 }
 
 void ATrafficVehicleController::Tick(float DeltaSeconds)
@@ -159,8 +182,30 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	const float SteeringInput = FMath::Clamp(CrossZ * 2.0f, -1.0f, 1.0f);
 
 	// --- Throttle / Brake ---
-	// Guard against TargetSpeed == 0 to prevent division by zero.
-	if (TargetSpeed <= KINDA_SMALL_NUMBER)
+	// Compute effective target speed accounting for vehicle ahead.
+	float EffectiveTargetSpeed = TargetSpeed;
+	{
+		float LeaderSpeed = 0.0f;
+		const float LeaderDist = GetLeaderDistance(LeaderSpeed);
+		if (LeaderDist >= 0.0f)
+		{
+			// Proportional: full stop at FollowingDistance, full speed at 2x FollowingDistance.
+			const float GapFactor = FMath::Clamp(
+				(LeaderDist - FollowingDistance) / FMath::Max(FollowingDistance, 1.0f),
+				0.0f, 1.0f);
+			const float GapSpeed = TargetSpeed * GapFactor;
+			// Blend between leader speed (close) and gap-based speed (far).
+			// At GapFactor=0 (FollowingDistance): match leader speed.
+			// At GapFactor=1 (2x FollowingDistance): use full gap-based speed.
+			// This prevents hard-braking for a distant stopped leader.
+			const float ClampedLeaderSpeed = FMath::Max(LeaderSpeed, 0.0f);
+			EffectiveTargetSpeed = FMath::Lerp(ClampedLeaderSpeed, GapSpeed, GapFactor);
+			EffectiveTargetSpeed = FMath::Min(EffectiveTargetSpeed, TargetSpeed);
+		}
+	}
+
+	// Guard against EffectiveTargetSpeed == 0 to prevent division by zero.
+	if (EffectiveTargetSpeed <= KINDA_SMALL_NUMBER)
 	{
 		VehicleMovement->SetThrottleInput(0.0f);
 		VehicleMovement->SetSteeringInput(SteeringInput);
@@ -168,15 +213,15 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		return;
 	}
 
-	const float SpeedError = TargetSpeed - FMath::Abs(CurrentSpeed);
-	float ThrottleInput = FMath::Clamp(SpeedError / TargetSpeed, 0.0f, 1.0f);
+	const float SpeedError = EffectiveTargetSpeed - FMath::Abs(CurrentSpeed);
+	float ThrottleInput = FMath::Clamp(SpeedError / FMath::Max(EffectiveTargetSpeed, 1.0f), 0.0f, 1.0f);
 	float BrakeInput = 0.0f;
 
-	// Brake if significantly over target speed
-	if (CurrentSpeed > TargetSpeed * 1.1f)
+	// Brake if significantly over effective target speed
+	if (CurrentSpeed > EffectiveTargetSpeed * 1.1f)
 	{
 		ThrottleInput = 0.0f;
-		BrakeInput = FMath::Clamp((CurrentSpeed - TargetSpeed) / TargetSpeed, 0.0f, 1.0f);
+		BrakeInput = FMath::Clamp((CurrentSpeed - EffectiveTargetSpeed) / FMath::Max(EffectiveTargetSpeed, 1.0f), 0.0f, 1.0f);
 	}
 
 	// Back off throttle in sharp turns
@@ -312,4 +357,79 @@ void ATrafficVehicleController::CheckLaneTransition()
 			TEXT("TrafficVehicleController: Failed to initialize lane following for lane %d from lane %d — treating as dead end."),
 			NextLane.HandleId, CurrentLane.HandleId);
 	}
+}
+
+float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
+{
+	OutLeaderSpeed = 0.0f;
+
+	const APawn* ControlledPawn = GetPawn();
+	if (!ControlledPawn) return -1.0f;
+
+	const UWorld* World = GetWorld();
+	if (!World) return -1.0f;
+
+	const FVector VehicleLocation = ControlledPawn->GetActorLocation();
+
+	// Use direction toward the look-ahead point (lane-aligned) instead of
+	// the vehicle's forward vector, which may be temporarily misaligned.
+	FVector SweepDirection = ControlledPawn->GetActorForwardVector();
+	if (LanePoints.Num() >= 2)
+	{
+		const int32 ClosestIdx = FindClosestPointIndex(VehicleLocation);
+		const int32 NextIdx = FMath::Min(ClosestIdx + 1, LanePoints.Num() - 1);
+		SweepDirection = (LanePoints[NextIdx] - VehicleLocation).GetSafeNormal();
+		if (SweepDirection.IsNearlyZero())
+		{
+			SweepDirection = ControlledPawn->GetActorForwardVector();
+		}
+	}
+
+	// Sphere sweep along the lane direction.
+	// Sweep radius is 40% of lane width — wide enough to catch same-lane vehicles
+	// without reaching into adjacent lanes (which are typically 100% width apart).
+	const float SweepRadiusFraction = 0.4f;
+	const float MinSweepRadius = 50.0f;
+	const float SweepRadius = FMath::Max(LaneWidth * SweepRadiusFraction, MinSweepRadius);
+
+	// Small offset to push sweep start past our own collision shape.
+	const float SelfCollisionBuffer = 10.0f;
+	const FVector SweepStart = VehicleLocation + SweepDirection * (SweepRadius + SelfCollisionBuffer);
+	const FVector SweepEnd = SweepStart + SweepDirection * DetectionDistance;
+
+	FHitResult HitResult;
+	FCollisionQueryParams QueryParams;
+	QueryParams.AddIgnoredActor(ControlledPawn);
+	QueryParams.bTraceComplex = false;
+
+	const bool bHit = World->SweepSingleByChannel(
+		HitResult,
+		SweepStart,
+		SweepEnd,
+		FQuat::Identity,
+		ECC_Pawn,
+		FCollisionShape::MakeSphere(SweepRadius),
+		QueryParams);
+
+	if (!bHit || !HitResult.GetActor())
+	{
+		return -1.0f;
+	}
+
+	// Verify the hit actor is a traffic vehicle (controlled by ATrafficVehicleController)
+	// to avoid false positives from player characters or other non-traffic pawns.
+	const APawn* HitPawn = Cast<APawn>(HitResult.GetActor());
+	if (!HitPawn || !Cast<ATrafficVehicleController>(HitPawn->GetController()))
+	{
+		return -1.0f;
+	}
+
+	// Extract leader's forward speed.
+	if (const UPawnMovementComponent* LeaderMovement = HitPawn->GetMovementComponent())
+	{
+		// Project leader velocity onto our sweep direction for relative speed.
+		OutLeaderSpeed = FVector::DotProduct(LeaderMovement->Velocity, SweepDirection);
+	}
+
+	return HitResult.Distance;
 }

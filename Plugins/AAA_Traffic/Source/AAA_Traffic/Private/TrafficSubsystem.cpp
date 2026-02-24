@@ -2,6 +2,7 @@
 
 #include "TrafficSubsystem.h"
 #include "TrafficRoadProvider.h"
+#include "TrafficVehicleController.h"
 #include "TrafficLog.h"
 
 DEFINE_LOG_CATEGORY(LogAAATraffic);
@@ -49,4 +50,16 @@ ITrafficRoadProvider* UTrafficSubsystem::GetProvider() const
 	}
 
 	return Cast<ITrafficRoadProvider>(ActiveProviderObject);
+}
+
+void UTrafficSubsystem::RegisterVehicle(ATrafficVehicleController* InController)
+{
+	if (!InController) return;
+	ActiveVehicles.Add(InController);
+}
+
+void UTrafficSubsystem::UnregisterVehicle(ATrafficVehicleController* InController)
+{
+	if (!InController) return;
+	ActiveVehicles.Remove(InController);
 }
