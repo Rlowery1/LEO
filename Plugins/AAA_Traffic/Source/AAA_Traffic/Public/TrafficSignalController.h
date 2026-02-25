@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "TrafficRoadProvider.h"
 #include "TrafficSignalController.generated.h"
 
 class UTrafficSubsystem;
@@ -20,6 +21,28 @@ enum class ETrafficSignalPhase : uint8
 	Yellow,
 	/** Vehicles must stop. */
 	Red
+};
+
+/**
+ * A group of lanes that share a green phase in a multi-phase signal.
+ * For a simple 4-way intersection, you might have 2 groups: one for N/S lanes
+ * and one for E/W lanes.
+ *
+ * When PhaseGroups is empty on the signal controller, the signal falls back to
+ * the legacy single-phase mode where all lanes get green simultaneously.
+ */
+USTRUCT(BlueprintType)
+struct FSignalPhaseGroup
+{
+	GENERATED_BODY()
+
+	/** Human-readable label for this phase group (e.g. "North-South"). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal")
+	FString GroupName;
+
+	/** Lanes that receive green during this group's phase. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal")
+	TArray<FTrafficLaneHandle> GreenLanes;
 };
 
 /**
@@ -49,10 +72,20 @@ public:
 	virtual void Tick(float DeltaSeconds) override;
 
 	/** Get the current signal phase. */
+	UFUNCTION(BlueprintCallable, Category = "Traffic|Signal")
 	ETrafficSignalPhase GetCurrentPhase() const { return CurrentPhase; }
 
 	/** Get the junction ID this signal controls. */
+	UFUNCTION(BlueprintPure, Category = "Traffic|Signal")
 	int32 GetJunctionId() const { return JunctionId; }
+
+	/**
+	 * Check if a given lane has a green signal right now.
+	 * When PhaseGroups are configured, checks if the lane is in the current green group.
+	 * When PhaseGroups is empty (legacy mode), returns true if the whole signal is green.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Traffic|Signal")
+	bool IsLaneGreen(const FTrafficLaneHandle& Lane) const;
 
 	// --- Configuration ---
 
@@ -76,12 +109,29 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal", meta = (ClampMin = "0"))
 	float PhaseOffset;
 
+	/**
+	 * Optional multi-phase groups. Each group defines a set of lanes that get green
+	 * simultaneously. The signal cycles through groups in order:
+	 *   Group0 Green → Yellow → Red(all-red gap) → Group1 Green → Yellow → ...
+	 *
+	 * When empty, the signal uses the legacy single-phase mode (all lanes green/red together).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal")
+	TArray<FSignalPhaseGroup> PhaseGroups;
+
+	/** When true (non-Shipping builds), draws a sphere at this signal's location colored by the current phase. Has no effect in Shipping. */
+	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")
+	bool bDebugDrawSignal = false;
+
 private:
 	/** Current phase of the signal. */
 	ETrafficSignalPhase CurrentPhase;
 
 	/** Time remaining in the current phase (seconds). */
 	float PhaseTimer;
+
+	/** Index into PhaseGroups for the currently-green group (multi-phase mode). */
+	int32 CurrentGroupIndex;
 
 	/** Advance to the next phase in the cycle. */
 	void AdvancePhase();

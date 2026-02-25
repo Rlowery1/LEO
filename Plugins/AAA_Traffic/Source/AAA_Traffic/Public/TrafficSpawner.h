@@ -22,7 +22,7 @@ struct FTrafficLaneHandle;
  * Play-In-Editor — useful for verifying that the adapter path data aligns
  * with the painted road markings.
  */
-UCLASS()
+UCLASS(Blueprintable)
 class AAA_TRAFFIC_API ATrafficSpawner : public AActor
 {
 	GENERATED_BODY()
@@ -82,7 +82,7 @@ private:
 	/** Controllers spawned by this spawner, for filtering shared despawn delegate. */
 	TSet<TWeakObjectPtr<ATrafficVehicleController>> OwnedVehicles;
 
-#if ENABLE_DRAW_DEBUG
+#if ENABLE_DRAW_DEBUG // ── Debug internals (no UPROPERTYs here) ──
 	/** Cache lane polylines from the provider so debug draw doesn't re-query every frame. */
 	void CacheDebugLaneData();
 
@@ -110,30 +110,31 @@ private:
 	TArray<FDebugLaneData> DebugLanes;
 #endif // ENABLE_DRAW_DEBUG
 
+protected:
 	// ── Traffic Config ──────────────────────────────────────────────
 
 	/** Vehicle pawn class to spawn (e.g. a DD_Vehicles Blueprint). */
-	UPROPERTY(EditAnywhere, Category = "Traffic")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	TSubclassOf<APawn> VehicleClass;
 
 	/** Number of vehicles to spawn. May exceed lane count (vehicles share lanes via SpawnSpacing). */
-	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "1"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "1"))
 	int32 VehicleCount;
 
 	/** Target speed for spawned vehicles (cm/s). */
-	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
 	float VehicleSpeed;
 
 	/** Seed for deterministic spawn decisions (lane assignment, ordering). */
-	UPROPERTY(EditAnywhere, Category = "Traffic")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	int32 SpawnSeed;
 
 	/** Vertical offset added to lane start position when spawning (cm). */
-	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
 	float SpawnZOffset;
 
 	/** Spacing between vehicles spawned on the same lane (cm). */
-	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "200"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "200"))
 	float SpawnSpacing;
 
 	/**
@@ -141,7 +142,7 @@ private:
 	 * Each vehicle gets a deterministic random offset in [-SpeedVariation, +SpeedVariation]%
 	 * of VehicleSpeed, using SpawnSeed for reproducibility.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0", ClampMax = "100"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0", ClampMax = "100"))
 	float SpeedVariation;
 
 	// ── Lane Change ────────────────────────────────────────────────
@@ -152,28 +153,28 @@ private:
 	 * 1 = aggressive (short blend, low cooldown, loose gap).
 	 * Maps to internal controller tuning knobs automatically.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Traffic|Lane Change", meta = (ClampMin = "0", ClampMax = "1"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Lane Change", meta = (ClampMin = "0", ClampMax = "1"))
 	float LaneChangeAggression;
 
 	// ── Respawn ────────────────────────────────────────────────────
 
 	/** If true, despawned vehicles are replaced to maintain VehicleCount. */
-	UPROPERTY(EditAnywhere, Category = "Traffic|Respawn")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Respawn")
 	bool bEnableRespawn;
 
 	/** Seconds between respawn checks. */
-	UPROPERTY(EditAnywhere, Category = "Traffic|Respawn", meta = (ClampMin = "0.5", EditCondition = "bEnableRespawn"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Respawn", meta = (ClampMin = "0.5", EditCondition = "bEnableRespawn"))
 	float RespawnCheckInterval;
 
 	/**
 	 * Minimum distance (cm) from any player for a respawn location to be valid.
 	 * Prevents vehicles popping in within the player's field of view.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Traffic|Respawn", meta = (ClampMin = "1000", EditCondition = "bEnableRespawn"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Respawn", meta = (ClampMin = "1000", EditCondition = "bEnableRespawn"))
 	float MinRespawnDistance;
 
 	/** Default speed limit (cm/s) used if the provider returns no per-lane speed data. */
-	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
 	float DefaultSpeedLimit;
 
 	// ── Debug ───────────────────────────────────────────────────────

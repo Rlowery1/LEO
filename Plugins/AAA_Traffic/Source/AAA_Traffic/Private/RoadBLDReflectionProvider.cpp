@@ -545,6 +545,7 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 	FProperty* StartEdgeProp = CornerStruct->FindPropertyByName(TEXT("StartEdge"));
 	FProperty* EndEdgeProp   = CornerStruct->FindPropertyByName(TEXT("EndEdge"));
 	FProperty* bStaleProp    = CornerStruct->FindPropertyByName(TEXT("bStale"));
+	IntersectionPointProp    = CornerStruct->FindPropertyByName(TEXT("IntersectionPoint"));
 
 	if (!StartEdgeProp || !EndEdgeProp)
 	{
@@ -624,6 +625,14 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 	};
 
 	// ── Process each corner ──────────────────────────────────────
+	// Also collect IntersectionPoints for junction ID grouping (F1).
+	struct FCornerJunctionData
+	{
+		FVector IntersectionPoint;
+		TArray<int32> StartLaneHandles;
+	};
+	TArray<FCornerJunctionData> CornerJunctionDataList;
+
 	for (int32 i = 0; i < NumCorners; ++i)
 	{
 		const uint8* ElemPtr = ArrayHelper.GetRawPtr(i);
@@ -655,6 +664,20 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 				Connections.AddUnique(FTrafficLaneHandle(DstHandle));
 			}
 		}
+
+		// Collect junction data for grouping pass.
+		if (IntersectionPointProp && StartLaneHandles.Num() > 0)
+		{
+			FCornerJunctionData JData;
+			const FStructProperty* VecProp = CastField<FStructProperty>(IntersectionPointProp);
+			if (VecProp)
+			{
+				const void* ValuePtr = VecProp->ContainerPtrToValuePtr<void>(ElemPtr);
+				JData.IntersectionPoint = *static_cast<const FVector*>(ValuePtr);
+			}
+			JData.StartLaneHandles = MoveTemp(StartLaneHandles);
+			CornerJunctionDataList.Add(MoveTemp(JData));
+		}
 	}
 
 	// Sort each connection list by HandleId for deterministic selection.
@@ -674,6 +697,103 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("RoadBLDReflectionProvider: Built lane connectivity — %d lanes with connections, %d total links."),
 		LaneConnectionMap.Num(), ConnectedLaneCount);
+
+	// ── Junction grouping pass ───────────────────────────────────
+	// Group corners whose IntersectionPoint values are within a spatial threshold
+	// into junction clusters. Assign deterministic junction IDs (1-based).
+	LaneToJunctionMap.Empty();
+	JunctionCentroids.Empty();
+
+	if (CornerJunctionDataList.Num() > 0)
+	{
+		constexpr float JunctionGroupThreshold = 200.0f; // cm
+		const float ThresholdSq = JunctionGroupThreshold * JunctionGroupThreshold;
+
+		// Union-find for clustering corners by proximity.
+		TArray<int32> Parent;
+		Parent.SetNumUninitialized(CornerJunctionDataList.Num());
+		for (int32 k = 0; k < Parent.Num(); ++k) { Parent[k] = k; }
+
+		// Find with path compression.
+		TFunction<int32(int32)> Find = [&Parent, &Find](int32 X) -> int32
+		{
+			if (Parent[X] != X) { Parent[X] = Find(Parent[X]); }
+			return Parent[X];
+		};
+
+		// Union.
+		auto Union = [&Parent, &Find](int32 A, int32 B)
+		{
+			int32 RA = Find(A);
+			int32 RB = Find(B);
+			if (RA != RB) { Parent[RA] = RB; }
+		};
+
+		// Cluster by proximity (O(N^2), N = non-stale corners — small).
+		for (int32 a = 0; a < CornerJunctionDataList.Num(); ++a)
+		{
+			for (int32 b = a + 1; b < CornerJunctionDataList.Num(); ++b)
+			{
+				if (FVector::DistSquared(CornerJunctionDataList[a].IntersectionPoint,
+					CornerJunctionDataList[b].IntersectionPoint) <= ThresholdSq)
+				{
+					Union(a, b);
+				}
+			}
+		}
+
+		// Collect clusters: root → list of corner indices.
+		TMap<int32, TArray<int32>> Clusters;
+		for (int32 k = 0; k < CornerJunctionDataList.Num(); ++k)
+		{
+			Clusters.FindOrAdd(Find(k)).Add(k);
+		}
+
+		// Sort clusters by centroid (X→Y→Z) for deterministic ID assignment.
+		struct FClusterEntry
+		{
+			FVector Centroid;
+			TArray<int32> CornerIndices;
+		};
+		TArray<FClusterEntry> SortedClusters;
+		for (auto& ClusterPair : Clusters)
+		{
+			FClusterEntry Entry;
+			FVector Sum = FVector::ZeroVector;
+			for (int32 Idx : ClusterPair.Value)
+			{
+				Sum += CornerJunctionDataList[Idx].IntersectionPoint;
+			}
+			Entry.Centroid = Sum / static_cast<float>(ClusterPair.Value.Num());
+			Entry.CornerIndices = MoveTemp(ClusterPair.Value);
+			SortedClusters.Add(MoveTemp(Entry));
+		}
+		SortedClusters.Sort([](const FClusterEntry& A, const FClusterEntry& B)
+		{
+			if (!FMath::IsNearlyEqual(A.Centroid.X, B.Centroid.X, 1.0f)) return A.Centroid.X < B.Centroid.X;
+			if (!FMath::IsNearlyEqual(A.Centroid.Y, B.Centroid.Y, 1.0f)) return A.Centroid.Y < B.Centroid.Y;
+			return A.Centroid.Z < B.Centroid.Z;
+		});
+
+		// Assign junction IDs starting at 1.
+		for (int32 JIdx = 0; JIdx < SortedClusters.Num(); ++JIdx)
+		{
+			const int32 JunctionId = JIdx + 1;
+			JunctionCentroids.Add(JunctionId, SortedClusters[JIdx].Centroid);
+
+			for (int32 CornerIdx : SortedClusters[JIdx].CornerIndices)
+			{
+				for (int32 LaneHandle : CornerJunctionDataList[CornerIdx].StartLaneHandles)
+				{
+					LaneToJunctionMap.FindOrAdd(LaneHandle) = JunctionId;
+				}
+			}
+		}
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: Grouped %d corners into %d junctions, %d lanes mapped."),
+			CornerJunctionDataList.Num(), SortedClusters.Num(), LaneToJunctionMap.Num());
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -726,6 +846,66 @@ void URoadBLDReflectionProvider::BuildLaneAdjacency()
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("RoadBLDReflectionProvider: Built lane adjacency — %d left links, %d right links."),
 		LeftNeighborMap.Num(), RightNeighborMap.Num());
+}
+
+// ---------------------------------------------------------------------------
+// ITrafficRoadProvider — junction queries
+// ---------------------------------------------------------------------------
+
+int32 URoadBLDReflectionProvider::GetJunctionForLane(const FTrafficLaneHandle& Lane)
+{
+	if (const int32* JId = LaneToJunctionMap.Find(Lane.HandleId))
+	{
+		return *JId;
+	}
+	return 0;
+}
+
+bool URoadBLDReflectionProvider::GetJunctionPath(
+	const FTrafficLaneHandle& FromLane,
+	const FTrafficLaneHandle& ToLane,
+	TArray<FVector>& OutPath)
+{
+	// Find the junction that bridges FromLane → ToLane.
+	const int32* FromJunction = LaneToJunctionMap.Find(FromLane.HandleId);
+	if (!FromJunction || *FromJunction == 0)
+	{
+		return false;
+	}
+
+	// Validate that ToLane maps to the same junction (guards against mismatched lane pairs).
+	const int32* ToJunction = LaneToJunctionMap.Find(ToLane.HandleId);
+	if (!ToJunction || *ToJunction != *FromJunction)
+	{
+		return false;
+	}
+
+	const FVector* Centroid = JunctionCentroids.Find(*FromJunction);
+	if (!Centroid)
+	{
+		return false;
+	}
+
+	// Build a 3-point path: FromLane endpoint → junction centroid → ToLane startpoint.
+	TArray<FVector> FromPoints;
+	float FromWidth;
+	TArray<FVector> ToPoints;
+	float ToWidth;
+
+	if (!GetLanePath(FromLane, FromPoints, FromWidth) || FromPoints.Num() == 0)
+	{
+		return false;
+	}
+	if (!GetLanePath(ToLane, ToPoints, ToWidth) || ToPoints.Num() == 0)
+	{
+		return false;
+	}
+
+	OutPath.Reset(3);
+	OutPath.Add(FromPoints.Last());
+	OutPath.Add(*Centroid);
+	OutPath.Add(ToPoints[0]);
+	return true;
 }
 
 // ---------------------------------------------------------------------------
