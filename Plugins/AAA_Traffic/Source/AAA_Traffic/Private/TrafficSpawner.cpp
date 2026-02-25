@@ -434,8 +434,26 @@ void ATrafficSpawner::DrawDebugLanes() const
 }
 #endif // ENABLE_DRAW_DEBUG
 
+void ATrafficSpawner::OnProviderRegistered(ITrafficRoadProvider* Provider)
+{
+	if (bSpawnComplete) { return; }
+
+#if ENABLE_DRAW_DEBUG
+	// Reset debug cache so it picks up provider data on next tick.
+	bDebugCacheReady = false;
+	bDebugCacheAttempted = false;
+	DebugLanes.Empty();
+#endif
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("TrafficSpawner: Provider registered (deferred) — attempting vehicle spawn."));
+	SpawnVehicles();
+}
+
 void ATrafficSpawner::SpawnVehicles()
 {
+	if (bSpawnComplete) { return; }
+
 	if (!VehicleClass)
 	{
 		UE_LOG(LogAAATraffic, Error, TEXT("TrafficSpawner: No VehicleClass assigned."));
@@ -453,8 +471,18 @@ void ATrafficSpawner::SpawnVehicles()
 	ITrafficRoadProvider* Provider = TrafficSub ? TrafficSub->GetProvider() : nullptr;
 	if (!Provider)
 	{
-		UE_LOG(LogAAATraffic, Error,
-			TEXT("TrafficSpawner: No road provider registered. Is a road-kit adapter module loaded?"));
+		// No provider yet — subscribe for deferred retry.
+		if (TrafficSub)
+		{
+			TrafficSub->OnProviderRegistered.AddUObject(this, &ATrafficSpawner::OnProviderRegistered);
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("TrafficSpawner: No provider yet — subscribed for deferred retry."));
+		}
+		else
+		{
+			UE_LOG(LogAAATraffic, Error,
+				TEXT("TrafficSpawner: No TrafficSubsystem found."));
+		}
 		return;
 	}
 
@@ -584,4 +612,6 @@ void ATrafficSpawner::SpawnVehicles()
 				i, Lane.HandleId);
 		}
 	}
+
+	bSpawnComplete = true;
 }

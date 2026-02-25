@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "DrawDebugHelpers.h"
+#include "TrafficRoadProvider.h"
 #include "TrafficSpawner.generated.h"
 
 /**
@@ -34,6 +35,12 @@ protected:
 private:
 	/** Deferred to next tick so all subsystems (including adapters) are initialized. */
 	void SpawnVehicles();
+
+	/** Called when a provider registers after BeginPlay (deferred retry). */
+	void OnProviderRegistered(ITrafficRoadProvider* Provider);
+
+	/** True once SpawnVehicles has successfully completed. */
+	bool bSpawnComplete = false;
 
 #if ENABLE_DRAW_DEBUG
 	/** Cache lane polylines from the provider so debug draw doesn't re-query every frame. */
