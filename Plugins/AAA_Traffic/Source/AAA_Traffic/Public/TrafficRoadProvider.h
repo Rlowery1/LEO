@@ -147,4 +147,11 @@ public:
 	 * Returns true if a path was generated, false otherwise (caller should fall back to straight-line).
 	 */
 	virtual bool GetJunctionPath(const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane, TArray<FVector>& OutPath) { return false; }
+
+	/**
+	 * Query whether a lane's travel direction is reversed relative to its
+	 * road's reference direction.  When true, the provider returns lane
+	 * path points already oriented in the correct travel direction.
+	 */
+	virtual bool IsLaneReversed(const FTrafficLaneHandle& Lane) { return false; }
 };
