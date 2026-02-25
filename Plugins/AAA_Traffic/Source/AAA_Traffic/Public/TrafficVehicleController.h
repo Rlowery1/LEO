@@ -151,6 +151,9 @@ private:
 	/** Previous vehicle location for distance tracking. */
 	FVector PreviousVehicleLocation;
 
+	/** Distance traveled by the vehicle this tick (computed once, consumed by blend). */
+	float DistanceThisTick;
+
 	// ── Lane-change state ───────────────────────────────────
 
 	/** Current lane-change phase. */

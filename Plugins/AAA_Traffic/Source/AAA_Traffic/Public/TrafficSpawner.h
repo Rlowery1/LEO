@@ -34,6 +34,7 @@ public:
 
 protected:
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 private:
 	/** Deferred to next tick so all subsystems (including adapters) are initialized. */
@@ -77,6 +78,9 @@ private:
 
 	/** Cached list of all available lanes (populated once during initial spawn). */
 	TArray<FTrafficLaneHandle> CachedAllLanes;
+
+	/** Controllers spawned by this spawner, for filtering shared despawn delegate. */
+	TSet<TWeakObjectPtr<ATrafficVehicleController>> OwnedVehicles;
 
 #if ENABLE_DRAW_DEBUG
 	/** Cache lane polylines from the provider so debug draw doesn't re-query every frame. */

@@ -14,6 +14,7 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, bAtDeadEnd(false)
 	, DistanceTraveledOnLane(0.0f)
 	, PreviousVehicleLocation(FVector::ZeroVector)
+	, DistanceThisTick(0.0f)
 	, LaneChangeState(ELaneChangeState::None)
 	, TargetLaneWidth(0.0f)
 	, LaneChangeProgress(0.0f)
@@ -185,9 +186,11 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	const float CurrentSpeed = VehicleMovement->GetForwardSpeed();
 
 	// Track cumulative distance traveled on this lane to prevent short-lane transition loops.
+	DistanceThisTick = 0.0f;
 	if (!PreviousVehicleLocation.IsZero())
 	{
-		DistanceTraveledOnLane += FVector::Dist(PreviousVehicleLocation, VehicleLocation);
+		DistanceThisTick = FVector::Dist(PreviousVehicleLocation, VehicleLocation);
+		DistanceTraveledOnLane += DistanceThisTick;
 	}
 	PreviousVehicleLocation = VehicleLocation;
 
@@ -534,10 +537,10 @@ void ATrafficVehicleController::EvaluateLaneChange()
 FVector ATrafficVehicleController::UpdateLaneChangeBlend(const FVector& VehicleLocation, int32 ClosestIndex)
 {
 	// Advance progress based on distance traveled this tick.
-	if (!PreviousVehicleLocation.IsZero())
+	// DistanceThisTick is computed once at the top of UpdateVehicleInput
+	// (before PreviousVehicleLocation is overwritten).
 	{
-		const float DistThisTick = FVector::Dist(PreviousVehicleLocation, VehicleLocation);
-		const float ProgressDelta = DistThisTick / FMath::Max(LaneChangeDistance, 1.0f);
+		const float ProgressDelta = DistanceThisTick / FMath::Max(LaneChangeDistance, 1.0f);
 		LaneChangeProgress = FMath::Min(LaneChangeProgress + ProgressDelta, 1.0f);
 	}
 

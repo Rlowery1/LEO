@@ -69,6 +69,24 @@ void ATrafficSpawner::Tick(float DeltaSeconds)
 #endif
 }
 
+void ATrafficSpawner::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// Unsubscribe from despawn delegate to prevent dangling callbacks.
+	if (UWorld* World = GetWorld())
+	{
+		if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
+		{
+			TrafficSub->OnVehicleDespawned.RemoveAll(this);
+			TrafficSub->OnProviderRegistered.RemoveAll(this);
+		}
+		World->GetTimerManager().ClearTimer(RespawnTimerHandle);
+	}
+
+	OwnedVehicles.Empty();
+
+	Super::EndPlay(EndPlayReason);
+}
+
 #if ENABLE_DRAW_DEBUG
 void ATrafficSpawner::CacheDebugLaneData()
 {
@@ -521,6 +539,8 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 		Controller->Possess(Vehicle);
 		Controller->InitializeLaneFollowing(Lane);
 
+		OwnedVehicles.Add(Controller);
+
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("TrafficSpawner: Vehicle %d spawned on lane %d."),
 			VehicleIndex, Lane.HandleId);
@@ -530,6 +550,12 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 void ATrafficSpawner::OnVehicleDespawned(ATrafficVehicleController* Controller, const FTrafficLaneHandle& Lane)
 {
 	if (!bEnableRespawn || !bSpawnComplete) { return; }
+
+	// Only respond to vehicles owned by this spawner.
+	if (!Controller || !OwnedVehicles.Remove(Controller))
+	{
+		return;
+	}
 
 	// Queue the lane for respawn.
 	if (Lane.IsValid())
@@ -604,7 +630,9 @@ void ATrafficSpawner::CheckRespawn()
 
 		++RespawnCounter;
 		const int32 VehicleIdx = TotalVehiclesSpawned++;
-		SpawnSingleVehicle(World, Provider, Lane, 0, VehicleIdx);
+		// Use RespawnCounter as slot offset to stagger respawn positions
+		// and avoid clumping when multiple respawns target the same lane.
+		SpawnSingleVehicle(World, Provider, Lane, RespawnCounter, VehicleIdx);
 
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("TrafficSpawner: Respawned vehicle on lane %d (respawn #%d)."),
