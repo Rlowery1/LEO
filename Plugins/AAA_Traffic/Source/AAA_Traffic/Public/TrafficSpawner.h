@@ -12,6 +12,25 @@ class ATrafficVehicleController;
 struct FTrafficLaneHandle;
 
 /**
+ * Entry in the vehicle class table for varied spawning.
+ * When the spawner's VehicleClasses array is non-empty, a class is picked
+ * per vehicle using weighted random selection with FRandomStream (deterministic).
+ */
+USTRUCT(BlueprintType)
+struct FVehicleClassEntry
+{
+	GENERATED_BODY()
+
+	/** Vehicle pawn class to spawn. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
+	TSubclassOf<APawn> VehicleClass;
+
+	/** Relative weight for selection probability. Higher = more likely. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0.01"))
+	float Weight = 1.0f;
+};
+
+/**
  * Place this actor in a level to spawn traffic vehicles on available lanes.
  *
  * On BeginPlay it queries the active ITrafficRoadProvider for lanes,
@@ -26,6 +45,8 @@ UCLASS(Blueprintable)
 class AAA_TRAFFIC_API ATrafficSpawner : public AActor
 {
 	GENERATED_BODY()
+
+	friend class FTrafficSpawnerCustomization;
 
 public:
 	ATrafficSpawner();
@@ -60,6 +81,12 @@ private:
 
 	/** Periodic check: if we're below VehicleCount, spawn a replacement. */
 	void CheckRespawn();
+
+	/** Select a vehicle class for the given vehicle index using weighted random. */
+	TSubclassOf<APawn> SelectVehicleClass(int32 VehicleIndex) const;
+
+	/** Auto-discover junctions and spawn ATrafficSignalController actors. */
+	void PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Provider, const TArray<FTrafficLaneHandle>& AllLanes);
 
 	/** True once SpawnVehicles has successfully completed. */
 	bool bSpawnComplete = false;
@@ -113,9 +140,17 @@ private:
 protected:
 	// ── Traffic Config ──────────────────────────────────────────────
 
-	/** Vehicle pawn class to spawn (e.g. a DD_Vehicles Blueprint). */
+	/** Vehicle pawn class to spawn (e.g. a DD_Vehicles Blueprint). Used when VehicleClasses is empty. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	TSubclassOf<APawn> VehicleClass;
+
+	/**
+	 * Array of vehicle classes with weights for varied spawning.
+	 * When non-empty, overrides VehicleClass. The spawner picks a class per
+	 * vehicle via weighted random using SpawnSeed for determinism.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
+	TArray<FVehicleClassEntry> VehicleClasses;
 
 	/** Number of vehicles to spawn. May exceed lane count (vehicles share lanes via SpawnSpacing). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "1"))
@@ -176,6 +211,10 @@ protected:
 	/** Default speed limit (cm/s) used if the provider returns no per-lane speed data. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
 	float DefaultSpeedLimit;
+
+	/** Automatically spawn traffic signal controllers at discovered junctions. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
+	bool bAutoPlaceSignals = true;
 
 	// ── Debug ───────────────────────────────────────────────────────
 

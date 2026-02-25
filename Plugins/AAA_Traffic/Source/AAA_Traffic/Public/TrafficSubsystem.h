@@ -11,6 +11,7 @@
 class ITrafficRoadProvider;
 class ATrafficVehicleController;
 class ATrafficSignalController;
+class UTrafficVehiclePool;
 
 /**
  * LOD tier for distance-based vehicle simulation detail.
@@ -121,6 +122,11 @@ public:
 	/** Release junction occupancy for the given vehicle. */
 	void ReleaseJunction(int32 JunctionId, ATrafficVehicleController* Controller);
 
+	// --- Vehicle Pool ---
+
+	/** Get the vehicle object pool (used by spawner and despawn sweep). */
+	UTrafficVehiclePool* GetVehiclePool() const { return VehiclePool; }
+
 	// --- Despawn configuration ---
 
 	/** Maximum distance (cm) from the nearest player before a vehicle is despawned. */
@@ -145,6 +151,10 @@ private:
 	/** The UObject that implements ITrafficRoadProvider. Kept as UObject* to prevent GC. */
 	UPROPERTY()
 	TObjectPtr<UObject> ActiveProviderObject;
+
+	/** Vehicle object pool for recycling despawned pawns (I1). */
+	UPROPERTY()
+	TObjectPtr<UTrafficVehiclePool> VehiclePool;
 
 	/**
 	 * Registry of all active traffic vehicle controllers in the world.

@@ -4,6 +4,7 @@
 #include "TrafficRoadProvider.h"
 #include "TrafficVehicleController.h"
 #include "TrafficSignalController.h"
+#include "TrafficVehiclePool.h"
 #include "TrafficLog.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
@@ -22,6 +23,7 @@ UTrafficSubsystem::UTrafficSubsystem()
 void UTrafficSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
+	VehiclePool = NewObject<UTrafficVehiclePool>(this, TEXT("VehiclePool"));
 }
 
 void UTrafficSubsystem::Deinitialize()
@@ -37,6 +39,10 @@ void UTrafficSubsystem::Deinitialize()
 	VehicleLODMap.Empty();
 	JunctionOccupancy.Empty();
 	SignalControllerMap.Empty();
+	if (VehiclePool)
+	{
+		VehiclePool->DrainPool();
+	}
 	Super::Deinitialize();
 }
 
@@ -265,7 +271,7 @@ void UTrafficSubsystem::PerformDespawnSweep()
 		}
 	}
 
-	// Destroy collected vehicles.
+	// Destroy collected vehicles (or pool them if pool is available).
 	for (int32 Idx = 0; Idx < ToDespawn.Num(); ++Idx)
 	{
 		ATrafficVehicleController* Controller = ToDespawn[Idx];
@@ -277,7 +283,12 @@ void UTrafficSubsystem::PerformDespawnSweep()
 
 		Controller->UnPossess();
 
-		if (VehiclePawn)
+		if (VehiclePawn && VehiclePool)
+		{
+			// Pool the pawn instead of destroying it (I1: object pooling).
+			VehiclePool->ReleaseVehicle(VehiclePawn);
+		}
+		else if (VehiclePawn)
 		{
 			VehiclePawn->Destroy();
 		}
