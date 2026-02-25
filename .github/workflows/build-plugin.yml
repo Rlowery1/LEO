@@ -34,8 +34,44 @@ jobs:
       ARTIFACTS_DIR: ${{ github.workspace }}\Artifacts
 
     steps:
+      - name: Kill stale UE build processes
+        shell: powershell
+        run: |
+          # Kill any leftover RunUAT / UBT / UBA processes from previous cancelled runs
+          $staleProcs = 'UnrealBuildTool','UbaHost','UbaAgent','dotnet','msbuild' | ForEach-Object {
+            Get-Process -Name $_ -ErrorAction SilentlyContinue
+          }
+          if ($staleProcs) {
+            $staleProcs | ForEach-Object {
+              Write-Host "Killing stale process: $($_.ProcessName) (PID $($_.Id))"
+              Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+            }
+            Start-Sleep -Seconds 2
+          } else {
+            Write-Host 'No stale build processes found.'
+          }
+
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Clean previous build artifacts
+        shell: powershell
+        run: |
+          # Remove stale Artifacts and Intermediate from prior runs to ensure a clean build
+          if (Test-Path $env:ARTIFACTS_DIR) {
+            Write-Host "Removing stale artifacts: $env:ARTIFACTS_DIR"
+            Remove-Item -Recurse -Force $env:ARTIFACTS_DIR
+          }
+          $hostIntermediate = Join-Path $env:GITHUB_WORKSPACE 'HostProject\Intermediate'
+          if (Test-Path $hostIntermediate) {
+            Write-Host "Removing stale HostProject Intermediate: $hostIntermediate"
+            Remove-Item -Recurse -Force $hostIntermediate
+          }
+          $hostSaved = Join-Path $env:GITHUB_WORKSPACE 'HostProject\Saved'
+          if (Test-Path $hostSaved) {
+            Write-Host "Removing stale HostProject Saved: $hostSaved"
+            Remove-Item -Recurse -Force $hostSaved
+          }
 
       - name: Determine channel (dev vs main)
         shell: powershell
