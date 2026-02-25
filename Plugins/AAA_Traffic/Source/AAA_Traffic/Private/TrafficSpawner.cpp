@@ -8,6 +8,8 @@
 #include "Engine/World.h"
 #include "TimerManager.h"
 #include "EngineUtils.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/Pawn.h"
 
 ATrafficSpawner::ATrafficSpawner()
 	: VehicleCount(1)
@@ -16,6 +18,11 @@ ATrafficSpawner::ATrafficSpawner()
 	, SpawnZOffset(50.f)
 	, SpawnSpacing(1500.f)
 	, SpeedVariation(15.f)
+	, LaneChangeAggression(0.5f)
+	, bEnableRespawn(true)
+	, RespawnCheckInterval(2.0f)
+	, MinRespawnDistance(10000.f)
+	, DefaultSpeedLimit(0.0f)
 {
 #if ENABLE_DRAW_DEBUG
 	PrimaryActorTick.bCanEverTick = true;
@@ -60,6 +67,24 @@ void ATrafficSpawner::Tick(float DeltaSeconds)
 		DrawDebugLanes();
 	}
 #endif
+}
+
+void ATrafficSpawner::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// Unsubscribe from despawn delegate to prevent dangling callbacks.
+	if (UWorld* World = GetWorld())
+	{
+		if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
+		{
+			TrafficSub->OnVehicleDespawned.RemoveAll(this);
+			TrafficSub->OnProviderRegistered.RemoveAll(this);
+		}
+		World->GetTimerManager().ClearTimer(RespawnTimerHandle);
+	}
+
+	OwnedVehicles.Empty();
+
+	Super::EndPlay(EndPlayReason);
 }
 
 #if ENABLE_DRAW_DEBUG
@@ -434,6 +459,189 @@ void ATrafficSpawner::DrawDebugLanes() const
 }
 #endif // ENABLE_DRAW_DEBUG
 
+void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Provider,
+	const FTrafficLaneHandle& Lane, int32 SlotIndex, int32 VehicleIndex)
+{
+	TArray<FVector> LanePoints;
+	float LaneWidth;
+	if (!Provider->GetLanePath(Lane, LanePoints, LaneWidth) || LanePoints.Num() < 2)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("TrafficSpawner: Could not get path for lane %d — skipping."),
+			Lane.HandleId);
+		return;
+	}
+
+	const float TargetOffset = SlotIndex * SpawnSpacing;
+
+	// Walk along lane points to find the staggered spawn position.
+	FVector SpawnPos = LanePoints[0];
+	FVector SpawnDir = (LanePoints[1] - LanePoints[0]).GetSafeNormal();
+	float AccumulatedDist = 0.0f;
+	for (int32 p = 0; p < LanePoints.Num() - 1; ++p)
+	{
+		const float SegLen = FVector::Dist(LanePoints[p], LanePoints[p + 1]);
+		if (AccumulatedDist + SegLen >= TargetOffset)
+		{
+			const float Alpha = (TargetOffset - AccumulatedDist) / FMath::Max(SegLen, KINDA_SMALL_NUMBER);
+			SpawnPos = FMath::Lerp(LanePoints[p], LanePoints[p + 1], Alpha);
+			SpawnDir = (LanePoints[p + 1] - LanePoints[p]).GetSafeNormal();
+			break;
+		}
+		AccumulatedDist += SegLen;
+	}
+
+	// If the requested offset exceeds the lane length, clamp to the lane end.
+	if (TargetOffset > AccumulatedDist && LanePoints.Num() >= 2)
+	{
+		const int32 LastIdx = LanePoints.Num() - 1;
+		SpawnPos = LanePoints[LastIdx];
+		SpawnDir = (LanePoints[LastIdx] - LanePoints[LastIdx - 1]).GetSafeNormal();
+	}
+
+	const FVector SpawnLocation = SpawnPos + FVector(0.0, 0.0, SpawnZOffset);
+	const FRotator SpawnRotation = SpawnDir.Rotation();
+	const FTransform SpawnTransform(SpawnRotation, SpawnLocation);
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride =
+		ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+
+	APawn* Vehicle = World->SpawnActor<APawn>(VehicleClass, SpawnTransform, SpawnParams);
+	if (!Vehicle)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("TrafficSpawner: Failed to spawn vehicle %d."), VehicleIndex);
+		return;
+	}
+
+	ATrafficVehicleController* Controller =
+		World->SpawnActor<ATrafficVehicleController>();
+	if (Controller)
+	{
+		Controller->SetRandomSeed(SpawnSeed + VehicleIndex);
+
+		// Apply deterministic per-vehicle speed variation.
+		float FinalSpeed = VehicleSpeed;
+		if (SpeedVariation > KINDA_SMALL_NUMBER)
+		{
+			constexpr int32 SpeedVariationSeedOffset = 10000;
+			FRandomStream SpeedRng(SpawnSeed + VehicleIndex + SpeedVariationSeedOffset);
+			const float VariationFraction = SpeedVariation / 100.0f;
+			const float Offset = SpeedRng.FRandRange(-VariationFraction, VariationFraction);
+			FinalSpeed = VehicleSpeed * (1.0f + Offset);
+			FinalSpeed = FMath::Max(FinalSpeed, 0.0f);
+		}
+		Controller->SetTargetSpeed(FinalSpeed);
+		Controller->SetLaneChangeAggression(LaneChangeAggression);
+		Controller->SetDefaultSpeedLimit(DefaultSpeedLimit);
+
+		Controller->Possess(Vehicle);
+		Controller->InitializeLaneFollowing(Lane);
+
+		OwnedVehicles.Add(Controller);
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("TrafficSpawner: Vehicle %d spawned on lane %d."),
+			VehicleIndex, Lane.HandleId);
+	}
+}
+
+void ATrafficSpawner::OnVehicleDespawned(ATrafficVehicleController* Controller, const FTrafficLaneHandle& Lane)
+{
+	if (!bEnableRespawn || !bSpawnComplete) { return; }
+
+	// Only respond to vehicles owned by this spawner.
+	if (!Controller || !OwnedVehicles.Remove(Controller))
+	{
+		return;
+	}
+
+	// Queue the lane for respawn.
+	if (Lane.IsValid())
+	{
+		RespawnQueue.Add(Lane);
+	}
+	else if (CachedAllLanes.Num() > 0)
+	{
+		// If lane is unknown, pick one deterministically.
+		FRandomStream RespawnRng(SpawnSeed + TotalVehiclesSpawned + RespawnCounter);
+		const int32 Idx = RespawnRng.RandRange(0, CachedAllLanes.Num() - 1);
+		RespawnQueue.Add(CachedAllLanes[Idx]);
+	}
+}
+
+void ATrafficSpawner::CheckRespawn()
+{
+	if (RespawnQueue.IsEmpty()) { return; }
+
+	UWorld* World = GetWorld();
+	if (!World) { return; }
+
+	UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>();
+	ITrafficRoadProvider* Provider = TrafficSub ? TrafficSub->GetProvider() : nullptr;
+	if (!Provider) { return; }
+
+	// Gather player positions for distance validation.
+	TArray<FVector> PlayerPositions;
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		if (const APlayerController* PC = It->Get())
+		{
+			if (const APawn* PlayerPawn = PC->GetPawn())
+			{
+				PlayerPositions.Add(PlayerPawn->GetActorLocation());
+			}
+		}
+	}
+
+	const float MinDistSq = MinRespawnDistance * MinRespawnDistance;
+
+	// Process queued respawns.
+	TArray<FTrafficLaneHandle> Remaining;
+	for (const FTrafficLaneHandle& Lane : RespawnQueue)
+	{
+		// Get lane start position to check against player distances.
+		TArray<FVector> LanePoints;
+		float LaneWidth;
+		if (!Provider->GetLanePath(Lane, LanePoints, LaneWidth) || LanePoints.Num() < 2)
+		{
+			continue; // Lane no longer valid — drop.
+		}
+
+		const FVector SpawnCandidate = LanePoints[0] + FVector(0, 0, SpawnZOffset);
+
+		// Ensure spawn location is far enough from all players.
+		bool bTooClose = false;
+		for (const FVector& PlayerPos : PlayerPositions)
+		{
+			if (FVector::DistSquared(SpawnCandidate, PlayerPos) < MinDistSq)
+			{
+				bTooClose = true;
+				break;
+			}
+		}
+
+		if (bTooClose)
+		{
+			Remaining.Add(Lane); // Retry next interval.
+			continue;
+		}
+
+		++RespawnCounter;
+		const int32 VehicleIdx = TotalVehiclesSpawned++;
+		// Use RespawnCounter as slot offset to stagger respawn positions
+		// and avoid clumping when multiple respawns target the same lane.
+		SpawnSingleVehicle(World, Provider, Lane, RespawnCounter, VehicleIdx);
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("TrafficSpawner: Respawned vehicle on lane %d (respawn #%d)."),
+			Lane.HandleId, RespawnCounter);
+	}
+
+	RespawnQueue = MoveTemp(Remaining);
+}
+
 void ATrafficSpawner::OnProviderRegistered(ITrafficRoadProvider* Provider)
 {
 	if (bSpawnComplete) { return; }
@@ -506,6 +714,9 @@ void ATrafficSpawner::SpawnVehicles()
 		return;
 	}
 
+	// Cache for respawn use.
+	CachedAllLanes = AllLanes;
+
 	// Allow VehicleCount to exceed lane count — vehicles share lanes with
 	// staggered positioning via SpawnSpacing.
 	const int32 SpawnCount = VehicleCount;
@@ -520,104 +731,34 @@ void ATrafficSpawner::SpawnVehicles()
 	for (int32 i = 0; i < SpawnCount; ++i)
 	{
 		const FTrafficLaneHandle& Lane = AllLanes[i % AllLanes.Num()];
-
-		TArray<FVector> LanePoints;
-		float LaneWidth;
-		if (!Provider->GetLanePath(Lane, LanePoints, LaneWidth) || LanePoints.Num() < 2)
-		{
-			UE_LOG(LogAAATraffic, Warning,
-				TEXT("TrafficSpawner: Could not get path for lane %d — skipping."),
-				Lane.HandleId);
-			continue;
-		}
-
-		// Stagger spawn position along the lane based on how many vehicles already placed on it.
 		const int32 SlotIndex = LaneOccupancy.FindOrAdd(Lane.HandleId, 0);
 		LaneOccupancy[Lane.HandleId] = SlotIndex + 1;
-		const float TargetOffset = SlotIndex * SpawnSpacing;
 
-		// Walk along lane points to find the staggered spawn position.
-		FVector SpawnPos = LanePoints[0];
-		FVector SpawnDir = (LanePoints[1] - LanePoints[0]).GetSafeNormal();
-		float AccumulatedDist = 0.0f;
-		for (int32 p = 0; p < LanePoints.Num() - 1; ++p)
-		{
-			const float SegLen = FVector::Dist(LanePoints[p], LanePoints[p + 1]);
-			if (AccumulatedDist + SegLen >= TargetOffset)
-			{
-				const float Alpha = (TargetOffset - AccumulatedDist) / FMath::Max(SegLen, KINDA_SMALL_NUMBER);
-				SpawnPos = FMath::Lerp(LanePoints[p], LanePoints[p + 1], Alpha);
-				SpawnDir = (LanePoints[p + 1] - LanePoints[p]).GetSafeNormal();
-				break;
-			}
-			AccumulatedDist += SegLen;
-		}
-
-		// If the requested offset exceeds the lane length, clamp to the lane end
-		// instead of leaving SpawnPos/SpawnDir at the lane start.
-		if (TargetOffset > AccumulatedDist && LanePoints.Num() >= 2)
-		{
-			const int32 LastIdx = LanePoints.Num() - 1;
-			SpawnPos = LanePoints[LastIdx];
-			SpawnDir = (LanePoints[LastIdx] - LanePoints[LastIdx - 1]).GetSafeNormal();
-
-			UE_LOG(LogAAATraffic, Warning,
-				TEXT("TrafficSpawner: TargetOffset %.2f exceeds length %.2f of lane %d, clamping to lane end."),
-				TargetOffset, AccumulatedDist, Lane.HandleId);
-		}
-
-		const FVector SpawnLocation = SpawnPos + FVector(0.0, 0.0, SpawnZOffset);
-		const FRotator SpawnRotation = SpawnDir.Rotation();
-		const FTransform SpawnTransform(SpawnRotation, SpawnLocation);
-
-		FActorSpawnParameters SpawnParams;
-		SpawnParams.SpawnCollisionHandlingOverride =
-			ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
-
-		APawn* Vehicle = World->SpawnActor<APawn>(VehicleClass, SpawnTransform, SpawnParams);
-		if (!Vehicle)
-		{
-			UE_LOG(LogAAATraffic, Warning,
-				TEXT("TrafficSpawner: Failed to spawn vehicle %d."), i);
-			continue;
-		}
-
-		// Spawn our AI controller and possess the vehicle.
-		ATrafficVehicleController* Controller =
-			World->SpawnActor<ATrafficVehicleController>();
-		if (Controller)
-		{
-			Controller->SetRandomSeed(SpawnSeed + i);
-
-			// Apply deterministic per-vehicle speed variation.
-			float FinalSpeed = VehicleSpeed;
-			if (SpeedVariation > KINDA_SMALL_NUMBER)
-			{
-				// Offset keeps this RNG stream disjoint from the controller RNG (SpawnSeed + i),
-				// improving seed hygiene and avoiding accidental cross-stream collisions.
-				constexpr int32 SpeedVariationSeedOffset = 10000;
-				FRandomStream SpeedRng(SpawnSeed + i + SpeedVariationSeedOffset);
-				const float VariationFraction = SpeedVariation / 100.0f;
-				const float Offset = SpeedRng.FRandRange(-VariationFraction, VariationFraction);
-				FinalSpeed = VehicleSpeed * (1.0f + Offset);
-				FinalSpeed = FMath::Max(FinalSpeed, 0.0f);
-			}
-			Controller->SetTargetSpeed(FinalSpeed);
-
-			Controller->Possess(Vehicle);
-			Controller->InitializeLaneFollowing(Lane);
-
-			UE_LOG(LogAAATraffic, Log,
-				TEXT("TrafficSpawner: Vehicle %d spawned on lane %d."),
-				i, Lane.HandleId);
-		}
+		SpawnSingleVehicle(World, Provider, Lane, SlotIndex, i);
 	}
 
+	TotalVehiclesSpawned = SpawnCount;
 	bSpawnComplete = true;
 
 	// Unbind delegate now that spawning is complete (review feedback: keep delegate list clean).
 	if (TrafficSub)
 	{
 		TrafficSub->OnProviderRegistered.RemoveAll(this);
+	}
+
+	// Subscribe to despawn events for respawning.
+	if (bEnableRespawn && TrafficSub)
+	{
+		TrafficSub->OnVehicleDespawned.AddUObject(this, &ATrafficSpawner::OnVehicleDespawned);
+
+		World->GetTimerManager().SetTimer(
+			RespawnTimerHandle,
+			FTimerDelegate::CreateUObject(this, &ATrafficSpawner::CheckRespawn),
+			RespawnCheckInterval,
+			/*bLoop=*/ true);
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("TrafficSpawner: Respawn enabled — checking every %.1f seconds."),
+			RespawnCheckInterval);
 	}
 }

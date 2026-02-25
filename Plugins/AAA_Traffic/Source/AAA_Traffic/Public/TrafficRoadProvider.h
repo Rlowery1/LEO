@@ -7,6 +7,16 @@
 #include "TrafficRoadProvider.generated.h"
 
 /**
+ * Which side of the current lane to query for an adjacent lane.
+ */
+UENUM(BlueprintType)
+enum class ETrafficLaneSide : uint8
+{
+	Left,
+	Right
+};
+
+/**
  * Opaque handle to a road managed by a traffic road provider.
  * The handle ID is meaningful only to the adapter that created it.
  */
@@ -103,4 +113,24 @@ public:
 	 * Returns an invalid handle if no lane is near the location.
 	 */
 	virtual FTrafficLaneHandle GetLaneAtLocation(const FVector& Location) = 0;
+
+	/**
+	 * Get the adjacent (neighbor) lane on the given side.
+	 * Returns an invalid handle if no same-direction neighbor exists on that side.
+	 * Only returns neighbors on the same road segment (no cross-road adjacency).
+	 */
+	virtual FTrafficLaneHandle GetAdjacentLane(const FTrafficLaneHandle& Lane, ETrafficLaneSide Side) = 0;
+
+	/**
+	 * Get the road that owns the given lane.
+	 * Returns an invalid handle if the lane is unknown.
+	 */
+	virtual FTrafficRoadHandle GetRoadForLane(const FTrafficLaneHandle& Lane) = 0;
+
+	/**
+	 * Get the speed limit for a lane (cm/s).
+	 * Returns a negative value (e.g. -1.0) if the road kit has no speed-limit data,
+	 * in which case the caller should fall back to its own default speed.
+	 */
+	virtual float GetLaneSpeedLimit(const FTrafficLaneHandle& Lane) = 0;
 };

@@ -42,6 +42,9 @@ public:
 	virtual FVector GetLaneDirection(const FTrafficLaneHandle& Lane) override;
 	virtual TArray<FTrafficLaneHandle> GetConnectedLanes(const FTrafficLaneHandle& Lane) override;
 	virtual FTrafficLaneHandle GetLaneAtLocation(const FVector& Location) override;
+	virtual FTrafficLaneHandle GetAdjacentLane(const FTrafficLaneHandle& Lane, ETrafficLaneSide Side) override;
+	virtual FTrafficRoadHandle GetRoadForLane(const FTrafficLaneHandle& Lane) override;
+	virtual float GetLaneSpeedLimit(const FTrafficLaneHandle& Lane) override;
 
 #if WITH_ROADBLD
 private:
@@ -50,6 +53,9 @@ private:
 
 	/** Build the lane connectivity table from RoadBLD corner data. */
 	void BuildLaneConnectivity();
+
+	/** Detect left/right neighbor lanes on the same road via shared edge curves. */
+	void BuildLaneAdjacency();
 
 	/** Resolve a road handle back to the live RoadBLD actor. */
 	ADynamicRoad* ResolveRoad(const FTrafficRoadHandle& Handle) const;
@@ -68,6 +74,9 @@ private:
 	/** Road handle ID → RoadBLD road actor. */
 	TMap<int32, TWeakObjectPtr<ADynamicRoad>> RoadHandleMap;
 
+	/** Road handle ID → ordered list of lane handle IDs for that road. */
+	TMap<int32, TArray<int32>> RoadToLaneHandles;
+
 	/** Lane handle ID → RoadBLD lane object. */
 	TMap<int32, TWeakObjectPtr<UDynamicRoadLane>> LaneHandleMap;
 
@@ -79,6 +88,15 @@ private:
 
 	/** Pre-built lane connectivity: lane handle ID → list of connected lane handles. */
 	TMap<int32, TArray<FTrafficLaneHandle>> LaneConnectionMap;
+
+	/** Left neighbor: lane handle ID → left-adjacent lane handle ID (0 = none). */
+	TMap<int32, int32> LeftNeighborMap;
+
+	/** Right neighbor: lane handle ID → right-adjacent lane handle ID (0 = none). */
+	TMap<int32, int32> RightNeighborMap;
+
+	/** Reverse lookup: lane handle ID → owning road handle ID. */
+	TMap<int32, int32> LaneToRoadHandleMap;
 
 	/** True once CacheRoadData() has run. */
 	bool bCached;

@@ -8,6 +8,8 @@
 #include "TrafficSpawner.generated.h"
 
 class ITrafficRoadProvider;
+class ATrafficVehicleController;
+struct FTrafficLaneHandle;
 
 /**
  * Place this actor in a level to spawn traffic vehicles on available lanes.
@@ -32,16 +34,53 @@ public:
 
 protected:
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 private:
 	/** Deferred to next tick so all subsystems (including adapters) are initialized. */
 	void SpawnVehicles();
 
+	/**
+	 * Spawn a single vehicle on the given lane at a position along it.
+	 * Used by both initial spawn and respawn logic.
+	 * @param World        World context.
+	 * @param Provider     Active road provider.
+	 * @param Lane         Lane to spawn on.
+	 * @param SlotIndex    Position along the lane (multiplied by SpawnSpacing).
+	 * @param VehicleIndex Index for seed generation.
+	 */
+	void SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Provider,
+		const FTrafficLaneHandle& Lane, int32 SlotIndex, int32 VehicleIndex);
+
 	/** Called when a provider registers after BeginPlay (deferred retry). */
 	void OnProviderRegistered(ITrafficRoadProvider* Provider);
 
+	/** Called when a vehicle is despawned — schedules a respawn if enabled. */
+	void OnVehicleDespawned(ATrafficVehicleController* Controller, const FTrafficLaneHandle& Lane);
+
+	/** Periodic check: if we're below VehicleCount, spawn a replacement. */
+	void CheckRespawn();
+
 	/** True once SpawnVehicles has successfully completed. */
 	bool bSpawnComplete = false;
+
+	/** Counter incremented each time a vehicle is respawned (used for deterministic seeding). */
+	int32 RespawnCounter = 0;
+
+	/** Total number of vehicles ever spawned (initial + respawns), for unique seed assignment. */
+	int32 TotalVehiclesSpawned = 0;
+
+	/** Lanes pending respawn (queued by OnVehicleDespawned, consumed by CheckRespawn). */
+	TArray<FTrafficLaneHandle> RespawnQueue;
+
+	/** Timer handle for the periodic respawn check. */
+	FTimerHandle RespawnTimerHandle;
+
+	/** Cached list of all available lanes (populated once during initial spawn). */
+	TArray<FTrafficLaneHandle> CachedAllLanes;
+
+	/** Controllers spawned by this spawner, for filtering shared despawn delegate. */
+	TSet<TWeakObjectPtr<ATrafficVehicleController>> OwnedVehicles;
 
 #if ENABLE_DRAW_DEBUG
 	/** Cache lane polylines from the provider so debug draw doesn't re-query every frame. */
@@ -104,6 +143,38 @@ private:
 	 */
 	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0", ClampMax = "100"))
 	float SpeedVariation;
+
+	// ── Lane Change ────────────────────────────────────────────────
+
+	/**
+	 * Lane-change aggression (0-1).
+	 * 0 = conservative (long blend, high cooldown, strict gap).
+	 * 1 = aggressive (short blend, low cooldown, loose gap).
+	 * Maps to internal controller tuning knobs automatically.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Traffic|Lane Change", meta = (ClampMin = "0", ClampMax = "1"))
+	float LaneChangeAggression;
+
+	// ── Respawn ────────────────────────────────────────────────────
+
+	/** If true, despawned vehicles are replaced to maintain VehicleCount. */
+	UPROPERTY(EditAnywhere, Category = "Traffic|Respawn")
+	bool bEnableRespawn;
+
+	/** Seconds between respawn checks. */
+	UPROPERTY(EditAnywhere, Category = "Traffic|Respawn", meta = (ClampMin = "0.5", EditCondition = "bEnableRespawn"))
+	float RespawnCheckInterval;
+
+	/**
+	 * Minimum distance (cm) from any player for a respawn location to be valid.
+	 * Prevents vehicles popping in within the player's field of view.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Traffic|Respawn", meta = (ClampMin = "1000", EditCondition = "bEnableRespawn"))
+	float MinRespawnDistance;
+
+	/** Default speed limit (cm/s) used if the provider returns no per-lane speed data. */
+	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0"))
+	float DefaultSpeedLimit;
 
 	// ── Debug ───────────────────────────────────────────────────────
 
