@@ -30,6 +30,7 @@ void UTrafficSubsystem::Deinitialize()
 		World->GetTimerManager().ClearTimer(DespawnTimerHandle);
 	}
 	ActiveVehicles.Empty();
+	VehiclesByLane.Empty();
 	Super::Deinitialize();
 }
 
@@ -115,6 +116,12 @@ void UTrafficSubsystem::UnregisterVehicle(ATrafficVehicleController* InControlle
 	if (!InController) return;
 	ActiveVehicles.Remove(InController);
 
+	// Remove from per-lane registry.
+	for (auto& Pair : VehiclesByLane)
+	{
+		Pair.Value.Remove(InController);
+	}
+
 	// Stop the timer when no vehicles remain.
 	if (ActiveVehicles.Num() == 0)
 	{
@@ -123,6 +130,32 @@ void UTrafficSubsystem::UnregisterVehicle(ATrafficVehicleController* InControlle
 			World->GetTimerManager().ClearTimer(DespawnTimerHandle);
 		}
 	}
+}
+
+void UTrafficSubsystem::UpdateVehicleLane(ATrafficVehicleController* InController, const FTrafficLaneHandle& NewLane)
+{
+	if (!InController) return;
+
+	// Remove from any previous lane.
+	for (auto& Pair : VehiclesByLane)
+	{
+		Pair.Value.Remove(InController);
+	}
+
+	// Add to new lane.
+	if (NewLane.IsValid())
+	{
+		VehiclesByLane.FindOrAdd(NewLane.HandleId).Add(InController);
+	}
+}
+
+TArray<TWeakObjectPtr<ATrafficVehicleController>> UTrafficSubsystem::GetVehiclesOnLane(const FTrafficLaneHandle& Lane) const
+{
+	if (const TArray<TWeakObjectPtr<ATrafficVehicleController>>* Vehicles = VehiclesByLane.Find(Lane.HandleId))
+	{
+		return *Vehicles;
+	}
+	return TArray<TWeakObjectPtr<ATrafficVehicleController>>();
 }
 
 void UTrafficSubsystem::PerformDespawnSweep()
@@ -209,6 +242,9 @@ void UTrafficSubsystem::PerformDespawnSweep()
 		ATrafficVehicleController* Controller = ToDespawn[Idx];
 		APawn* VehiclePawn = Controller->GetPawn();
 		const FString VehicleName = VehiclePawn ? VehiclePawn->GetName() : TEXT("unknown");
+
+		// Broadcast before destroy so listeners (e.g. spawner respawn) can react.
+		OnVehicleDespawned.Broadcast(Controller, Controller->GetCurrentLane());
 
 		Controller->UnPossess();
 

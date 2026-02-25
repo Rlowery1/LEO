@@ -46,6 +46,9 @@ public:
 	virtual FVector GetLaneDirection(const FTrafficLaneHandle& Lane) override;
 	virtual TArray<FTrafficLaneHandle> GetConnectedLanes(const FTrafficLaneHandle& Lane) override;
 	virtual FTrafficLaneHandle GetLaneAtLocation(const FVector& Location) override;
+	virtual FTrafficLaneHandle GetAdjacentLane(const FTrafficLaneHandle& Lane, ETrafficLaneSide Side) override;
+	virtual FTrafficRoadHandle GetRoadForLane(const FTrafficLaneHandle& Lane) override;
+	virtual float GetLaneSpeedLimit(const FTrafficLaneHandle& Lane) override;
 
 private:
 	// ── Data caching ────────────────────────────────────────
@@ -55,6 +58,9 @@ private:
 
 	/** Build lane connectivity from RoadNetworkCorners via reflection. */
 	void BuildLaneConnectivity(UWorld* World);
+
+	/** Detect left/right neighbor lanes on the same road via shared edge curves. */
+	void BuildLaneAdjacency();
 
 	// ── Reflection helpers ──────────────────────────────────
 
@@ -140,6 +146,15 @@ private:
 
 	/** Pre-built lane connectivity: lane handle ID → list of connected lane handles. */
 	TMap<int32, TArray<FTrafficLaneHandle>> LaneConnectionMap;
+
+	/** Left neighbor: lane handle ID → left-adjacent lane handle ID (0 = none). */
+	TMap<int32, int32> LeftNeighborMap;
+
+	/** Right neighbor: lane handle ID → right-adjacent lane handle ID (0 = none). */
+	TMap<int32, int32> RightNeighborMap;
+
+	/** Reverse lookup: lane handle ID → owning road handle ID. */
+	TMap<int32, int32> LaneToRoadHandleMap;
 
 	/** True once CacheRoadData() has successfully run. */
 	bool bCached = false;

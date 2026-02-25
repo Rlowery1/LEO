@@ -14,10 +14,20 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, bAtDeadEnd(false)
 	, DistanceTraveledOnLane(0.0f)
 	, PreviousVehicleLocation(FVector::ZeroVector)
+	, LaneChangeState(ELaneChangeState::None)
+	, TargetLaneWidth(0.0f)
+	, LaneChangeProgress(0.0f)
+	, LaneChangeCooldownRemaining(0.0f)
+	, BaseTargetSpeed(0.0f)
 	, TargetSpeed(1500.f)
 	, LookAheadDistance(500.f)
 	, FollowingDistance(300.f)
 	, DetectionDistance(2000.f)
+	, LaneChangeDistance(1500.f)
+	, LaneChangeCooldownTime(5.0f)
+	, LaneChangeSpeedThreshold(0.6f)
+	, LaneChangeGapRequired(800.f)
+	, DefaultSpeedLimit(0.0f)
 	, RandomSeed(0)
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -33,6 +43,24 @@ void ATrafficVehicleController::SetRandomSeed(int32 InSeed)
 	RandomSeed = InSeed;
 }
 
+void ATrafficVehicleController::SetLaneChangeAggression(float Aggression)
+{
+	Aggression = FMath::Clamp(Aggression, 0.0f, 1.0f);
+
+	// Map 0-1 aggression to internal tuning knobs.
+	// Aggression 0: conservative — long blend, high cooldown, strict gap, only if very slow.
+	// Aggression 1: aggressive — short blend, low cooldown, loose gap, eager trigger.
+	LaneChangeDistance      = FMath::Lerp(2500.0f, 800.0f, Aggression);
+	LaneChangeCooldownTime  = FMath::Lerp(8.0f, 2.0f, Aggression);
+	LaneChangeSpeedThreshold = FMath::Lerp(0.4f, 0.8f, Aggression);
+	LaneChangeGapRequired   = FMath::Lerp(1200.0f, 500.0f, Aggression);
+}
+
+void ATrafficVehicleController::SetDefaultSpeedLimit(float InSpeedLimit)
+{
+	DefaultSpeedLimit = FMath::Max(0.0f, InSpeedLimit);
+}
+
 void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle& InLane)
 {
 	CurrentLane = InLane;
@@ -40,6 +68,11 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 	bAtDeadEnd = false;
 	DistanceTraveledOnLane = 0.0f;
 	PreviousVehicleLocation = FVector::ZeroVector;
+
+	// Reset lane-change state when entering a new lane.
+	LaneChangeState = ELaneChangeState::None;
+	LaneChangeProgress = 0.0f;
+	TargetLanePoints.Empty();
 
 	UWorld* World = GetWorld();
 	if (!World)
@@ -64,10 +97,33 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("TrafficVehicleController: Lane loaded — %d points, width %.1f cm."),
 			LanePoints.Num(), LaneWidth);
+
+		// Query lane speed limit from the provider.
+		const float LaneSpeedLimit = Provider->GetLaneSpeedLimit(CurrentLane);
+		if (LaneSpeedLimit > 0.0f)
+		{
+			TargetSpeed = LaneSpeedLimit;
+		}
+		else if (DefaultSpeedLimit > 0.0f)
+		{
+			TargetSpeed = DefaultSpeedLimit;
+		}
+		// else: keep the TargetSpeed set by SetTargetSpeed (spawner-configured).
+		// Preserve the base speed for restoration after speed-zone transitions.
+		if (BaseTargetSpeed <= 0.0f)
+		{
+			BaseTargetSpeed = TargetSpeed;
+		}
 	}
 	else
 	{
 		UE_LOG(LogAAATraffic, Warning, TEXT("TrafficVehicleController: Failed to load lane path data."));
+	}
+
+	// Notify the subsystem of our lane assignment.
+	if (TrafficSub)
+	{
+		TrafficSub->UpdateVehicleLane(this, CurrentLane);
 	}
 }
 
@@ -135,11 +191,23 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	}
 	PreviousVehicleLocation = VehicleLocation;
 
+	// Tick lane-change cooldown.
+	if (LaneChangeCooldownRemaining > 0.0f)
+	{
+		LaneChangeCooldownRemaining -= DeltaSeconds;
+	}
+
+	// Consider a lane change if idle and cooldown expired.
+	if (LaneChangeState == ELaneChangeState::None && LaneChangeCooldownRemaining <= 0.0f)
+	{
+		EvaluateLaneChange();
+	}
+
 	// Find where we are on the lane and where to aim
 	const int32 ClosestIndex = FindClosestPointIndex(VehicleLocation);
 
 	// --- Lane-end detection ---
-	if (!bAtDeadEnd)
+	if (!bAtDeadEnd && LaneChangeState == ELaneChangeState::None)
 	{
 		const float RemainingDist = GetRemainingDistance(ClosestIndex);
 		// Use speed-based look-ahead so fast vehicles get more advance notice.
@@ -170,7 +238,16 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		return;
 	}
 
-	const FVector TargetPoint = GetLookAheadPoint(VehicleLocation, ClosestIndex);
+	// --- Determine target point (normal or lane-change blended) ---
+	FVector TargetPoint;
+	if (LaneChangeState == ELaneChangeState::Executing)
+	{
+		TargetPoint = UpdateLaneChangeBlend(VehicleLocation, ClosestIndex);
+	}
+	else
+	{
+		TargetPoint = GetLookAheadPoint(VehicleLocation, ClosestIndex);
+	}
 
 	// --- Steering ---
 	const FVector ToTarget = (TargetPoint - VehicleLocation).GetSafeNormal2D();
@@ -356,6 +433,209 @@ void ATrafficVehicleController::CheckLaneTransition()
 		UE_LOG(LogAAATraffic, Warning,
 			TEXT("TrafficVehicleController: Failed to initialize lane following for lane %d from lane %d — treating as dead end."),
 			NextLane.HandleId, CurrentLane.HandleId);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Lane Change — evaluation, blend, finalize
+// ---------------------------------------------------------------------------
+
+void ATrafficVehicleController::EvaluateLaneChange()
+{
+	if (!CachedProvider || !bLaneDataReady) { return; }
+
+	const APawn* ControlledPawn = GetPawn();
+	if (!ControlledPawn) { return; }
+
+	const UChaosWheeledVehicleMovementComponent* VehicleMovement =
+		Cast<UChaosWheeledVehicleMovementComponent>(ControlledPawn->GetMovementComponent());
+	if (!VehicleMovement) { return; }
+
+	const float CurrentSpeed = FMath::Abs(VehicleMovement->GetForwardSpeed());
+	const float EffectiveTarget = FMath::Max(TargetSpeed, 1.0f);
+
+	// Only consider lane change if we're significantly slower than desired.
+	if (CurrentSpeed / EffectiveTarget >= LaneChangeSpeedThreshold)
+	{
+		return;
+	}
+
+	// Verify a slow leader is actually ahead (avoid false triggers from turns/hills).
+	float LeaderSpeed = 0.0f;
+	const float LeaderDist = GetLeaderDistance(LeaderSpeed);
+	if (LeaderDist < 0.0f || LeaderDist > DetectionDistance * 0.75f)
+	{
+		return; // No close leader — speed issue is not from congestion.
+	}
+
+	const FVector MyDirection = CachedProvider->GetLaneDirection(CurrentLane);
+
+	// Try both sides — deterministic order: Left first, then Right.
+	const ETrafficLaneSide Sides[] = { ETrafficLaneSide::Left, ETrafficLaneSide::Right };
+
+	for (ETrafficLaneSide Side : Sides)
+	{
+		FTrafficLaneHandle CandidateLane = CachedProvider->GetAdjacentLane(CurrentLane, Side);
+		if (!CandidateLane.IsValid()) { continue; }
+
+		// Direction safety: only allow same-direction lanes (dot > 0).
+		const FVector CandidateDir = CachedProvider->GetLaneDirection(CandidateLane);
+		if (FVector::DotProduct(MyDirection, CandidateDir) <= 0.0f) { continue; }
+
+		// Gap check via per-lane registry (deterministic — no physics sweep).
+		UWorld* World = GetWorld();
+		UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
+		if (!TrafficSub) { continue; }
+
+		const FVector VehicleLocation = ControlledPawn->GetActorLocation();
+		bool bGapClear = true;
+
+		TArray<TWeakObjectPtr<ATrafficVehicleController>> Neighbors = TrafficSub->GetVehiclesOnLane(CandidateLane);
+		for (const TWeakObjectPtr<ATrafficVehicleController>& WeakNeighbor : Neighbors)
+		{
+			ATrafficVehicleController* Neighbor = WeakNeighbor.Get();
+			if (!Neighbor || Neighbor == this) { continue; }
+
+			const APawn* NeighborPawn = Neighbor->GetPawn();
+			if (!NeighborPawn) { continue; }
+
+			const float DistToNeighbor = FVector::Dist(VehicleLocation, NeighborPawn->GetActorLocation());
+			if (DistToNeighbor < LaneChangeGapRequired)
+			{
+				bGapClear = false;
+				break;
+			}
+		}
+
+		if (!bGapClear) { continue; }
+
+		// Candidate lane is valid — begin lane change.
+		TArray<FVector> CandidatePoints;
+		float CandidateWidth;
+		if (!CachedProvider->GetLanePath(CandidateLane, CandidatePoints, CandidateWidth) || CandidatePoints.Num() < 2)
+		{
+			continue;
+		}
+
+		LaneChangeState = ELaneChangeState::Executing;
+		TargetLaneHandle = CandidateLane;
+		TargetLanePoints = MoveTemp(CandidatePoints);
+		TargetLaneWidth = CandidateWidth;
+		LaneChangeProgress = 0.0f;
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("TrafficVehicleController: Beginning lane change from lane %d to lane %d (%s)."),
+			CurrentLane.HandleId, CandidateLane.HandleId,
+			Side == ETrafficLaneSide::Left ? TEXT("left") : TEXT("right"));
+		return;
+	}
+}
+
+FVector ATrafficVehicleController::UpdateLaneChangeBlend(const FVector& VehicleLocation, int32 ClosestIndex)
+{
+	// Advance progress based on distance traveled this tick.
+	if (!PreviousVehicleLocation.IsZero())
+	{
+		const float DistThisTick = FVector::Dist(PreviousVehicleLocation, VehicleLocation);
+		const float ProgressDelta = DistThisTick / FMath::Max(LaneChangeDistance, 1.0f);
+		LaneChangeProgress = FMath::Min(LaneChangeProgress + ProgressDelta, 1.0f);
+	}
+
+	// Get look-ahead on source lane.
+	const FVector SourcePoint = GetLookAheadPoint(VehicleLocation, ClosestIndex);
+
+	// Find closest index on target lane and get look-ahead there.
+	int32 TargetClosestIndex = 0;
+	float BestDistSq = MAX_flt;
+	for (int32 i = 0; i < TargetLanePoints.Num(); ++i)
+	{
+		const float DSq = FVector::DistSquared(VehicleLocation, TargetLanePoints[i]);
+		if (DSq < BestDistSq)
+		{
+			BestDistSq = DSq;
+			TargetClosestIndex = i;
+		}
+	}
+
+	// Walk forward on target lane by LookAheadDistance.
+	FVector TargetPoint = TargetLanePoints.Last();
+	{
+		float AccDist = 0.0f;
+		int32 Idx = TargetClosestIndex;
+		while (Idx < TargetLanePoints.Num() - 1)
+		{
+			const float SegDist = FVector::Dist(TargetLanePoints[Idx], TargetLanePoints[Idx + 1]);
+			AccDist += SegDist;
+			if (AccDist >= LookAheadDistance)
+			{
+				const float Overshoot = AccDist - LookAheadDistance;
+				const float Alpha = 1.0f - (Overshoot / FMath::Max(SegDist, KINDA_SMALL_NUMBER));
+				TargetPoint = FMath::Lerp(TargetLanePoints[Idx], TargetLanePoints[Idx + 1], Alpha);
+				break;
+			}
+			++Idx;
+		}
+	}
+
+	// Smooth blend with ease-in-out curve.
+	const float BlendAlpha = FMath::SmoothStep(0.0f, 1.0f, LaneChangeProgress);
+	const FVector BlendedPoint = FMath::Lerp(SourcePoint, TargetPoint, BlendAlpha);
+
+	// Check for completion.
+	if (LaneChangeProgress >= 1.0f)
+	{
+		FinalizeLaneChange();
+	}
+
+	return BlendedPoint;
+}
+
+void ATrafficVehicleController::FinalizeLaneChange()
+{
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("TrafficVehicleController: Lane change complete — now on lane %d."),
+		TargetLaneHandle.HandleId);
+
+	// Adopt target lane as current.
+	CurrentLane = TargetLaneHandle;
+	LanePoints = MoveTemp(TargetLanePoints);
+	LaneWidth = TargetLaneWidth;
+
+	// Reset distance tracking for new lane.
+	DistanceTraveledOnLane = 0.0f;
+
+	// Query speed limit for the new lane.
+	if (CachedProvider)
+	{
+		const float LaneSpeedLimit = CachedProvider->GetLaneSpeedLimit(CurrentLane);
+		if (LaneSpeedLimit > 0.0f)
+		{
+			TargetSpeed = LaneSpeedLimit;
+		}
+		else if (DefaultSpeedLimit > 0.0f)
+		{
+			TargetSpeed = DefaultSpeedLimit;
+		}
+		else
+		{
+			TargetSpeed = BaseTargetSpeed;
+		}
+	}
+
+	// Reset lane-change state.
+	LaneChangeState = ELaneChangeState::None;
+	TargetLaneHandle = FTrafficLaneHandle();
+	TargetLanePoints.Empty();
+	LaneChangeProgress = 0.0f;
+	LaneChangeCooldownRemaining = LaneChangeCooldownTime;
+
+	// Notify subsystem of new lane.
+	if (UWorld* World = GetWorld())
+	{
+		if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
+		{
+			TrafficSub->UpdateVehicleLane(this, CurrentLane);
+		}
 	}
 }
 
