@@ -2,6 +2,7 @@
 
 #include "TrafficVehicleController.h"
 #include "TrafficSubsystem.h"
+#include "TrafficSignalController.h"
 #include "TrafficLog.h"
 #include "ChaosWheeledVehicleMovementComponent.h"
 #include "GameFramework/Pawn.h"
@@ -12,12 +13,18 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, bLaneDataReady(false)
 	, CachedProvider(nullptr)
 	, bAtDeadEnd(false)
+	, JunctionTransitionIndex(0)
+	, bWaitingAtIntersection(false)
+	, IntersectionJunctionId(0)
 	, DistanceTraveledOnLane(0.0f)
 	, PreviousVehicleLocation(FVector::ZeroVector)
 	, DistanceThisTick(0.0f)
+	, LastClosestIndex(0)
+	, LODFrameCounter(0)
 	, LaneChangeState(ELaneChangeState::None)
 	, TargetLaneWidth(0.0f)
 	, LaneChangeProgress(0.0f)
+	, LaneChangeSettleTimer(0.0f)
 	, LaneChangeCooldownRemaining(0.0f)
 	, BaseTargetSpeed(0.0f)
 	, TargetSpeed(1500.f)
@@ -69,10 +76,17 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 	bAtDeadEnd = false;
 	DistanceTraveledOnLane = 0.0f;
 	PreviousVehicleLocation = FVector::ZeroVector;
+	LastClosestIndex = 0;
+	JunctionTransitionPoints.Empty();
+	JunctionTransitionIndex = 0;
+	bWaitingAtIntersection = false;
+	// Note: IntersectionJunctionId is NOT reset here — it persists until
+	// the vehicle clears the junction (transition points consumed).
 
 	// Reset lane-change state when entering a new lane.
 	LaneChangeState = ELaneChangeState::None;
 	LaneChangeProgress = 0.0f;
+	LaneChangeSettleTimer = 0.0f;
 	TargetLanePoints.Empty();
 
 	UWorld* World = GetWorld();
@@ -148,6 +162,12 @@ void ATrafficVehicleController::OnUnPossess()
 	{
 		if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
 		{
+			// Release any junction occupancy before unregistering.
+			if (IntersectionJunctionId != 0)
+			{
+				TrafficSub->ReleaseJunction(IntersectionJunctionId, this);
+				IntersectionJunctionId = 0;
+			}
 			TrafficSub->UnregisterVehicle(this);
 		}
 	}
@@ -160,6 +180,41 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 
 	if (!bLaneDataReady || !GetPawn())
 	{
+		return;
+	}
+
+	++LODFrameCounter;
+
+	// --- LOD-based tick gating (Feature 7) ---
+	// Reduced: tick every 4 frames. Minimal: tick every 10 frames.
+	UTrafficSubsystem* TrafficSub = nullptr;
+	ETrafficLOD CurrentLOD = ETrafficLOD::Full;
+	if (UWorld* World = GetWorld())
+	{
+		TrafficSub = World->GetSubsystem<UTrafficSubsystem>();
+		if (TrafficSub)
+		{
+			CurrentLOD = TrafficSub->GetVehicleLOD(this);
+			TrafficSub->UpdateVehiclePosition(this, GetPawn()->GetActorLocation());
+		}
+	}
+
+	if (CurrentLOD == ETrafficLOD::Reduced && (LODFrameCounter % 4) != 0)
+	{
+		return;
+	}
+	if (CurrentLOD == ETrafficLOD::Minimal && (LODFrameCounter % 10) != 0)
+	{
+		// Minimal LOD: teleport along polyline instead of physics input.
+		if (LanePoints.Num() >= 2)
+		{
+			const int32 NextIdx = FMath::Min(LastClosestIndex + 1, LanePoints.Num() - 1);
+			if (NextIdx != LastClosestIndex)
+			{
+				GetPawn()->SetActorLocation(LanePoints[NextIdx]);
+				LastClosestIndex = NextIdx;
+			}
+		}
 		return;
 	}
 
@@ -209,7 +264,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	// Find where we are on the lane and where to aim
 	const int32 ClosestIndex = FindClosestPointIndex(VehicleLocation);
 
-	// --- Lane-end detection ---
+	// --- Lane-end detection + intersection right-of-way ---
 	if (!bAtDeadEnd && LaneChangeState == ELaneChangeState::None)
 	{
 		const float RemainingDist = GetRemainingDistance(ClosestIndex);
@@ -218,6 +273,68 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		const float TransitionThreshold = FMath::Max(LookAheadDistance, FMath::Abs(CurrentSpeed) * ReactionTime);
 		if (RemainingDist < TransitionThreshold && DistanceTraveledOnLane > TransitionThreshold)
 		{
+			// --- Intersection approach (Feature 1) ---
+			// Query junction ID at lane end. If non-zero, check occupancy first.
+			if (!bWaitingAtIntersection && CachedProvider)
+			{
+				const int32 JunctionId = CachedProvider->GetJunctionForLane(CurrentLane);
+				if (JunctionId != 0)
+				{
+					IntersectionJunctionId = JunctionId;
+
+					UWorld* World = GetWorld();
+					UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
+					if (TrafficSub)
+					{
+// Check for signal first — vehicles stop on Red/Yellow.
+					ATrafficSignalController* Signal = TrafficSub->GetSignalForJunction(JunctionId);
+					bool bSignalAllows = true;
+					if (Signal)
+					{
+						const ETrafficSignalPhase Phase = Signal->GetCurrentPhase();
+						bSignalAllows = (Phase == ETrafficSignalPhase::Green);
+						}
+
+						if (bSignalAllows && TrafficSub->TryOccupyJunction(JunctionId, this))
+						{
+							// We have right-of-way — proceed with transition.
+						}
+						else
+						{
+							// Junction occupied — wait.
+							bWaitingAtIntersection = true;
+						}
+					}
+				}
+			}
+
+			// If waiting at intersection, brake proportionally to remaining distance.
+			if (bWaitingAtIntersection)
+			{
+				UWorld* World = GetWorld();
+				UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
+
+				// Retry occupancy each tick.
+				if (TrafficSub && IntersectionJunctionId != 0)
+				{
+					if (TrafficSub->TryOccupyJunction(IntersectionJunctionId, this))
+					{
+						bWaitingAtIntersection = false;
+						// Fall through to CheckLaneTransition below.
+					}
+				}
+
+				if (bWaitingAtIntersection)
+				{
+					// Gradually brake to a stop at the lane end.
+					const float BrakeFactor = FMath::Clamp(1.0f - (RemainingDist / FMath::Max(TransitionThreshold, 1.0f)), 0.0f, 1.0f);
+					VehicleMovement->SetThrottleInput(FMath::Max(0.0f, 0.3f - BrakeFactor * 0.3f));
+					VehicleMovement->SetSteeringInput(0.0f);
+					VehicleMovement->SetBrakeInput(BrakeFactor);
+					return;
+				}
+			}
+
 			CheckLaneTransition();
 			if (!bLaneDataReady || !GetPawn())
 			{
@@ -226,7 +343,19 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 			}
 			if (!bAtDeadEnd)
 			{
-				// Successfully transitioned — recalculate on new lane data.
+				// Successfully transitioned. Release junction immediately if no
+				// transition points were generated (junction span too small).
+				if (IntersectionJunctionId != 0 && JunctionTransitionPoints.Num() == 0)
+				{
+					UWorld* World = GetWorld();
+					UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
+					if (TrafficSub)
+					{
+						TrafficSub->ReleaseJunction(IntersectionJunctionId, this);
+					}
+					IntersectionJunctionId = 0;
+				}
+				// Recalculate on new lane data.
 				return;
 			}
 		}
@@ -241,10 +370,65 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		return;
 	}
 
-	// --- Determine target point (normal or lane-change blended) ---
+	// --- Determine target point (junction transition, lane-change blended, or normal) ---
 	FVector TargetPoint;
-	if (LaneChangeState == ELaneChangeState::Executing)
+
+	// Junction transition takes priority — follow synthesized curve first.
+	if (JunctionTransitionPoints.Num() > 0)
 	{
+		// Advance along junction points based on proximity.
+		while (JunctionTransitionIndex < JunctionTransitionPoints.Num() - 1)
+		{
+			if (FVector::DistSquared(VehicleLocation, JunctionTransitionPoints[JunctionTransitionIndex]) < 10000.0f) // 1m
+			{
+				++JunctionTransitionIndex;
+			}
+			else
+			{
+				break;
+			}
+		}
+
+		if (JunctionTransitionIndex >= JunctionTransitionPoints.Num() - 1)
+		{
+			// Finished junction transition — release junction occupancy and proceed.
+			JunctionTransitionPoints.Empty();
+			JunctionTransitionIndex = 0;
+
+			if (IntersectionJunctionId != 0)
+			{
+				if (UWorld* World = GetWorld())
+				{
+					if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
+					{
+						TrafficSub->ReleaseJunction(IntersectionJunctionId, this);
+					}
+				}
+				IntersectionJunctionId = 0;
+			}
+
+			TargetPoint = GetLookAheadPoint(VehicleLocation, ClosestIndex);
+		}
+		else
+		{
+			// Look ahead a bit on the junction curve.
+			const int32 LookIdx = FMath::Min(JunctionTransitionIndex + 2, JunctionTransitionPoints.Num() - 1);
+			TargetPoint = JunctionTransitionPoints[LookIdx];
+		}
+	}
+	else if (LaneChangeState == ELaneChangeState::Executing)
+	{
+		TargetPoint = UpdateLaneChangeBlend(VehicleLocation, ClosestIndex);
+	}
+	else if (LaneChangeState == ELaneChangeState::Completing)
+	{
+		// Settling phase: drive purely on target lane, count down settle timer.
+		LaneChangeSettleTimer -= DeltaSeconds;
+		if (LaneChangeSettleTimer <= 0.0f)
+		{
+			FinalizeLaneChange();
+		}
+		// While settling, steer toward target lane look-ahead.
 		TargetPoint = UpdateLaneChangeBlend(VehicleLocation, ClosestIndex);
 	}
 	else
@@ -263,25 +447,39 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 
 	// --- Throttle / Brake ---
 	// Compute effective target speed accounting for vehicle ahead.
+	// On Reduced LOD, skip the expensive sphere-sweep leader detection.
 	float EffectiveTargetSpeed = TargetSpeed;
 	{
-		float LeaderSpeed = 0.0f;
-		const float LeaderDist = GetLeaderDistance(LeaderSpeed);
-		if (LeaderDist >= 0.0f)
+		ETrafficLOD TickLOD = ETrafficLOD::Full;
+		if (UWorld* LODWorld = GetWorld())
 		{
-			// Proportional: full stop at FollowingDistance, full speed at 2x FollowingDistance.
-			const float GapFactor = FMath::Clamp(
-				(LeaderDist - FollowingDistance) / FMath::Max(FollowingDistance, 1.0f),
-				0.0f, 1.0f);
-			const float GapSpeed = TargetSpeed * GapFactor;
-			// Blend between leader speed (close) and gap-based speed (far).
-			// At GapFactor=0 (FollowingDistance): match leader speed.
-			// At GapFactor=1 (2x FollowingDistance): use full gap-based speed.
-			// This prevents hard-braking for a distant stopped leader.
-			const float ClampedLeaderSpeed = FMath::Max(LeaderSpeed, 0.0f);
-			EffectiveTargetSpeed = FMath::Lerp(ClampedLeaderSpeed, GapSpeed, GapFactor);
-			EffectiveTargetSpeed = FMath::Min(EffectiveTargetSpeed, TargetSpeed);
+			if (UTrafficSubsystem* LODSub = LODWorld->GetSubsystem<UTrafficSubsystem>())
+			{
+				TickLOD = LODSub->GetVehicleLOD(this);
+			}
 		}
+
+		if (TickLOD == ETrafficLOD::Full)
+		{
+			float LeaderSpeed = 0.0f;
+			const float LeaderDist = GetLeaderDistance(LeaderSpeed);
+			if (LeaderDist >= 0.0f)
+			{
+				// Proportional: full stop at FollowingDistance, full speed at 2x FollowingDistance.
+				const float GapFactor = FMath::Clamp(
+					(LeaderDist - FollowingDistance) / FMath::Max(FollowingDistance, 1.0f),
+					0.0f, 1.0f);
+				const float GapSpeed = TargetSpeed * GapFactor;
+				// Blend between leader speed (close) and gap-based speed (far).
+				// At GapFactor=0 (FollowingDistance): match leader speed.
+				// At GapFactor=1 (2x FollowingDistance): use full gap-based speed.
+				// This prevents hard-braking for a distant stopped leader.
+				const float ClampedLeaderSpeed = FMath::Max(LeaderSpeed, 0.0f);
+				EffectiveTargetSpeed = FMath::Lerp(ClampedLeaderSpeed, GapSpeed, GapFactor);
+				EffectiveTargetSpeed = FMath::Min(EffectiveTargetSpeed, TargetSpeed);
+			}
+		}
+		// Reduced LOD: no leader detection — use TargetSpeed directly.
 	}
 
 	// Guard against EffectiveTargetSpeed == 0 to prevent division by zero.
@@ -315,12 +513,21 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	VehicleMovement->SetBrakeInput(BrakeInput);
 }
 
-int32 ATrafficVehicleController::FindClosestPointIndex(const FVector& VehicleLocation) const
+int32 ATrafficVehicleController::FindClosestPointIndex(const FVector& VehicleLocation)
 {
-	int32 BestIndex = 0;
-	float BestDistSq = MAX_flt;
+	if (LanePoints.Num() == 0) { return 0; }
 
-	for (int32 i = 0; i < LanePoints.Num(); ++i)
+	// Bounded search around the last-known index for O(1) amortized performance.
+	// Vehicles advance monotonically along the lane, so the closest index is
+	// usually within a few steps of the cached value.
+	constexpr int32 SearchRadius = 8;
+	const int32 StartIdx = FMath::Max(0, LastClosestIndex - 2);
+	const int32 EndIdx = FMath::Min(LanePoints.Num() - 1, LastClosestIndex + SearchRadius);
+
+	int32 BestIndex = LastClosestIndex;
+	float BestDistSq = FVector::DistSquared(VehicleLocation, LanePoints[FMath::Clamp(LastClosestIndex, 0, LanePoints.Num() - 1)]);
+
+	for (int32 i = StartIdx; i <= EndIdx; ++i)
 	{
 		const float DistSq = FVector::DistSquared(VehicleLocation, LanePoints[i]);
 		if (DistSq < BestDistSq)
@@ -330,6 +537,22 @@ int32 ATrafficVehicleController::FindClosestPointIndex(const FVector& VehicleLoc
 		}
 	}
 
+	// If the best index is at the boundary of the search window, fall back to
+	// a full scan to handle teleports, respawns, or large time-steps.
+	if (BestIndex == StartIdx || BestIndex == EndIdx)
+	{
+		for (int32 i = 0; i < LanePoints.Num(); ++i)
+		{
+			const float DistSq = FVector::DistSquared(VehicleLocation, LanePoints[i]);
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				BestIndex = i;
+			}
+		}
+	}
+
+	LastClosestIndex = BestIndex;
 	return BestIndex;
 }
 
@@ -417,14 +640,63 @@ void ATrafficVehicleController::CheckLaneTransition()
 		return;
 	}
 
-	// Deterministic lane selection using seeded RandomStream.
-	const int32 LaneIndex = RandomStream.RandRange(0, Connected.Num() - 1);
+	// --- Weighted lane selection (Feature 4) ---
+	// Weight by direction alignment with current lane to prefer "going straight."
+	// Sort by HandleId first for determinism, then build a CDF.
+	Connected.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
+	{
+		return A.HandleId < B.HandleId;
+	});
+
+	const FVector CurrentDir = CachedProvider->GetLaneDirection(CurrentLane);
+
+	TArray<float> Weights;
+	Weights.Reserve(Connected.Num());
+	float TotalWeight = 0.0f;
+	for (const FTrafficLaneHandle& Candidate : Connected)
+	{
+		const FVector CandDir = CachedProvider->GetLaneDirection(Candidate);
+		// Weight = dot + 1 shifted to [0,2], clamped with a minimum so no lane has zero chance.
+		const float Dot = FVector::DotProduct(CurrentDir, CandDir);
+		const float W = FMath::Max(Dot + 1.0f, 0.1f);
+		Weights.Add(W);
+		TotalWeight += W;
+	}
+
+	// Pick via CDF with the seeded random stream.
+	const float Roll = RandomStream.FRandRange(0.0f, TotalWeight);
+	float CumulativeWeight = 0.0f;
+	int32 LaneIndex = Connected.Num() - 1; // fallback to last
+	for (int32 i = 0; i < Connected.Num(); ++i)
+	{
+		CumulativeWeight += Weights[i];
+		if (Roll <= CumulativeWeight)
+		{
+			LaneIndex = i;
+			break;
+		}
+	}
 
 	const FTrafficLaneHandle NextLane = Connected[LaneIndex];
 
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("TrafficVehicleController: Transitioning from lane %d to lane %d (%d candidates)."),
 		CurrentLane.HandleId, NextLane.HandleId, Connected.Num());
+
+	// --- Junction smoothing (Feature 3) ---
+	// Cache the end of the current lane before switching, so we can synthesize
+	// a smooth transition curve from old-lane-end to new-lane-start.
+	FVector OldLaneEnd = FVector::ZeroVector;
+	FVector OldLaneTangent = FVector::ZeroVector;
+	if (LanePoints.Num() >= 2)
+	{
+		OldLaneEnd = LanePoints.Last();
+		OldLaneTangent = (LanePoints.Last() - LanePoints[LanePoints.Num() - 2]).GetSafeNormal();
+	}
+
+	// Check if provider has a junction path.
+	TArray<FVector> ProviderJunctionPath;
+	const bool bHasProviderPath = CachedProvider && CachedProvider->GetJunctionPath(CurrentLane, NextLane, ProviderJunctionPath) && ProviderJunctionPath.Num() >= 2;
 
 	InitializeLaneFollowing(NextLane);
 
@@ -436,6 +708,45 @@ void ATrafficVehicleController::CheckLaneTransition()
 		UE_LOG(LogAAATraffic, Warning,
 			TEXT("TrafficVehicleController: Failed to initialize lane following for lane %d from lane %d — treating as dead end."),
 			NextLane.HandleId, CurrentLane.HandleId);
+		return;
+	}
+
+	// Generate junction transition points.
+	JunctionTransitionIndex = 0;
+	if (bHasProviderPath)
+	{
+		JunctionTransitionPoints = MoveTemp(ProviderJunctionPath);
+	}
+	else if (!OldLaneTangent.IsNearlyZero() && LanePoints.Num() >= 2)
+	{
+		// Synthesize a cubic Hermite curve from old-lane-end to new-lane-start.
+		const FVector NewLaneStart = LanePoints[0];
+		const FVector NewLaneTangent = (LanePoints[1] - LanePoints[0]).GetSafeNormal();
+		const float SpanDist = FVector::Dist(OldLaneEnd, NewLaneStart);
+
+		if (SpanDist > 50.0f) // Only if there's meaningful gap to smooth over.
+		{
+			const float TangentScale = SpanDist * 0.5f;
+			const FVector P0 = OldLaneEnd;
+			const FVector P1 = NewLaneStart;
+			const FVector M0 = OldLaneTangent * TangentScale;
+			const FVector M1 = NewLaneTangent * TangentScale;
+
+			constexpr int32 NumSegments = 6;
+			JunctionTransitionPoints.Reserve(NumSegments + 1);
+			for (int32 i = 0; i <= NumSegments; ++i)
+			{
+				const float T = static_cast<float>(i) / static_cast<float>(NumSegments);
+				const float T2 = T * T;
+				const float T3 = T2 * T;
+				// Hermite basis functions.
+				const float H00 = 2.0f * T3 - 3.0f * T2 + 1.0f;
+				const float H10 = T3 - 2.0f * T2 + T;
+				const float H01 = -2.0f * T3 + 3.0f * T2;
+				const float H11 = T3 - T2;
+				JunctionTransitionPoints.Add(H00 * P0 + H10 * M0 + H01 * P1 + H11 * M1);
+			}
+		}
 	}
 }
 
@@ -536,6 +847,32 @@ void ATrafficVehicleController::EvaluateLaneChange()
 
 FVector ATrafficVehicleController::UpdateLaneChangeBlend(const FVector& VehicleLocation, int32 ClosestIndex)
 {
+	// --- Continuous merge safety check (Feature 5) ---
+	// Re-check gap on target lane each tick. Abort early if unsafe.
+	if (LaneChangeState == ELaneChangeState::Executing && LaneChangeProgress < 0.8f)
+	{
+		const float AbortGapThreshold = LaneChangeGapRequired * 0.7f;
+		UWorld* World = GetWorld();
+		UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
+		if (TrafficSub)
+		{
+			TArray<TWeakObjectPtr<ATrafficVehicleController>> Neighbors = TrafficSub->GetVehiclesOnLane(TargetLaneHandle);
+			for (const TWeakObjectPtr<ATrafficVehicleController>& WeakNeighbor : Neighbors)
+			{
+				ATrafficVehicleController* Neighbor = WeakNeighbor.Get();
+				if (!Neighbor || Neighbor == this) continue;
+				const APawn* NeighborPawn = Neighbor->GetPawn();
+				if (!NeighborPawn) continue;
+				if (FVector::Dist(VehicleLocation, NeighborPawn->GetActorLocation()) < AbortGapThreshold)
+				{
+					AbortLaneChange();
+					// Return source lane point after aborting.
+					return GetLookAheadPoint(VehicleLocation, ClosestIndex);
+				}
+			}
+		}
+	}
+
 	// Advance progress based on distance traveled this tick.
 	// DistanceThisTick is computed once at the top of UpdateVehicleInput
 	// (before PreviousVehicleLocation is overwritten).
@@ -584,10 +921,14 @@ FVector ATrafficVehicleController::UpdateLaneChangeBlend(const FVector& VehicleL
 	const float BlendAlpha = FMath::SmoothStep(0.0f, 1.0f, LaneChangeProgress);
 	const FVector BlendedPoint = FMath::Lerp(SourcePoint, TargetPoint, BlendAlpha);
 
-	// Check for completion.
-	if (LaneChangeProgress >= 1.0f)
+	// Check for completion — enter settling phase.
+	if (LaneChangeProgress >= 1.0f && LaneChangeState == ELaneChangeState::Executing)
 	{
-		FinalizeLaneChange();
+		LaneChangeState = ELaneChangeState::Completing;
+		LaneChangeSettleTimer = 0.5f; // 0.5s settling phase.
+		UE_LOG(LogAAATraffic, Verbose,
+			TEXT("TrafficVehicleController: Lane change blend complete, entering settling phase on lane %d."),
+			TargetLaneHandle.HandleId);
 	}
 
 	return BlendedPoint;
@@ -642,6 +983,20 @@ void ATrafficVehicleController::FinalizeLaneChange()
 	}
 }
 
+void ATrafficVehicleController::AbortLaneChange()
+{
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("TrafficVehicleController: Lane change ABORTED (unsafe gap) — staying on lane %d."),
+		CurrentLane.HandleId);
+
+	LaneChangeState = ELaneChangeState::None;
+	TargetLaneHandle = FTrafficLaneHandle();
+	TargetLanePoints.Empty();
+	LaneChangeProgress = 0.0f;
+	LaneChangeSettleTimer = 0.0f;
+	LaneChangeCooldownRemaining = LaneChangeCooldownTime;
+}
+
 float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 {
 	OutLeaderSpeed = 0.0f;
@@ -659,7 +1014,9 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 	FVector SweepDirection = ControlledPawn->GetActorForwardVector();
 	if (LanePoints.Num() >= 2)
 	{
-		const int32 ClosestIdx = FindClosestPointIndex(VehicleLocation);
+		// Use the cached closest index (updated earlier this frame in UpdateVehicleInput)
+		// to avoid calling the non-const FindClosestPointIndex from this const method.
+		const int32 ClosestIdx = FMath::Clamp(LastClosestIndex, 0, LanePoints.Num() - 1);
 		const int32 NextIdx = FMath::Min(ClosestIdx + 1, LanePoints.Num() - 1);
 		SweepDirection = (LanePoints[NextIdx] - VehicleLocation).GetSafeNormal();
 		if (SweepDirection.IsNearlyZero())

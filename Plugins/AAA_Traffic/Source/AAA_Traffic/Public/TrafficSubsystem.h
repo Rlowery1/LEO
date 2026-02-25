@@ -10,6 +10,20 @@
 
 class ITrafficRoadProvider;
 class ATrafficVehicleController;
+class ATrafficSignalController;
+
+/**
+ * LOD tier for distance-based vehicle simulation detail.
+ */
+enum class ETrafficLOD : uint8
+{
+	/** Full simulation: every-frame tick, physics input, sphere sweep. */
+	Full,
+	/** Reduced: tick every N frames, skip leader detection. */
+	Reduced,
+	/** Minimal: tick infrequently, teleport along polyline, skip lane changes. */
+	Minimal
+};
 
 /** Broadcast when a provider registers (or re-registers) with the subsystem. */
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnProviderRegistered, ITrafficRoadProvider* /*Provider*/);
@@ -70,6 +84,38 @@ public:
 	/** Get the set of all currently active vehicle controllers. */
 	const TSet<TWeakObjectPtr<ATrafficVehicleController>>& GetActiveVehicles() const { return ActiveVehicles; }
 
+	// --- Spatial Grid ---
+
+	/** Update a vehicle's position in the spatial grid. Call from vehicle Tick. */
+	void UpdateVehiclePosition(ATrafficVehicleController* Controller, const FVector& Position);
+
+	/** Get all vehicles within Radius of Position. */
+	TArray<ATrafficVehicleController*> GetNearbyVehicles(const FVector& Position, float Radius) const;
+
+	// --- LOD ---
+
+	/** Get the current LOD tier for a vehicle. */
+	ETrafficLOD GetVehicleLOD(const ATrafficVehicleController* Controller) const;
+
+	// --- Signal Controllers ---
+
+	/** Register a signal controller for a junction ID. */
+	void RegisterSignalController(int32 JunctionId, ATrafficSignalController* Controller);
+
+	/** Unregister a signal controller. */
+	void UnregisterSignalController(int32 JunctionId);
+
+	/** Get the signal controller for a junction, or nullptr. */
+	ATrafficSignalController* GetSignalForJunction(int32 JunctionId) const;
+
+	// --- Junction Occupancy ---
+
+	/** Mark a junction as occupied by a vehicle (returns false if already occupied by another). */
+	bool TryOccupyJunction(int32 JunctionId, ATrafficVehicleController* Controller);
+
+	/** Release junction occupancy for the given vehicle. */
+	void ReleaseJunction(int32 JunctionId, ATrafficVehicleController* Controller);
+
 	// --- Despawn configuration ---
 
 	/** Maximum distance (cm) from the nearest player before a vehicle is despawned. */
@@ -120,4 +166,36 @@ private:
 	 * Used by lane-change gap checking for deterministic neighbor queries.
 	 */
 	TMap<int32, TArray<TWeakObjectPtr<ATrafficVehicleController>>> VehiclesByLane;
+
+	// --- Spatial grid ---
+
+	/** Cell size for spatial hashing (cm). */
+	static constexpr float SpatialCellSize = 5000.0f;
+
+	/** Compute the spatial cell key for a world position. */
+	static int64 ComputeCellKey(const FVector& Position);
+
+	/** Spatial hash grid: cell key → vehicles in that cell. */
+	TMap<int64, TArray<TWeakObjectPtr<ATrafficVehicleController>>> SpatialGrid;
+
+	/** Per-vehicle cached cell key for efficient grid updates. */
+	TMap<TWeakObjectPtr<ATrafficVehicleController>, int64> VehicleCellMap;
+
+	// --- LOD ---
+
+	/** Per-vehicle LOD tier, updated during despawn sweep. */
+	TMap<TWeakObjectPtr<ATrafficVehicleController>, ETrafficLOD> VehicleLODMap;
+
+	/** Assign LOD tiers based on player distances (called during despawn sweep). */
+	void UpdateLODTiers(const TArray<FVector>& PlayerPositions);
+
+	// --- Signal controllers ---
+
+	/** Junction ID → signal controller. */
+	TMap<int32, TWeakObjectPtr<ATrafficSignalController>> SignalControllerMap;
+
+	// --- Junction occupancy ---
+
+	/** Junction ID → vehicle currently traversing it. */
+	TMap<int32, TWeakObjectPtr<ATrafficVehicleController>> JunctionOccupancy;
 };
