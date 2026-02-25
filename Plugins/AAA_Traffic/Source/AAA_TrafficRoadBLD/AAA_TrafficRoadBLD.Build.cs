@@ -20,10 +20,11 @@ public class AAA_TrafficRoadBLD : ModuleRules
 		);
 
 		// RoadBLD is an optional sibling plugin.
-		// When present, this module compiles the full adapter.
-		// When absent (e.g. CI / users without RoadBLD), it compiles as an empty stub.
+		// When present WITH compilable headers, this module compiles the full adapter.
+		// When absent (CI), or present but precompiled-only (no source headers), it compiles as an empty stub.
 		string RoadBLDDir = Path.GetFullPath(Path.Combine(PluginDirectory, "..", "RoadBLD"));
-		bool bHasRoadBLD = Directory.Exists(RoadBLDDir);
+		string RoadBLDPublicDir = Path.Combine(RoadBLDDir, "Source", "RoadBLDRuntime", "Public");
+		bool bHasRoadBLD = Directory.Exists(RoadBLDDir) && Directory.Exists(RoadBLDPublicDir);
 
 		if (bHasRoadBLD)
 		{

@@ -39,6 +39,12 @@ private:
 	/** Cache lane polylines from the provider so debug draw doesn't re-query every frame. */
 	void CacheDebugLaneData();
 
+	/**
+	 * Fallback: discover lane geometry via UE reflection when no compiled adapter
+	 * is available (e.g. precompiled RoadBLD without source headers).
+	 */
+	void CacheDebugLaneDataViaReflection(UWorld* World);
+
 	/** Draw cached lane centerlines using DrawDebugLine. */
 	void DrawDebugLanes() const;
 
