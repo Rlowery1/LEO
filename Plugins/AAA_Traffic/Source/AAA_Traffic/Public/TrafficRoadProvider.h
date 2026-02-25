@@ -133,4 +133,18 @@ public:
 	 * in which case the caller should fall back to its own default speed.
 	 */
 	virtual float GetLaneSpeedLimit(const FTrafficLaneHandle& Lane) = 0;
+
+	/**
+	 * Get the junction identifier at the end of a lane.
+	 * Returns a non-zero ID if the lane terminates at an intersection / multi-road junction.
+	 * Returns 0 if the lane continues within the same road or is a dead end.
+	 */
+	virtual int32 GetJunctionForLane(const FTrafficLaneHandle& Lane) { return 0; }
+
+	/**
+	 * Get a smooth path through a junction between two connected lanes.
+	 * Fills OutPath with a series of world-space points representing the junction trajectory.
+	 * Returns true if a path was generated, false otherwise (caller should fall back to straight-line).
+	 */
+	virtual bool GetJunctionPath(const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane, TArray<FVector>& OutPath) { return false; }
 };

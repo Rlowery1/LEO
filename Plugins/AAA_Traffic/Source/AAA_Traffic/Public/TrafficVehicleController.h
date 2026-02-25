@@ -73,8 +73,11 @@ private:
 	/** Feed throttle / steering / brake into the vehicle movement component. */
 	void UpdateVehicleInput(float DeltaSeconds);
 
-	/** Find the index of the closest lane point to the given world position. */
-	int32 FindClosestPointIndex(const FVector& VehicleLocation) const;
+	/**
+	 * Find the index of the closest lane point to the given world position.
+	 * Uses a cached last-known index with bounded search for O(1) amortized performance.
+	 */
+	int32 FindClosestPointIndex(const FVector& VehicleLocation);
 
 	/** Walk forward along lane points by LookAheadDistance and return the target point. */
 	FVector GetLookAheadPoint(const FVector& VehicleLocation, int32 ClosestIndex) const;
@@ -125,6 +128,12 @@ private:
 	 */
 	void FinalizeLaneChange();
 
+	/**
+	 * Abort a lane change: return to source lane, reset state.
+	 * Called when continuous gap check detects it's unsafe to continue.
+	 */
+	void AbortLaneChange();
+
 	// ----- State -----
 
 	/** Handle to the lane currently being followed. */
@@ -145,6 +154,21 @@ private:
 	/** True when vehicle has reached lane-end with no connected lanes. */
 	bool bAtDeadEnd;
 
+	/**
+	 * Junction transition path: smooth curve points connecting the end of one
+	 * lane to the start of the next. Consumed before following the new lane.
+	 */
+	TArray<FVector> JunctionTransitionPoints;
+
+	/** Index along JunctionTransitionPoints currently being followed. */
+	int32 JunctionTransitionIndex;
+
+	/** True when waiting at an intersection for right-of-way. */
+	bool bWaitingAtIntersection;
+
+	/** Junction ID of the intersection this vehicle is waiting/in. 0 = none. */
+	int32 IntersectionJunctionId;
+
 	/** Cumulative distance traveled on the current lane (prevents short-lane transition loops). */
 	float DistanceTraveledOnLane;
 
@@ -153,6 +177,12 @@ private:
 
 	/** Distance traveled by the vehicle this tick (computed once, consumed by blend). */
 	float DistanceThisTick;
+
+	/** Cached index from last FindClosestPointIndex call (for O(1) amortized search). */
+	int32 LastClosestIndex;
+
+	/** Frame counter for LOD-based tick gating. */
+	uint32 LODFrameCounter;
 
 	// ── Lane-change state ───────────────────────────────────
 
@@ -170,6 +200,9 @@ private:
 
 	/** Progress of the lane-change blend (0 = source, 1 = target). */
 	float LaneChangeProgress;
+
+	/** Time remaining in the Completing settling phase (seconds). */
+	float LaneChangeSettleTimer;
 
 	/** Time remaining before another lane change can be considered (seconds). */
 	float LaneChangeCooldownRemaining;
