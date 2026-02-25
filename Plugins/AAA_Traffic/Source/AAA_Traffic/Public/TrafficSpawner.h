@@ -82,7 +82,7 @@ private:
 	/** Controllers spawned by this spawner, for filtering shared despawn delegate. */
 	TSet<TWeakObjectPtr<ATrafficVehicleController>> OwnedVehicles;
 
-#if ENABLE_DRAW_DEBUG
+#if ENABLE_DRAW_DEBUG // ── Debug internals (no UPROPERTYs here) ──
 	/** Cache lane polylines from the provider so debug draw doesn't re-query every frame. */
 	void CacheDebugLaneData();
 
@@ -110,6 +110,7 @@ private:
 	TArray<FDebugLaneData> DebugLanes;
 #endif // ENABLE_DRAW_DEBUG
 
+protected:
 	// ── Traffic Config ──────────────────────────────────────────────
 
 	/** Vehicle pawn class to spawn (e.g. a DD_Vehicles Blueprint). */

@@ -217,6 +217,7 @@ private:
 	/** Base target speed before lane speed-limit adjustments. */
 	float BaseTargetSpeed;
 
+protected:
 	// ----- Tuning -----
 
 	/** Target speed in cm/s (default ~54 km/h). */
@@ -270,11 +271,9 @@ private:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	int32 RandomSeed;
 
-#if ENABLE_DRAW_DEBUG
-	/** When true, draws the lane polyline, look-ahead target, and leader detection in-game. */
+	/** When true (non-Shipping builds), draws the lane polyline, look-ahead target, and leader detection in-game. Has no effect in Shipping. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Debug")
 	bool bDebugDraw = false;
-#endif
 
 	/**
 	 * Deterministic random stream (seeded from RandomSeed).
