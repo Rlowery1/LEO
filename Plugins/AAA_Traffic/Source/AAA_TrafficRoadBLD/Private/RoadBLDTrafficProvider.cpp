@@ -608,6 +608,10 @@ bool URoadBLDTrafficProvider::GetJunctionPath(
 	const int32* FromJunction = LaneToJunctionMap.Find(FromLane.HandleId);
 	if (!FromJunction || *FromJunction == 0) { return false; }
 
+	// Validate that ToLane maps to the same junction (guards against mismatched lane pairs).
+	const int32* ToJunction = LaneToJunctionMap.Find(ToLane.HandleId);
+	if (!ToJunction || *ToJunction != *FromJunction) { return false; }
+
 	const FVector* Centroid = JunctionCentroids.Find(*FromJunction);
 	if (!Centroid) { return false; }
 

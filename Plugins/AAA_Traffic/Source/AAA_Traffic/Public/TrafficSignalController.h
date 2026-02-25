@@ -120,7 +120,7 @@ public:
 	TArray<FSignalPhaseGroup> PhaseGroups;
 
 	/** When true (non-Shipping builds), draws a sphere at this signal's location colored by the current phase. Has no effect in Shipping. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Debug")
+	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")
 	bool bDebugDrawSignal = false;
 
 private:

@@ -24,8 +24,7 @@ public class AAA_TrafficEditor : ModuleRules
 				"UnrealEd",
 				"Slate",
 				"SlateCore",
-				"PropertyEditor",
-				"EditorStyle"
+				"PropertyEditor"
 			}
 		);
 	}

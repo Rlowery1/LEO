@@ -272,7 +272,7 @@ protected:
 	int32 RandomSeed;
 
 	/** When true (non-Shipping builds), draws the lane polyline, look-ahead target, and leader detection in-game. Has no effect in Shipping. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Debug")
+	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")
 	bool bDebugDraw = false;
 
 	/**
