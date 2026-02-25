@@ -614,4 +614,10 @@ void ATrafficSpawner::SpawnVehicles()
 	}
 
 	bSpawnComplete = true;
+
+	// Unbind delegate now that spawning is complete (review feedback: keep delegate list clean).
+	if (TrafficSub)
+	{
+		TrafficSub->OnProviderRegistered.RemoveAll(this);
+	}
 }

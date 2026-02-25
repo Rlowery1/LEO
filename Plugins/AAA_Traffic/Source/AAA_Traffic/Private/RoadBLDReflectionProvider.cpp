@@ -6,7 +6,6 @@
 #include "TrafficLog.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
-#include "UObject/FieldPathProperty.h"
 
 // ---------------------------------------------------------------------------
 // USubsystem overrides
@@ -342,6 +341,8 @@ void URoadBLDReflectionProvider::CacheRoadData(UWorld* World)
 		RoadHandleMap.Add(RoadId, RoadActor);
 
 		TArray<UObject*> Lanes = GetAllLanesForRoad(RoadActor);
+		// Filter null entries before sorting — GetAllLanes() can return nulls.
+		Lanes.RemoveAll([](const UObject* Obj) { return Obj == nullptr; });
 		// Sort lanes by name for deterministic handle ordering.
 		Lanes.Sort([](const UObject& A, const UObject& B)
 		{
@@ -466,14 +467,28 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 		return;
 	}
 
-	// Find the road network actor.
+	// Find the road network actor — sort candidates by name for deterministic
+	// selection if multiple exist (System.md §4.4).
 	AActor* NetworkActor = nullptr;
-	for (FActorIterator It(World); It; ++It)
 	{
-		if (It->IsA(DynNetworkClass))
+		TArray<AActor*> NetworkCandidates;
+		for (FActorIterator It(World); It; ++It)
 		{
-			NetworkActor = *It;
-			break;
+			if (It->IsA(DynNetworkClass))
+			{
+				NetworkCandidates.Add(*It);
+			}
+		}
+		if (NetworkCandidates.Num() > 0)
+		{
+			NetworkCandidates.Sort([](const AActor& A, const AActor& B) { return A.GetName() < B.GetName(); });
+			NetworkActor = NetworkCandidates[0];
+			if (NetworkCandidates.Num() > 1)
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("RoadBLDReflectionProvider: %d DynamicRoadNetwork actors found — using '%s' (first by name)."),
+					NetworkCandidates.Num(), *NetworkActor->GetName());
+			}
 		}
 	}
 	if (!NetworkActor)

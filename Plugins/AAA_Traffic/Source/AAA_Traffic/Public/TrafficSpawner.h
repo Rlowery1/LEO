@@ -5,8 +5,9 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "DrawDebugHelpers.h"
-#include "TrafficRoadProvider.h"
 #include "TrafficSpawner.generated.h"
+
+class ITrafficRoadProvider;
 
 /**
  * Place this actor in a level to spawn traffic vehicles on available lanes.

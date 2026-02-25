@@ -85,11 +85,21 @@ $passes = 0
 foreach ($className in $baseline.classes.PSObject.Properties.Name) {
     $classSpec = $baseline.classes.$className
 
+    # Narrow search to the class-specific generated header when available.
+    # UHT generates <ClassName>.generated.h — searching only that file avoids
+    # false positives from identically-named symbols on unrelated classes.
+    $scopedContent = $headerContent
+    if ($headerContent.ContainsKey($className)) {
+        $scopedContent = @{ $className = $headerContent[$className] }
+    } else {
+        Write-Warning "No header matching '$className.generated.h' found — falling back to broad search."
+    }
+
     # Check functions.
     foreach ($func in $classSpec.functions) {
         $funcName = $func.name
         $found = $false
-        foreach ($content in $headerContent.Values) {
+        foreach ($content in $scopedContent.Values) {
             if ($content -match "\b$funcName\b") {
                 $found = $true
                 break
@@ -111,7 +121,7 @@ foreach ($className in $baseline.classes.PSObject.Properties.Name) {
     foreach ($prop in $classSpec.properties) {
         $propName = $prop.name
         $found = $false
-        foreach ($content in $headerContent.Values) {
+        foreach ($content in $scopedContent.Values) {
             if ($content -match "\b$propName\b") {
                 $found = $true
                 break

@@ -65,21 +65,28 @@ struct AAA_TRAFFIC_API FRoadBLDAPIContract
 		FRoadBLDAPIContractResult Result;
 
 		// ── UClasses ───────────────────────────────────────────────
+		/** Per-function contract: name + expected UFunction::NumParms (includes return value). */
+		struct FFuncCheck
+		{
+			const TCHAR* Name;
+			int32 ExpectedNumParms;  // -1 = skip count check
+		};
+
 		struct FClassEntry
 		{
 			const TCHAR* Path;
-			TArray<const TCHAR*> RequiredFunctions;
+			TArray<FFuncCheck> RequiredFunctions;
 			TArray<const TCHAR*> RequiredProperties;
 		};
 
-		// DynamicRoad
+		// DynamicRoad  (param counts derived from RoadBLD 1.2.1 reflection)
 		FClassEntry DynamicRoad;
 		DynamicRoad.Path = TEXT("/Script/RoadBLDRuntime.DynamicRoad");
 		DynamicRoad.RequiredFunctions = {
-			TEXT("GetLength"),
-			TEXT("GetAllLanes"),
-			TEXT("ConvertDistanceBetweenCurves"),
-			TEXT("GetWorldPositionAtDistance")
+			{ TEXT("GetLength"),                     1 },  // () -> float
+			{ TEXT("GetAllLanes"),                    1 },  // () -> TArray<UObject*>
+			{ TEXT("ConvertDistanceBetweenCurves"),   4 },  // (Src, Tgt, Dist) -> float
+			{ TEXT("GetWorldPositionAtDistance"),      2 }   // (Dist) -> FVector
 		};
 		DynamicRoad.RequiredProperties = {
 			TEXT("ReferenceLine")
@@ -108,13 +115,22 @@ struct AAA_TRAFFIC_API FRoadBLDAPIContract
 				continue;  // Can't check members without the class.
 			}
 
-			for (const TCHAR* FuncName : Entry.RequiredFunctions)
+			for (const FFuncCheck& Func : Entry.RequiredFunctions)
 			{
-				if (!Class->FindFunctionByName(FuncName))
+				UFunction* FoundFunc = Class->FindFunctionByName(Func.Name);
+				if (!FoundFunc)
 				{
 					Result.AddFailure(TEXT("UFunction"), 
-						FString::Printf(TEXT("%s::%s"), Entry.Path, FuncName),
+						FString::Printf(TEXT("%s::%s"), Entry.Path, Func.Name),
 						TEXT("Function not found on class."));
+				}
+				else if (Func.ExpectedNumParms >= 0
+					&& FoundFunc->NumParms != Func.ExpectedNumParms)
+				{
+					Result.AddFailure(TEXT("UFunction"),
+						FString::Printf(TEXT("%s::%s"), Entry.Path, Func.Name),
+						FString::Printf(TEXT("Param count mismatch: expected %d, found %d."),
+							Func.ExpectedNumParms, FoundFunc->NumParms));
 				}
 			}
 
