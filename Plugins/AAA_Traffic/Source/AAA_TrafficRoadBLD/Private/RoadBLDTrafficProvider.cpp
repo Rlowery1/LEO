@@ -48,9 +48,13 @@ void URoadBLDTrafficProvider::Deinitialize()
 	}
 
 	RoadHandleMap.Empty();
+	RoadToLaneHandles.Empty();
 	LaneHandleMap.Empty();
 	LaneToHandleMap.Empty();
 	LaneConnectionMap.Empty();
+	LeftNeighborMap.Empty();
+	RightNeighborMap.Empty();
+	LaneToRoadHandleMap.Empty();
 	CachedRoadNetwork = nullptr;
 	bCached = false;
 #endif
@@ -116,18 +120,24 @@ void URoadBLDTrafficProvider::CacheRoadData()
 		{
 			return A->GetName() < B->GetName();
 		});
+
+		TArray<int32>& RoadLaneIds = RoadToLaneHandles.Add(RoadId);
+
 		for (UDynamicRoadLane* Lane : Lanes)
 		{
 			if (!Lane) continue;
 			const int32 LaneId = NextHandleId++;
 			LaneHandleMap.Add(LaneId, Lane);
 			LaneToHandleMap.Add(Lane, LaneId);
+			RoadLaneIds.Add(LaneId);
+			LaneToRoadHandleMap.Add(LaneId, RoadId);
 		}
 	}
 
 	bCached = true;
 
 	BuildLaneConnectivity();
+	BuildLaneAdjacency();
 }
 
 void URoadBLDTrafficProvider::BuildLaneConnectivity()
@@ -401,6 +411,83 @@ ADynamicRoad* URoadBLDTrafficProvider::GetRoadForLane(UDynamicRoadLane* Lane) co
 	return Lane->GetTypedOuter<ADynamicRoad>();
 }
 
+// ---------------------------------------------------------------------------
+// BuildLaneAdjacency — shared-edge detection for left/right neighbors
+// ---------------------------------------------------------------------------
+
+void URoadBLDTrafficProvider::BuildLaneAdjacency()
+{
+	LeftNeighborMap.Empty();
+	RightNeighborMap.Empty();
+
+	for (const auto& RoadPair : RoadToLaneHandles)
+	{
+		const TArray<int32>& LaneIds = RoadPair.Value;
+		if (LaneIds.Num() < 2) { continue; }
+
+		for (int32 i = 0; i < LaneIds.Num(); ++i)
+		{
+			UDynamicRoadLane* LaneI = ResolveLane(FTrafficLaneHandle(LaneIds[i]));
+			if (!LaneI) { continue; }
+
+			for (int32 j = i + 1; j < LaneIds.Num(); ++j)
+			{
+				UDynamicRoadLane* LaneJ = ResolveLane(FTrafficLaneHandle(LaneIds[j]));
+				if (!LaneJ) { continue; }
+
+				// I's right edge == J's left edge ⇒ J is to the right of I.
+				if (LaneI->RightEdgeCurve && LaneJ->LeftEdgeCurve
+					&& LaneI->RightEdgeCurve == LaneJ->LeftEdgeCurve)
+				{
+					RightNeighborMap.Add(LaneIds[i], LaneIds[j]);
+					LeftNeighborMap.Add(LaneIds[j], LaneIds[i]);
+				}
+				// I's left edge == J's right edge ⇒ J is to the left of I.
+				else if (LaneI->LeftEdgeCurve && LaneJ->RightEdgeCurve
+					&& LaneI->LeftEdgeCurve == LaneJ->RightEdgeCurve)
+				{
+					LeftNeighborMap.Add(LaneIds[i], LaneIds[j]);
+					RightNeighborMap.Add(LaneIds[j], LaneIds[i]);
+				}
+			}
+		}
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDTrafficProvider: Built lane adjacency — %d left links, %d right links."),
+		LeftNeighborMap.Num(), RightNeighborMap.Num());
+}
+
+// ---------------------------------------------------------------------------
+// ITrafficRoadProvider — adjacency & speed limit
+// ---------------------------------------------------------------------------
+
+FTrafficLaneHandle URoadBLDTrafficProvider::GetAdjacentLane(
+	const FTrafficLaneHandle& Lane, ETrafficLaneSide Side)
+{
+	const TMap<int32, int32>& Map = (Side == ETrafficLaneSide::Left) ? LeftNeighborMap : RightNeighborMap;
+	if (const int32* NeighborId = Map.Find(Lane.HandleId))
+	{
+		return FTrafficLaneHandle(*NeighborId);
+	}
+	return FTrafficLaneHandle();
+}
+
+FTrafficRoadHandle URoadBLDTrafficProvider::GetRoadForLane(const FTrafficLaneHandle& Lane)
+{
+	if (const int32* RoadId = LaneToRoadHandleMap.Find(Lane.HandleId))
+	{
+		return FTrafficRoadHandle(*RoadId);
+	}
+	return FTrafficRoadHandle();
+}
+
+float URoadBLDTrafficProvider::GetLaneSpeedLimit(const FTrafficLaneHandle& /*Lane*/)
+{
+	// RoadBLD does not expose per-lane speed limits.
+	return -1.0f;
+}
+
 #else // !WITH_ROADBLD — empty stubs so the module compiles without RoadBLD
 
 TArray<FTrafficRoadHandle> URoadBLDTrafficProvider::GetAllRoads() { return {}; }
@@ -409,5 +496,8 @@ bool URoadBLDTrafficProvider::GetLanePath(const FTrafficLaneHandle&, TArray<FVec
 FVector URoadBLDTrafficProvider::GetLaneDirection(const FTrafficLaneHandle&) { return FVector::ForwardVector; }
 TArray<FTrafficLaneHandle> URoadBLDTrafficProvider::GetConnectedLanes(const FTrafficLaneHandle&) { return {}; }
 FTrafficLaneHandle URoadBLDTrafficProvider::GetLaneAtLocation(const FVector&) { return {}; }
+FTrafficLaneHandle URoadBLDTrafficProvider::GetAdjacentLane(const FTrafficLaneHandle&, ETrafficLaneSide) { return {}; }
+FTrafficRoadHandle URoadBLDTrafficProvider::GetRoadForLane(const FTrafficLaneHandle&) { return {}; }
+float URoadBLDTrafficProvider::GetLaneSpeedLimit(const FTrafficLaneHandle&) { return -1.0f; }
 
 #endif // WITH_ROADBLD

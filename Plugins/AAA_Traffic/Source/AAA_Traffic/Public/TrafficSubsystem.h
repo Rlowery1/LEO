@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "Engine/TimerHandle.h"
+#include "TrafficRoadProvider.h"
 #include "TrafficSubsystem.generated.h"
 
 class ITrafficRoadProvider;
@@ -12,6 +13,9 @@ class ATrafficVehicleController;
 
 /** Broadcast when a provider registers (or re-registers) with the subsystem. */
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnProviderRegistered, ITrafficRoadProvider* /*Provider*/);
+
+/** Broadcast just before a vehicle is destroyed by the despawn sweep. */
+DECLARE_MULTICAST_DELEGATE_TwoParams(FOnVehicleDespawned, ATrafficVehicleController* /*Controller*/, const FTrafficLaneHandle& /*Lane*/);
 
 /**
  * World subsystem that holds a reference to the active road provider.
@@ -48,11 +52,20 @@ public:
 	/** Fired when a provider registers. Listeners can use this for deferred initialization. */
 	FOnProviderRegistered OnProviderRegistered;
 
+	/** Fired just before a vehicle is destroyed by the despawn sweep. */
+	FOnVehicleDespawned OnVehicleDespawned;
+
 	/** Register an active traffic vehicle controller. */
 	void RegisterVehicle(ATrafficVehicleController* InController);
 
 	/** Unregister a traffic vehicle controller. */
 	void UnregisterVehicle(ATrafficVehicleController* InController);
+
+	/** Notify the subsystem that a vehicle has changed lanes (updates per-lane registry). */
+	void UpdateVehicleLane(ATrafficVehicleController* InController, const FTrafficLaneHandle& NewLane);
+
+	/** Get all vehicles currently on a given lane. */
+	TArray<TWeakObjectPtr<ATrafficVehicleController>> GetVehiclesOnLane(const FTrafficLaneHandle& Lane) const;
 
 	/** Get the set of all currently active vehicle controllers. */
 	const TSet<TWeakObjectPtr<ATrafficVehicleController>>& GetActiveVehicles() const { return ActiveVehicles; }
@@ -101,4 +114,10 @@ private:
 	 * when the referenced UObject is collected.
 	 */
 	TSet<TWeakObjectPtr<ATrafficVehicleController>> ActiveVehicles;
+
+	/**
+	 * Per-lane vehicle registry: lane handle ID → controllers currently on that lane.
+	 * Used by lane-change gap checking for deterministic neighbor queries.
+	 */
+	TMap<int32, TArray<TWeakObjectPtr<ATrafficVehicleController>>> VehiclesByLane;
 };

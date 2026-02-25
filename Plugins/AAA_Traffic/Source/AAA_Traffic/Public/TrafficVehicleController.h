@@ -8,6 +8,20 @@
 #include "TrafficVehicleController.generated.h"
 
 /**
+ * State of in-progress lane change.
+ */
+UENUM()
+enum class ELaneChangeState : uint8
+{
+	/** Not changing lanes. */
+	None,
+	/** Actively blending from source to target lane. */
+	Executing,
+	/** Blend complete, settling onto new lane. */
+	Completing
+};
+
+/**
  * AI controller that drives a Chaos vehicle along a lane
  * obtained from an ITrafficRoadProvider adapter.
  *
@@ -37,6 +51,18 @@ public:
 
 	/** Returns true if the vehicle has reached a dead-end with no connected lanes. */
 	bool IsAtDeadEnd() const { return bAtDeadEnd; }
+
+	/** Get the lane this vehicle is currently following. */
+	const FTrafficLaneHandle& GetCurrentLane() const { return CurrentLane; }
+
+	/**
+	 * Configure lane-change behavior from spawner aggression slider (0-1).
+	 * Maps aggression to internal thresholds and cooldown timings.
+	 */
+	void SetLaneChangeAggression(float Aggression);
+
+	/** Set the base (default) speed limit used when the provider has no lane speed data. */
+	void SetDefaultSpeedLimit(float InSpeedLimit);
 
 protected:
 	virtual void OnPossess(APawn* InPawn) override;
@@ -79,6 +105,26 @@ private:
 	 */
 	float GetLeaderDistance(float& OutLeaderSpeed) const;
 
+	// ── Lane change ─────────────────────────────────────────
+
+	/**
+	 * Evaluate whether to begin a lane change (slow leader ahead, gap available).
+	 * Called every tick when LaneChangeState == None and cooldown has expired.
+	 */
+	void EvaluateLaneChange();
+
+	/**
+	 * Advance the active lane-change blend.
+	 * Interpolates the steering target between source and target lane polylines.
+	 * Returns the blended look-ahead point for this frame.
+	 */
+	FVector UpdateLaneChangeBlend(const FVector& VehicleLocation, int32 ClosestIndex);
+
+	/**
+	 * Complete a lane change: adopt target lane as current, reset state.
+	 */
+	void FinalizeLaneChange();
+
 	// ----- State -----
 
 	/** Handle to the lane currently being followed. */
@@ -105,6 +151,32 @@ private:
 	/** Previous vehicle location for distance tracking. */
 	FVector PreviousVehicleLocation;
 
+	/** Distance traveled by the vehicle this tick (computed once, consumed by blend). */
+	float DistanceThisTick;
+
+	// ── Lane-change state ───────────────────────────────────
+
+	/** Current lane-change phase. */
+	ELaneChangeState LaneChangeState;
+
+	/** Handle to the target lane during an active lane change. */
+	FTrafficLaneHandle TargetLaneHandle;
+
+	/** Cached centerline of the target lane (for blending). */
+	TArray<FVector> TargetLanePoints;
+
+	/** Width of the target lane (cm). */
+	float TargetLaneWidth;
+
+	/** Progress of the lane-change blend (0 = source, 1 = target). */
+	float LaneChangeProgress;
+
+	/** Time remaining before another lane change can be considered (seconds). */
+	float LaneChangeCooldownRemaining;
+
+	/** Base target speed before lane speed-limit adjustments. */
+	float BaseTargetSpeed;
+
 	// ----- Tuning -----
 
 	/** Target speed in cm/s (default ~54 km/h). */
@@ -122,6 +194,34 @@ private:
 	/** Maximum forward detection range for vehicles ahead (cm). */
 	UPROPERTY(EditAnywhere, Category = "Traffic|Proximity", meta = (ClampMin = "500"))
 	float DetectionDistance;
+
+	// ── Lane Change Tuning ──────────────────────────────────
+
+	/**
+	 * Distance over which the lane-change lateral blend occurs (cm).
+	 * Shorter = snappier, longer = smoother.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Traffic|LaneChange", meta = (ClampMin = "200"))
+	float LaneChangeDistance;
+
+	/** Minimum time between successive lane changes (seconds). */
+	UPROPERTY(EditAnywhere, Category = "Traffic|LaneChange", meta = (ClampMin = "0"))
+	float LaneChangeCooldownTime;
+
+	/**
+	 * Speed ratio threshold to trigger a lane change (0-1).
+	 * A change is considered when CurrentSpeed / TargetSpeed < this value.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Traffic|LaneChange", meta = (ClampMin = "0", ClampMax = "1"))
+	float LaneChangeSpeedThreshold;
+
+	/** Minimum gap (cm) required on the target lane for a safe merge. */
+	UPROPERTY(EditAnywhere, Category = "Traffic|LaneChange", meta = (ClampMin = "100"))
+	float LaneChangeGapRequired;
+
+	/** Default speed limit (cm/s) used when the provider returns no speed data. */
+	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0"))
+	float DefaultSpeedLimit;
 
 	/**
 	 * Seed for deterministic random decisions.

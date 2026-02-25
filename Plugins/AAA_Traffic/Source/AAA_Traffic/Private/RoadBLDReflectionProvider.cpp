@@ -39,6 +39,9 @@ void URoadBLDReflectionProvider::Deinitialize()
 	LaneHandleMap.Empty();
 	LaneToHandleMap.Empty();
 	LaneConnectionMap.Empty();
+	LeftNeighborMap.Empty();
+	RightNeighborMap.Empty();
+	LaneToRoadHandleMap.Empty();
 	bCached = false;
 
 	DynRoadClass = nullptr;
@@ -98,6 +101,9 @@ void URoadBLDReflectionProvider::OnWorldBeginPlay(UWorld& InWorld)
 
 	// ── Build lane connectivity ──────────────────────────────────
 	BuildLaneConnectivity(&InWorld);
+
+	// ── Build same-road lane adjacency (left/right neighbors) ────
+	BuildLaneAdjacency();
 
 	// ── Register ─────────────────────────────────────────────────
 	if (TrafficSub)
@@ -411,6 +417,7 @@ void URoadBLDReflectionProvider::CacheRoadData(UWorld* World)
 
 			const int32 LaneId = NextHandleId++;
 			RoadLaneIds.Add(LaneId);
+			LaneToRoadHandleMap.Add(LaneId, RoadId);
 
 			FReflectionLaneData& LData = LaneHandleMap.Add(LaneId);
 			LData.LaneObject = LaneObj;
@@ -667,6 +674,89 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("RoadBLDReflectionProvider: Built lane connectivity — %d lanes with connections, %d total links."),
 		LaneConnectionMap.Num(), ConnectedLaneCount);
+}
+
+// ---------------------------------------------------------------------------
+// BuildLaneAdjacency — detect left/right neighbor lanes per road
+// ---------------------------------------------------------------------------
+
+void URoadBLDReflectionProvider::BuildLaneAdjacency()
+{
+	LeftNeighborMap.Empty();
+	RightNeighborMap.Empty();
+
+	// For each road, examine pairs of lanes and detect adjacency via shared edge curves.
+	// Lane A's RightEdge == Lane B's LeftEdge ⇒ B is to the right of A (and A is to the left of B).
+	for (const auto& RoadPair : RoadToLaneHandles)
+	{
+		const TArray<int32>& LaneIds = RoadPair.Value;
+		if (LaneIds.Num() < 2) { continue; }
+
+		for (int32 i = 0; i < LaneIds.Num(); ++i)
+		{
+			const FReflectionLaneData* DataI = LaneHandleMap.Find(LaneIds[i]);
+			if (!DataI) { continue; }
+
+			for (int32 j = i + 1; j < LaneIds.Num(); ++j)
+			{
+				const FReflectionLaneData* DataJ = LaneHandleMap.Find(LaneIds[j]);
+				if (!DataJ) { continue; }
+
+				UObject* iRight = DataI->RightEdge.Get();
+				UObject* jLeft  = DataJ->LeftEdge.Get();
+				UObject* iLeft  = DataI->LeftEdge.Get();
+				UObject* jRight = DataJ->RightEdge.Get();
+
+				// I's right == J's left ⇒ J is to the right of I.
+				if (iRight && jLeft && iRight == jLeft)
+				{
+					RightNeighborMap.Add(LaneIds[i], LaneIds[j]);
+					LeftNeighborMap.Add(LaneIds[j], LaneIds[i]);
+				}
+				// I's left == J's right ⇒ J is to the left of I.
+				else if (iLeft && jRight && iLeft == jRight)
+				{
+					LeftNeighborMap.Add(LaneIds[i], LaneIds[j]);
+					RightNeighborMap.Add(LaneIds[j], LaneIds[i]);
+				}
+			}
+		}
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDReflectionProvider: Built lane adjacency — %d left links, %d right links."),
+		LeftNeighborMap.Num(), RightNeighborMap.Num());
+}
+
+// ---------------------------------------------------------------------------
+// ITrafficRoadProvider — adjacency & speed limit
+// ---------------------------------------------------------------------------
+
+FTrafficLaneHandle URoadBLDReflectionProvider::GetAdjacentLane(
+	const FTrafficLaneHandle& Lane, ETrafficLaneSide Side)
+{
+	const TMap<int32, int32>& Map = (Side == ETrafficLaneSide::Left) ? LeftNeighborMap : RightNeighborMap;
+	if (const int32* NeighborId = Map.Find(Lane.HandleId))
+	{
+		return FTrafficLaneHandle(*NeighborId);
+	}
+	return FTrafficLaneHandle();
+}
+
+FTrafficRoadHandle URoadBLDReflectionProvider::GetRoadForLane(const FTrafficLaneHandle& Lane)
+{
+	if (const int32* RoadId = LaneToRoadHandleMap.Find(Lane.HandleId))
+	{
+		return FTrafficRoadHandle(*RoadId);
+	}
+	return FTrafficRoadHandle();
+}
+
+float URoadBLDReflectionProvider::GetLaneSpeedLimit(const FTrafficLaneHandle& /*Lane*/)
+{
+	// RoadBLD does not expose per-lane speed limits. Return -1 so the caller
+	// knows to fall back to its own default speed.
+	return -1.0f;
 }
 
 // ---------------------------------------------------------------------------
