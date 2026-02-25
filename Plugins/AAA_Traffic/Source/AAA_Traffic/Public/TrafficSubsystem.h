@@ -10,6 +10,9 @@
 class ITrafficRoadProvider;
 class ATrafficVehicleController;
 
+/** Broadcast when a provider registers (or re-registers) with the subsystem. */
+DECLARE_MULTICAST_DELEGATE_OneParam(FOnProviderRegistered, ITrafficRoadProvider* /*Provider*/);
+
 /**
  * World subsystem that holds a reference to the active road provider.
  * Road-kit adapters register themselves here; the traffic system queries through here.
@@ -38,6 +41,12 @@ public:
 
 	/** Get the currently active road provider, or nullptr if none is registered. */
 	ITrafficRoadProvider* GetProvider() const;
+
+	/** Returns true if a provider is currently registered. */
+	bool HasProvider() const;
+
+	/** Fired when a provider registers. Listeners can use this for deferred initialization. */
+	FOnProviderRegistered OnProviderRegistered;
 
 	/** Register an active traffic vehicle controller. */
 	void RegisterVehicle(ATrafficVehicleController* InController);

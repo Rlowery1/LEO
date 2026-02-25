@@ -7,6 +7,8 @@
 #include "DrawDebugHelpers.h"
 #include "TrafficSpawner.generated.h"
 
+class ITrafficRoadProvider;
+
 /**
  * Place this actor in a level to spawn traffic vehicles on available lanes.
  *
@@ -35,9 +37,21 @@ private:
 	/** Deferred to next tick so all subsystems (including adapters) are initialized. */
 	void SpawnVehicles();
 
+	/** Called when a provider registers after BeginPlay (deferred retry). */
+	void OnProviderRegistered(ITrafficRoadProvider* Provider);
+
+	/** True once SpawnVehicles has successfully completed. */
+	bool bSpawnComplete = false;
+
 #if ENABLE_DRAW_DEBUG
 	/** Cache lane polylines from the provider so debug draw doesn't re-query every frame. */
 	void CacheDebugLaneData();
+
+	/**
+	 * Fallback: discover lane geometry via UE reflection when no compiled adapter
+	 * is available (e.g. precompiled RoadBLD without source headers).
+	 */
+	void CacheDebugLaneDataViaReflection(UWorld* World);
 
 	/** Draw cached lane centerlines using DrawDebugLine. */
 	void DrawDebugLanes() const;
