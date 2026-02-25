@@ -46,6 +46,8 @@ class AAA_TRAFFIC_API ATrafficSpawner : public AActor
 {
 	GENERATED_BODY()
 
+	friend class FTrafficSpawnerCustomization;
+
 public:
 	ATrafficSpawner();
 
