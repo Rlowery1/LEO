@@ -4,6 +4,8 @@
 #include "TrafficSubsystem.h"
 #include "TrafficRoadProvider.h"
 #include "TrafficVehicleController.h"
+#include "TrafficSignalController.h"
+#include "TrafficVehiclePool.h"
 #include "TrafficLog.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
@@ -503,11 +505,31 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 	const FRotator SpawnRotation = SpawnDir.Rotation();
 	const FTransform SpawnTransform(SpawnRotation, SpawnLocation);
 
-	FActorSpawnParameters SpawnParams;
-	SpawnParams.SpawnCollisionHandlingOverride =
-		ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+	// Select vehicle class via weighted random (C1: vehicle variety).
+	const TSubclassOf<APawn> ChosenClass = SelectVehicleClass(VehicleIndex);
+	if (!ChosenClass)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("TrafficSpawner: No valid vehicle class for vehicle %d."), VehicleIndex);
+		return;
+	}
 
-	APawn* Vehicle = World->SpawnActor<APawn>(VehicleClass, SpawnTransform, SpawnParams);
+	// Try to acquire from the vehicle pool first (I1: object pooling).
+	APawn* Vehicle = nullptr;
+	UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>();
+	UTrafficVehiclePool* Pool = TrafficSub ? TrafficSub->GetVehiclePool() : nullptr;
+	if (Pool)
+	{
+		Vehicle = Pool->AcquireVehicle(World, ChosenClass, SpawnTransform);
+	}
+
+	if (!Vehicle)
+	{
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.SpawnCollisionHandlingOverride =
+			ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+		Vehicle = World->SpawnActor<APawn>(ChosenClass, SpawnTransform, SpawnParams);
+	}
 	if (!Vehicle)
 	{
 		UE_LOG(LogAAATraffic, Warning,
@@ -662,9 +684,9 @@ void ATrafficSpawner::SpawnVehicles()
 {
 	if (bSpawnComplete) { return; }
 
-	if (!VehicleClass)
+	if (VehicleClasses.Num() == 0 && !VehicleClass)
 	{
-		UE_LOG(LogAAATraffic, Error, TEXT("TrafficSpawner: No VehicleClass assigned."));
+		UE_LOG(LogAAATraffic, Error, TEXT("TrafficSpawner: No VehicleClass or VehicleClasses assigned."));
 		return;
 	}
 
@@ -717,6 +739,9 @@ void ATrafficSpawner::SpawnVehicles()
 	// Cache for respawn use.
 	CachedAllLanes = AllLanes;
 
+	// Auto-place traffic signals at discovered junctions (C2).
+	PlaceAutoSignals(World, Provider, AllLanes);
+
 	// Allow VehicleCount to exceed lane count — vehicles share lanes with
 	// staggered positioning via SpawnSpacing.
 	const int32 SpawnCount = VehicleCount;
@@ -760,5 +785,128 @@ void ATrafficSpawner::SpawnVehicles()
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("TrafficSpawner: Respawn enabled — checking every %.1f seconds."),
 			RespawnCheckInterval);
+	}
+}
+
+TSubclassOf<APawn> ATrafficSpawner::SelectVehicleClass(int32 VehicleIndex) const
+{
+	if (VehicleClasses.Num() == 0)
+	{
+		return VehicleClass;
+	}
+
+	// Build CDF from valid entries.
+	float TotalWeight = 0.0f;
+	for (const FVehicleClassEntry& Entry : VehicleClasses)
+	{
+		if (Entry.VehicleClass)
+		{
+			TotalWeight += Entry.Weight;
+		}
+	}
+
+	if (TotalWeight <= KINDA_SMALL_NUMBER)
+	{
+		return VehicleClass; // Fallback to single class.
+	}
+
+	constexpr int32 ClassSelectionSeedOffset = 20000;
+	FRandomStream ClassRng(SpawnSeed + VehicleIndex + ClassSelectionSeedOffset);
+	const float Roll = ClassRng.FRandRange(0.0f, TotalWeight);
+
+	float Cumulative = 0.0f;
+	for (const FVehicleClassEntry& Entry : VehicleClasses)
+	{
+		if (!Entry.VehicleClass) { continue; }
+		Cumulative += Entry.Weight;
+		if (Roll <= Cumulative)
+		{
+			return Entry.VehicleClass;
+		}
+	}
+
+	// Fallback (floating-point edge case).
+	for (int32 i = VehicleClasses.Num() - 1; i >= 0; --i)
+	{
+		if (VehicleClasses[i].VehicleClass)
+		{
+			return VehicleClasses[i].VehicleClass;
+		}
+	}
+	return VehicleClass;
+}
+
+void ATrafficSpawner::PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Provider,
+	const TArray<FTrafficLaneHandle>& AllLanes)
+{
+	if (!bAutoPlaceSignals) { return; }
+
+	UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
+
+	// Discover unique junction IDs from lane data.
+	TMap<int32, TArray<FTrafficLaneHandle>> JunctionLanes;
+	for (const FTrafficLaneHandle& Lane : AllLanes)
+	{
+		const int32 JId = Provider->GetJunctionForLane(Lane);
+		if (JId != 0)
+		{
+			JunctionLanes.FindOrAdd(JId).Add(Lane);
+		}
+	}
+
+	if (JunctionLanes.IsEmpty()) { return; }
+
+	// Sort junction IDs for deterministic processing (System.md §4.4).
+	TArray<int32> JunctionIds;
+	JunctionLanes.GetKeys(JunctionIds);
+	JunctionIds.Sort();
+
+	int32 SignalsPlaced = 0;
+	for (const int32 JId : JunctionIds)
+	{
+		// Skip junctions that already have a manually-placed signal controller.
+		if (TrafficSub && TrafficSub->GetSignalForJunction(JId))
+		{
+			continue;
+		}
+
+		const TArray<FTrafficLaneHandle>& Lanes = JunctionLanes[JId];
+
+		// Group incoming lanes by road for phase groups.
+		TMap<int32, TArray<FTrafficLaneHandle>> LanesByRoad;
+		for (const FTrafficLaneHandle& Lane : Lanes)
+		{
+			const FTrafficRoadHandle Road = Provider->GetRoadForLane(Lane);
+			LanesByRoad.FindOrAdd(Road.HandleId).Add(Lane);
+		}
+
+		// Spawn the signal controller at the world origin (no visible component needed).
+		ATrafficSignalController* Signal = World->SpawnActor<ATrafficSignalController>();
+		if (!Signal) { continue; }
+
+		Signal->JunctionId = JId;
+
+		// Build phase groups: each approach road gets its own green phase.
+		TArray<int32> RoadKeys;
+		LanesByRoad.GetKeys(RoadKeys);
+		RoadKeys.Sort();
+
+		Signal->PhaseGroups.Empty();
+		for (const int32 RoadId : RoadKeys)
+		{
+			FSignalPhaseGroup Group;
+			Group.GroupName = FString::Printf(TEXT("Road_%d"), RoadId);
+			Group.GreenLanes = LanesByRoad[RoadId];
+			Signal->PhaseGroups.Add(MoveTemp(Group));
+		}
+
+		++SignalsPlaced;
+	}
+
+	if (SignalsPlaced > 0)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("TrafficSpawner: Auto-placed %d signal controllers across %d junctions."),
+			SignalsPlaced, JunctionIds.Num());
 	}
 }

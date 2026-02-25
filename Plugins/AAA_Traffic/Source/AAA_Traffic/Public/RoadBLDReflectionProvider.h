@@ -51,6 +51,7 @@ public:
 	virtual float GetLaneSpeedLimit(const FTrafficLaneHandle& Lane) override;
 	virtual int32 GetJunctionForLane(const FTrafficLaneHandle& Lane) override;
 	virtual bool GetJunctionPath(const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane, TArray<FVector>& OutPath) override;
+	virtual bool IsLaneReversed(const FTrafficLaneHandle& Lane) override;
 
 private:
 	// ── Data caching ────────────────────────────────────────
@@ -63,6 +64,9 @@ private:
 
 	/** Detect left/right neighbor lanes on the same road via shared edge curves. */
 	void BuildLaneAdjacency();
+
+	/** Detect lanes whose travel direction is reversed (left-of-center on 2-way roads). */
+	void DetectReversedLanes();
 
 	// ── Reflection helpers ──────────────────────────────────
 
@@ -163,6 +167,9 @@ private:
 
 	/** Junction ID → centroid world position (for junction path generation). */
 	TMap<int32, FVector> JunctionCentroids;
+
+	/** Lane handles whose travel direction is reversed relative to reference line. */
+	TSet<int32> ReversedLaneSet;
 
 	/** True once CacheRoadData() has successfully run. */
 	bool bCached = false;

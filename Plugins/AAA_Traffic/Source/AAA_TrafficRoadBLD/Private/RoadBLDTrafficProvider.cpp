@@ -138,6 +138,7 @@ void URoadBLDTrafficProvider::CacheRoadData()
 
 	BuildLaneConnectivity();
 	BuildLaneAdjacency();
+	DetectReversedLanes();
 }
 
 void URoadBLDTrafficProvider::BuildLaneConnectivity()
@@ -332,6 +333,64 @@ void URoadBLDTrafficProvider::BuildLaneConnectivity()
 	}
 }
 
+void URoadBLDTrafficProvider::DetectReversedLanes()
+{
+	ReversedLaneSet.Empty();
+
+	for (const auto& RoadPair : RoadToLaneHandles)
+	{
+		if (RoadPair.Value.Num() < 2) { continue; } // Single-lane — cannot be 2-way.
+
+		ADynamicRoad* Road = ResolveRoad(FTrafficRoadHandle(RoadPair.Key));
+		if (!Road || !Road->ReferenceLine) { continue; }
+
+		const double RoadLength = Road->GetLength();
+		if (RoadLength < 200.0) { continue; }
+
+		// Sample reference line at midpoint for direction and position.
+		const double MidDist = RoadLength * 0.5;
+		const double NearDist = FMath::Max(MidDist - 100.0, 0.0);
+		const FVector RefMid = Road->ReferenceLine->Get3DPositionAtDistance(Road->ReferenceLine, MidDist);
+		const FVector RefNear = Road->ReferenceLine->Get3DPositionAtDistance(Road->ReferenceLine, NearDist);
+		const FVector RefDir = (RefMid - RefNear).GetSafeNormal();
+		if (RefDir.IsNearlyZero()) { continue; }
+
+		// Classify each lane as left-of-center or right-of-center.
+		struct FSideData { int32 LaneId; float Cross; };
+		TArray<FSideData> SideInfo;
+		int32 LeftCount = 0, RightCount = 0;
+
+		for (int32 LaneId : RoadPair.Value)
+		{
+			TArray<FVector> Points;
+			float Width;
+			if (!GetLanePath(FTrafficLaneHandle(LaneId), Points, Width) || Points.Num() < 2) { continue; }
+			const FVector LaneMid = Points[Points.Num() / 2];
+			const float Cross = FVector::CrossProduct(RefDir, (LaneMid - RefMid)).Z;
+			SideInfo.Add({ LaneId, Cross });
+			if (Cross > 50.0f) { ++LeftCount; }
+			else if (Cross < -50.0f) { ++RightCount; }
+		}
+
+		// Only mark reversed on 2-way roads (lanes on both sides).
+		if (LeftCount == 0 || RightCount == 0) { continue; }
+
+		for (const FSideData& S : SideInfo)
+		{
+			if (S.Cross > 50.0f) { ReversedLaneSet.Add(S.LaneId); }
+		}
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDTrafficProvider: Detected %d reversed lanes on 2-way roads."),
+		ReversedLaneSet.Num());
+}
+
+bool URoadBLDTrafficProvider::IsLaneReversed(const FTrafficLaneHandle& Lane)
+{
+	return ReversedLaneSet.Contains(Lane.HandleId);
+}
+
 TArray<FTrafficRoadHandle> URoadBLDTrafficProvider::GetAllRoads()
 {
 	TArray<FTrafficRoadHandle> Result;
@@ -440,6 +499,12 @@ bool URoadBLDTrafficProvider::GetLanePath(
 		}
 
 		OutPoints.Add(Pos);
+	}
+
+	// Reverse points for lanes whose travel direction opposes the reference line (C3).
+	if (ReversedLaneSet.Contains(Lane.HandleId))
+	{
+		Algo::Reverse(OutPoints);
 	}
 
 	return true;
@@ -643,5 +708,6 @@ FTrafficRoadHandle URoadBLDTrafficProvider::GetRoadForLane(const FTrafficLaneHan
 float URoadBLDTrafficProvider::GetLaneSpeedLimit(const FTrafficLaneHandle&) { return -1.0f; }
 int32 URoadBLDTrafficProvider::GetJunctionForLane(const FTrafficLaneHandle&) { return 0; }
 bool URoadBLDTrafficProvider::GetJunctionPath(const FTrafficLaneHandle&, const FTrafficLaneHandle&, TArray<FVector>&) { return false; }
+bool URoadBLDTrafficProvider::IsLaneReversed(const FTrafficLaneHandle&) { return false; }
 
 #endif // WITH_ROADBLD
