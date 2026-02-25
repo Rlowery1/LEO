@@ -3,6 +3,7 @@
 #include "TrafficSubsystem.h"
 #include "TrafficRoadProvider.h"
 #include "TrafficVehicleController.h"
+#include "TrafficSignalController.h"
 #include "TrafficLog.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
@@ -296,7 +297,7 @@ int64 UTrafficSubsystem::ComputeCellKey(const FVector& Position)
 {
 	const int32 CX = FMath::FloorToInt32(Position.X / SpatialCellSize);
 	const int32 CY = FMath::FloorToInt32(Position.Y / SpatialCellSize);
-	return (static_cast<int64>(CX) << 32) | static_cast<int64>(static_cast<uint32>(CY));
+	return (static_cast<int64>(CX) << 32) | (static_cast<int64>(CY) & 0xFFFFFFFF);
 }
 
 void UTrafficSubsystem::UpdateVehiclePosition(ATrafficVehicleController* Controller, const FVector& Position)
@@ -449,13 +450,8 @@ bool UTrafficSubsystem::TryOccupyJunction(int32 JunctionId, ATrafficVehicleContr
 		return true;
 	}
 
-	// Junction occupied by another vehicle — right-of-way by HandleId priority.
-	// Lower lane HandleId has priority.
-	if (Controller->GetCurrentLane().HandleId < Current->GetCurrentLane().HandleId)
-	{
-		Occupant = Controller;
-		return true;
-	}
+	// Junction is occupied by another vehicle — do not override existing occupancy.
+	// Once granted, occupancy remains exclusive until the holder releases it.
 	return false;
 }
 

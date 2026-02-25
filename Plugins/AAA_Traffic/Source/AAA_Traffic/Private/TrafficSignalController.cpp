@@ -51,6 +51,7 @@ void ATrafficSignalController::BeginPlay()
 		if (RemainingOffset >= PhaseTimer)
 		{
 			RemainingOffset -= PhaseTimer;
+			PhaseTimer = 0.0f; // Reset before advancing so additive AdvancePhase works correctly.
 			AdvancePhase();
 		}
 		else
@@ -90,7 +91,7 @@ void ATrafficSignalController::Tick(float DeltaSeconds)
 
 	PhaseTimer -= DeltaSeconds;
 
-	if (PhaseTimer <= 0.0f)
+	while (PhaseTimer <= 0.0f)
 	{
 		AdvancePhase();
 	}
@@ -98,21 +99,23 @@ void ATrafficSignalController::Tick(float DeltaSeconds)
 
 void ATrafficSignalController::AdvancePhase()
 {
+	// Additive timer: preserves negative overflow from PhaseTimer so that
+	// large DeltaSeconds values don't cause the signal to drift.
 	switch (CurrentPhase)
 	{
 	case ETrafficSignalPhase::Green:
 		CurrentPhase = ETrafficSignalPhase::Yellow;
-		PhaseTimer = YellowDuration;
+		PhaseTimer += YellowDuration;
 		break;
 
 	case ETrafficSignalPhase::Yellow:
 		CurrentPhase = ETrafficSignalPhase::Red;
-		PhaseTimer = RedDuration;
+		PhaseTimer += RedDuration;
 		break;
 
 	case ETrafficSignalPhase::Red:
 		CurrentPhase = ETrafficSignalPhase::Green;
-		PhaseTimer = GreenDuration;
+		PhaseTimer += GreenDuration;
 		break;
 	}
 }

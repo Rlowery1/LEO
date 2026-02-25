@@ -80,8 +80,7 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 	JunctionTransitionPoints.Empty();
 	JunctionTransitionIndex = 0;
 	bWaitingAtIntersection = false;
-	// Note: IntersectionJunctionId is NOT reset here — it persists until
-	// the vehicle clears the junction (transition points consumed).
+	IntersectionJunctionId = 0;
 
 	// Reset lane-change state when entering a new lane.
 	LaneChangeState = ELaneChangeState::None;
@@ -184,6 +183,7 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 	}
 
 	++LODFrameCounter;
+	if (LODFrameCounter >= 20) { LODFrameCounter = 0; } // Wrap at LCM(4,10) to prevent overflow.
 
 	// --- LOD-based tick gating (Feature 7) ---
 	// Reduced: tick every 4 frames. Minimal: tick every 10 frames.
@@ -211,7 +211,7 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 			const int32 NextIdx = FMath::Min(LastClosestIndex + 1, LanePoints.Num() - 1);
 			if (NextIdx != LastClosestIndex)
 			{
-				GetPawn()->SetActorLocation(LanePoints[NextIdx]);
+				GetPawn()->SetActorLocation(LanePoints[NextIdx], /*bSweep*/ false, /*OutSweepHitResult*/ nullptr, ETeleportType::TeleportPhysics);
 				LastClosestIndex = NextIdx;
 			}
 		}
@@ -309,15 +309,23 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 			}
 
 			// If waiting at intersection, brake proportionally to remaining distance.
-			if (bWaitingAtIntersection)
+		if (bWaitingAtIntersection)
 			{
 				UWorld* World = GetWorld();
 				UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
 
-				// Retry occupancy each tick.
+				// Retry signal + occupancy each tick.
 				if (TrafficSub && IntersectionJunctionId != 0)
 				{
-					if (TrafficSub->TryOccupyJunction(IntersectionJunctionId, this))
+					// Re-check the traffic signal phase before attempting occupancy.
+					bool bSignalAllows = true;
+					ATrafficSignalController* Signal = TrafficSub->GetSignalForJunction(IntersectionJunctionId);
+					if (Signal)
+					{
+						bSignalAllows = (Signal->GetCurrentPhase() == ETrafficSignalPhase::Green);
+					}
+
+					if (bSignalAllows && TrafficSub->TryOccupyJunction(IntersectionJunctionId, this))
 					{
 						bWaitingAtIntersection = false;
 						// Fall through to CheckLaneTransition below.
@@ -376,10 +384,14 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	// Junction transition takes priority — follow synthesized curve first.
 	if (JunctionTransitionPoints.Num() > 0)
 	{
-		// Advance along junction points based on proximity.
+		// Advance along junction points based on proximity or forward progress.
+		// Use both distance check and "closer to next" test so high-speed vehicles
+		// that skip past points still advance correctly.
 		while (JunctionTransitionIndex < JunctionTransitionPoints.Num() - 1)
 		{
-			if (FVector::DistSquared(VehicleLocation, JunctionTransitionPoints[JunctionTransitionIndex]) < 10000.0f) // 1m
+			const float DistToCurrentSq = FVector::DistSquared(VehicleLocation, JunctionTransitionPoints[JunctionTransitionIndex]);
+			const float DistToNextSq = FVector::DistSquared(VehicleLocation, JunctionTransitionPoints[JunctionTransitionIndex + 1]);
+			if (DistToCurrentSq < 10000.0f || DistToNextSq < DistToCurrentSq) // 1m or closer to next
 			{
 				++JunctionTransitionIndex;
 			}
@@ -427,9 +439,15 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		if (LaneChangeSettleTimer <= 0.0f)
 		{
 			FinalizeLaneChange();
+			// FinalizeLaneChange() clears TargetLanePoints and sets state to None.
+			// Use normal look-ahead on the (now current) lane.
+			TargetPoint = GetLookAheadPoint(VehicleLocation, ClosestIndex);
 		}
-		// While settling, steer toward target lane look-ahead.
-		TargetPoint = UpdateLaneChangeBlend(VehicleLocation, ClosestIndex);
+		else
+		{
+			// While settling, steer toward target lane look-ahead.
+			TargetPoint = UpdateLaneChangeBlend(VehicleLocation, ClosestIndex);
+		}
 	}
 	else
 	{
@@ -521,11 +539,12 @@ int32 ATrafficVehicleController::FindClosestPointIndex(const FVector& VehicleLoc
 	// Vehicles advance monotonically along the lane, so the closest index is
 	// usually within a few steps of the cached value.
 	constexpr int32 SearchRadius = 8;
+	LastClosestIndex = FMath::Clamp(LastClosestIndex, 0, LanePoints.Num() - 1);
 	const int32 StartIdx = FMath::Max(0, LastClosestIndex - 2);
 	const int32 EndIdx = FMath::Min(LanePoints.Num() - 1, LastClosestIndex + SearchRadius);
 
 	int32 BestIndex = LastClosestIndex;
-	float BestDistSq = FVector::DistSquared(VehicleLocation, LanePoints[FMath::Clamp(LastClosestIndex, 0, LanePoints.Num() - 1)]);
+	float BestDistSq = FVector::DistSquared(VehicleLocation, LanePoints[LastClosestIndex]);
 
 	for (int32 i = StartIdx; i <= EndIdx; ++i)
 	{
@@ -537,9 +556,10 @@ int32 ATrafficVehicleController::FindClosestPointIndex(const FVector& VehicleLoc
 		}
 	}
 
-	// If the best index is at the boundary of the search window, fall back to
-	// a full scan to handle teleports, respawns, or large time-steps.
-	if (BestIndex == StartIdx || BestIndex == EndIdx)
+	// Fall back to a full scan if the bounded search result is far from the vehicle,
+	// indicating a teleport, respawn, or lane switch.
+	constexpr float FullScanThresholdSq = 500.0f * 500.0f; // 5m
+	if (BestDistSq > FullScanThresholdSq)
 	{
 		for (int32 i = 0; i < LanePoints.Num(); ++i)
 		{
@@ -656,9 +676,10 @@ void ATrafficVehicleController::CheckLaneTransition()
 	for (const FTrafficLaneHandle& Candidate : Connected)
 	{
 		const FVector CandDir = CachedProvider->GetLaneDirection(Candidate);
-		// Weight = dot + 1 shifted to [0,2], clamped with a minimum so no lane has zero chance.
+		// Weight = dot + 1 shifted to [0,2], clamped with a small minimum so no lane has zero chance,
+		// but strongly favoring well-aligned (straight-ahead) lanes.
 		const float Dot = FVector::DotProduct(CurrentDir, CandDir);
-		const float W = FMath::Max(Dot + 1.0f, 0.1f);
+		const float W = FMath::Max(Dot + 1.0f, 0.01f);
 		Weights.Add(W);
 		TotalWeight += W;
 	}
@@ -947,6 +968,7 @@ void ATrafficVehicleController::FinalizeLaneChange()
 
 	// Reset distance tracking for new lane.
 	DistanceTraveledOnLane = 0.0f;
+	LastClosestIndex = 0;
 
 	// Query speed limit for the new lane.
 	if (CachedProvider)
