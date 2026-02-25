@@ -15,6 +15,7 @@ class ATrafficSignalController;
 /**
  * LOD tier for distance-based vehicle simulation detail.
  */
+UENUM(BlueprintType)
 enum class ETrafficLOD : uint8
 {
 	/** Full simulation: every-frame tick, physics input, sphere sweep. */
@@ -61,6 +62,7 @@ public:
 	ITrafficRoadProvider* GetProvider() const;
 
 	/** Returns true if a provider is currently registered. */
+	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	bool HasProvider() const;
 
 	/** Fired when a provider registers. Listeners can use this for deferred initialization. */
@@ -90,11 +92,13 @@ public:
 	void UpdateVehiclePosition(ATrafficVehicleController* Controller, const FVector& Position);
 
 	/** Get all vehicles within Radius of Position. */
+	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	TArray<ATrafficVehicleController*> GetNearbyVehicles(const FVector& Position, float Radius) const;
 
 	// --- LOD ---
 
 	/** Get the current LOD tier for a vehicle. */
+	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	ETrafficLOD GetVehicleLOD(const ATrafficVehicleController* Controller) const;
 
 	// --- Signal Controllers ---
@@ -106,6 +110,7 @@ public:
 	void UnregisterSignalController(int32 JunctionId);
 
 	/** Get the signal controller for a junction, or nullptr. */
+	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	ATrafficSignalController* GetSignalForJunction(int32 JunctionId) const;
 
 	// --- Junction Occupancy ---
@@ -119,15 +124,15 @@ public:
 	// --- Despawn configuration ---
 
 	/** Maximum distance (cm) from the nearest player before a vehicle is despawned. */
-	UPROPERTY(EditAnywhere, Category = "Traffic|Lifecycle", meta = (ClampMin = "5000"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Lifecycle", meta = (ClampMin = "5000"))
 	float DespawnDistance;
 
 	/** Seconds between lifecycle sweep passes (lower = more responsive, higher = cheaper). */
-	UPROPERTY(EditAnywhere, Category = "Traffic|Lifecycle", meta = (ClampMin = "0.1"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Lifecycle", meta = (ClampMin = "0.1"))
 	float DespawnCheckInterval;
 
 	/** If true, vehicles at a dead-end that have fully stopped will be despawned. */
-	UPROPERTY(EditAnywhere, Category = "Traffic|Lifecycle")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Lifecycle")
 	bool bDespawnDeadEndVehicles;
 
 private:

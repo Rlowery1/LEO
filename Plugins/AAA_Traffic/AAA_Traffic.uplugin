@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
-  "Version": 1,
-  "VersionName": "0.1.0",
+  "Version": 2,
+  "VersionName": "0.2.0",
   "FriendlyName": "AAA Traffic",
   "Description": "AAA_Traffic plugin.",
   "Category": "Gameplay",
@@ -35,6 +35,11 @@
       "Name": "AAA_TrafficRoadBLD",
       "Type": "Runtime",
       "LoadingPhase": "Default"
+    },
+    {
+      "Name": "AAA_TrafficEditor",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit"
     }
   ]
 }
