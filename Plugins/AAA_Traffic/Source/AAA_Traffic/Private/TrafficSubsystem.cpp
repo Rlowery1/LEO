@@ -62,6 +62,9 @@ void UTrafficSubsystem::RegisterProvider(UObject* InProvider)
 
 	ActiveProviderObject = InProvider;
 	UE_LOG(LogAAATraffic, Log, TEXT("TrafficSubsystem: Provider registered — %s"), *InProvider->GetName());
+
+	// Notify listeners (e.g. TrafficSpawner deferred retry).
+	OnProviderRegistered.Broadcast(Cast<ITrafficRoadProvider>(InProvider));
 }
 
 void UTrafficSubsystem::UnregisterProvider(UObject* InProvider)
@@ -81,6 +84,11 @@ ITrafficRoadProvider* UTrafficSubsystem::GetProvider() const
 	}
 
 	return Cast<ITrafficRoadProvider>(ActiveProviderObject);
+}
+
+bool UTrafficSubsystem::HasProvider() const
+{
+	return ActiveProviderObject != nullptr;
 }
 
 void UTrafficSubsystem::RegisterVehicle(ATrafficVehicleController* InController)

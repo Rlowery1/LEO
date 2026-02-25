@@ -1,0 +1,83 @@
+{
+  "version": "1.2.1",
+  "captured": "2026-02-24",
+  "notes": "Baseline captured from RoadBLD 1.2.1 shipped with WorldBLD. UHT generated headers in Intermediate/Build.",
+  "classes": {
+    "DynamicRoad": {
+      "path": "/Script/RoadBLDRuntime.DynamicRoad",
+      "functions": [
+        {
+          "name": "GetLength",
+          "returnType": "double",
+          "params": []
+        },
+        {
+          "name": "GetAllLanes",
+          "returnType": "TArray<UDynamicRoadLane*>",
+          "params": []
+        },
+        {
+          "name": "ConvertDistanceBetweenCurves",
+          "returnType": "double",
+          "params": [
+            { "name": "From", "type": "UCurveObject*" },
+            { "name": "To", "type": "UCurveObject*" },
+            { "name": "Distance", "type": "double" }
+          ]
+        },
+        {
+          "name": "GetWorldPositionAtDistance",
+          "returnType": "FVector2D",
+          "params": [
+            { "name": "Distance", "type": "double" }
+          ]
+        }
+      ],
+      "properties": [
+        { "name": "ReferenceLine", "type": "UReferenceLine*" }
+      ]
+    },
+    "DynamicRoadNetwork": {
+      "path": "/Script/RoadBLDRuntime.DynamicRoadNetwork",
+      "functions": [],
+      "properties": [
+        { "name": "RoadNetworkCorners", "type": "TArray<FRoadNetworkCorner>" }
+      ]
+    },
+    "DynamicRoadLane": {
+      "path": "/Script/RoadBLDRuntime.DynamicRoadLane",
+      "functions": [],
+      "properties": [
+        { "name": "LeftEdgeCurve", "type": "UEdgeCurve*" },
+        { "name": "RightEdgeCurve", "type": "UEdgeCurve*" },
+        { "name": "LaneWidth", "type": "double" }
+      ]
+    },
+    "EdgeCurve": {
+      "path": "/Script/RoadBLDRuntime.EdgeCurve",
+      "functions": [
+        {
+          "name": "Get3DPositionAtDistance",
+          "returnType": "FVector",
+          "params": [
+            { "name": "ReferenceLine", "type": "UCurveObject*" },
+            { "name": "Distance", "type": "double" }
+          ]
+        }
+      ],
+      "properties": [
+        { "name": "LeftLane", "type": "UDynamicRoadLane*" },
+        { "name": "RightLane", "type": "UDynamicRoadLane*" }
+      ]
+    }
+  },
+  "structs": {
+    "FRoadNetworkCorner": {
+      "properties": [
+        { "name": "StartEdge", "type": "UEdgeCurve*" },
+        { "name": "EndEdge", "type": "UEdgeCurve*" },
+        { "name": "bStale", "type": "bool" }
+      ]
+    }
+  }
+}
