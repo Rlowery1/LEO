@@ -4,6 +4,7 @@
 #include "TrafficSubsystem.h"
 #include "TrafficLog.h"
 #include "Engine/World.h"
+#include "DrawDebugHelpers.h"
 
 ATrafficSignalController::ATrafficSignalController()
 	: JunctionId(0)
@@ -13,6 +14,7 @@ ATrafficSignalController::ATrafficSignalController()
 	, PhaseOffset(0.0f)
 	, CurrentPhase(ETrafficSignalPhase::Red)
 	, PhaseTimer(0.0f)
+	, CurrentGroupIndex(0)
 {
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.TickInterval = 0.0f; // Every frame for responsive signal changes.
@@ -95,12 +97,36 @@ void ATrafficSignalController::Tick(float DeltaSeconds)
 	{
 		AdvancePhase();
 	}
+
+#if ENABLE_DRAW_DEBUG
+	if (bDebugDrawSignal)
+	{
+		FColor PhaseColor = FColor::Red;
+		if (CurrentPhase == ETrafficSignalPhase::Green) { PhaseColor = FColor::Green; }
+		else if (CurrentPhase == ETrafficSignalPhase::Yellow) { PhaseColor = FColor::Yellow; }
+
+		DrawDebugSphere(GetWorld(), GetActorLocation() + FVector(0, 0, 200), 80.0f, 8, PhaseColor, false, -1.0f, 0, 3.0f);
+
+		// Draw the junction ID as text above the sphere.
+		DrawDebugString(GetWorld(), GetActorLocation() + FVector(0, 0, 350),
+			FString::Printf(TEXT("J%d %s %.1fs"), JunctionId,
+				CurrentPhase == ETrafficSignalPhase::Green ? TEXT("G") :
+				CurrentPhase == ETrafficSignalPhase::Yellow ? TEXT("Y") : TEXT("R"),
+				PhaseTimer),
+			nullptr, PhaseColor, 0.0f, false);
+	}
+#endif
 }
 
 void ATrafficSignalController::AdvancePhase()
 {
 	// Additive timer: preserves negative overflow from PhaseTimer so that
 	// large DeltaSeconds values don't cause the signal to drift.
+	//
+	// Multi-phase mode: when PhaseGroups has entries, the cycle is:
+	//   Group[0] Green → Yellow → Red(gap) → Group[1] Green → Yellow → Red(gap) → ...
+	// Legacy mode (empty PhaseGroups): simple Green → Yellow → Red.
+
 	switch (CurrentPhase)
 	{
 	case ETrafficSignalPhase::Green:
@@ -114,8 +140,43 @@ void ATrafficSignalController::AdvancePhase()
 		break;
 
 	case ETrafficSignalPhase::Red:
+		// Advance to next group (wraps around).
+		if (PhaseGroups.Num() > 0)
+		{
+			CurrentGroupIndex = (CurrentGroupIndex + 1) % PhaseGroups.Num();
+		}
 		CurrentPhase = ETrafficSignalPhase::Green;
 		PhaseTimer += GreenDuration;
 		break;
 	}
+}
+
+bool ATrafficSignalController::IsLaneGreen(const FTrafficLaneHandle& Lane) const
+{
+	// Legacy mode: no phase groups configured — all lanes share the same phase.
+	if (PhaseGroups.Num() == 0)
+	{
+		return CurrentPhase == ETrafficSignalPhase::Green;
+	}
+
+	// Multi-phase: only lanes in the currently-green group get green.
+	if (CurrentPhase != ETrafficSignalPhase::Green)
+	{
+		return false;
+	}
+
+	if (!PhaseGroups.IsValidIndex(CurrentGroupIndex))
+	{
+		return false;
+	}
+
+	const FSignalPhaseGroup& ActiveGroup = PhaseGroups[CurrentGroupIndex];
+	for (const FTrafficLaneHandle& GreenLane : ActiveGroup.GreenLanes)
+	{
+		if (GreenLane == Lane)
+		{
+			return true;
+		}
+	}
+	return false;
 }

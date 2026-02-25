@@ -49,6 +49,8 @@ public:
 	virtual FTrafficLaneHandle GetAdjacentLane(const FTrafficLaneHandle& Lane, ETrafficLaneSide Side) override;
 	virtual FTrafficRoadHandle GetRoadForLane(const FTrafficLaneHandle& Lane) override;
 	virtual float GetLaneSpeedLimit(const FTrafficLaneHandle& Lane) override;
+	virtual int32 GetJunctionForLane(const FTrafficLaneHandle& Lane) override;
+	virtual bool GetJunctionPath(const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane, TArray<FVector>& OutPath) override;
 
 private:
 	// ── Data caching ────────────────────────────────────────
@@ -156,6 +158,12 @@ private:
 	/** Reverse lookup: lane handle ID → owning road handle ID. */
 	TMap<int32, int32> LaneToRoadHandleMap;
 
+	/** Lane handle ID → junction ID (non-zero if lane terminates at a junction). */
+	TMap<int32, int32> LaneToJunctionMap;
+
+	/** Junction ID → centroid world position (for junction path generation). */
+	TMap<int32, FVector> JunctionCentroids;
+
 	/** True once CacheRoadData() has successfully run. */
 	bool bCached = false;
 
@@ -193,4 +201,7 @@ private:
 
 	/** Lane class LaneWidth property. */
 	FProperty* LaneWidthProp = nullptr;
+
+	/** FRoadNetworkCorner::IntersectionPoint property. */
+	FProperty* IntersectionPointProp = nullptr;
 };

@@ -7,6 +7,7 @@
 #include "ChaosWheeledVehicleMovementComponent.h"
 #include "GameFramework/Pawn.h"
 #include "Engine/World.h"
+#include "DrawDebugHelpers.h"
 
 ATrafficVehicleController::ATrafficVehicleController()
 	: LaneWidth(0.f)
@@ -219,6 +220,39 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 	}
 
 	UpdateVehicleInput(DeltaSeconds);
+
+#if ENABLE_DRAW_DEBUG
+	if (bDebugDraw && GetPawn())
+	{
+		const UWorld* DbgWorld = GetWorld();
+		const FVector VehicleLoc = GetPawn()->GetActorLocation();
+
+		// Draw lane polyline (cyan).
+		for (int32 i = 0; i < LanePoints.Num() - 1; ++i)
+		{
+			DrawDebugLine(DbgWorld, LanePoints[i], LanePoints[i + 1], FColor::Cyan, false, -1.0f, 0, 2.0f);
+		}
+
+		// Draw look-ahead target (green sphere).
+		const int32 DbgClosest = FindClosestPointIndex(VehicleLoc);
+		const FVector LookPt = GetLookAheadPoint(VehicleLoc, DbgClosest);
+		DrawDebugSphere(DbgWorld, LookPt, 30.0f, 6, FColor::Green, false, -1.0f, 0, 2.0f);
+		DrawDebugLine(DbgWorld, VehicleLoc, LookPt, FColor::Green, false, -1.0f, 0, 1.5f);
+
+		// Draw detection range (orange line).
+		const FVector DetEnd = VehicleLoc + GetPawn()->GetActorForwardVector() * DetectionDistance;
+		DrawDebugLine(DbgWorld, VehicleLoc, DetEnd, FColor::Orange, false, -1.0f, 0, 1.0f);
+
+		// Draw lane-change target lane (magenta) if active.
+		if (LaneChangeState != ELaneChangeState::None)
+		{
+			for (int32 i = 0; i < TargetLanePoints.Num() - 1; ++i)
+			{
+				DrawDebugLine(DbgWorld, TargetLanePoints[i], TargetLanePoints[i + 1], FColor::Magenta, false, -1.0f, 0, 2.0f);
+			}
+		}
+	}
+#endif
 }
 
 void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
@@ -291,8 +325,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 					bool bSignalAllows = true;
 					if (Signal)
 					{
-						const ETrafficSignalPhase Phase = Signal->GetCurrentPhase();
-						bSignalAllows = (Phase == ETrafficSignalPhase::Green);
+						bSignalAllows = Signal->IsLaneGreen(CurrentLane);
 						}
 
 						if (bSignalAllows && TrafficSub->TryOccupyJunction(JunctionId, this))
@@ -322,7 +355,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 					ATrafficSignalController* Signal = TrafficSub->GetSignalForJunction(IntersectionJunctionId);
 					if (Signal)
 					{
-						bSignalAllows = (Signal->GetCurrentPhase() == ETrafficSignalPhase::Green);
+						bSignalAllows = Signal->IsLaneGreen(CurrentLane);
 					}
 
 					if (bSignalAllows && TrafficSub->TryOccupyJunction(IntersectionJunctionId, this))
@@ -497,7 +530,60 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 				EffectiveTargetSpeed = FMath::Min(EffectiveTargetSpeed, TargetSpeed);
 			}
 		}
-		// Reduced LOD: no leader detection — use TargetSpeed directly.
+		// Reduced LOD: analytical leader detection via spatial grid instead of
+		// a physics sweep — much cheaper for distant vehicles.
+		else if (TickLOD == ETrafficLOD::Reduced)
+		{
+			UTrafficSubsystem* SpSub = nullptr;
+			if (UWorld* SpWorld = GetWorld())
+			{
+				SpSub = SpWorld->GetSubsystem<UTrafficSubsystem>();
+			}
+			if (SpSub)
+			{
+				const FVector Loc = ControlledPawn->GetActorLocation();
+				const FVector Fwd = ControlledPawn->GetActorForwardVector();
+				TArray<ATrafficVehicleController*> Nearby = SpSub->GetNearbyVehicles(Loc, DetectionDistance);
+
+				float BestDist = MAX_FLT;
+				float BestSpeed = 0.0f;
+				for (const ATrafficVehicleController* Other : Nearby)
+				{
+					if (Other == this) { continue; }
+					const APawn* OP = Other->GetPawn();
+					if (!OP) { continue; }
+					const FVector Delta = OP->GetActorLocation() - Loc;
+					const float Dist = Delta.Size();
+					// Must be ahead of us (positive dot with forward).
+					if (Dist < KINDA_SMALL_NUMBER || FVector::DotProduct(Delta / Dist, Fwd) < 0.5f)
+					{
+						continue;
+					}
+					if (Dist < BestDist)
+					{
+						BestDist = Dist;
+						if (const UPawnMovementComponent* OtherMC = OP->GetMovementComponent())
+						{
+							BestSpeed = FVector::DotProduct(OtherMC->Velocity, Fwd);
+						}
+						else
+						{
+							BestSpeed = 0.0f;
+						}
+					}
+				}
+				if (BestDist < DetectionDistance)
+				{
+					const float GapFactor = FMath::Clamp(
+						(BestDist - FollowingDistance) / FMath::Max(FollowingDistance, 1.0f),
+						0.0f, 1.0f);
+					const float GapSpeed = TargetSpeed * GapFactor;
+					const float ClampedLeaderSpeed = FMath::Max(BestSpeed, 0.0f);
+					EffectiveTargetSpeed = FMath::Lerp(ClampedLeaderSpeed, GapSpeed, GapFactor);
+					EffectiveTargetSpeed = FMath::Min(EffectiveTargetSpeed, TargetSpeed);
+				}
+			}
+		}
 	}
 
 	// Guard against EffectiveTargetSpeed == 0 to prevent division by zero.
@@ -1078,10 +1164,10 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 		return -1.0f;
 	}
 
-	// Verify the hit actor is a traffic vehicle (controlled by ATrafficVehicleController)
-	// to avoid false positives from player characters or other non-traffic pawns.
+	// Accept any pawn as a leader — this includes player-driven vehicles so
+	// traffic reacts naturally to the player without special-casing.
 	const APawn* HitPawn = Cast<APawn>(HitResult.GetActor());
-	if (!HitPawn || !Cast<ATrafficVehicleController>(HitPawn->GetController()))
+	if (!HitPawn)
 	{
 		return -1.0f;
 	}

@@ -10,7 +10,7 @@
 /**
  * State of in-progress lane change.
  */
-UENUM()
+UENUM(BlueprintType)
 enum class ELaneChangeState : uint8
 {
 	/** Not changing lanes. */
@@ -29,7 +29,7 @@ enum class ELaneChangeState : uint8
  * lane centerline and feeds throttle / steering / brake to the vehicle
  * movement component.
  */
-UCLASS()
+UCLASS(Blueprintable)
 class AAA_TRAFFIC_API ATrafficVehicleController : public AAIController
 {
 	GENERATED_BODY()
@@ -41,27 +41,34 @@ public:
 	 * Tell this controller which lane to follow.
 	 * Fetches the lane path from the active road provider and begins driving.
 	 */
+	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	void InitializeLaneFollowing(const FTrafficLaneHandle& InLane);
 
 	/** Set the target speed for this controller (cm/s). */
+	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	void SetTargetSpeed(float InSpeed);
 
 	/** Set the random seed before possession (determines RandomStream). */
+	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	void SetRandomSeed(int32 InSeed);
 
 	/** Returns true if the vehicle has reached a dead-end with no connected lanes. */
+	UFUNCTION(BlueprintPure, Category = "Traffic")
 	bool IsAtDeadEnd() const { return bAtDeadEnd; }
 
 	/** Get the lane this vehicle is currently following. */
+	UFUNCTION(BlueprintPure, Category = "Traffic")
 	const FTrafficLaneHandle& GetCurrentLane() const { return CurrentLane; }
 
 	/**
 	 * Configure lane-change behavior from spawner aggression slider (0-1).
 	 * Maps aggression to internal thresholds and cooldown timings.
 	 */
+	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	void SetLaneChangeAggression(float Aggression);
 
 	/** Set the base (default) speed limit used when the provider has no lane speed data. */
+	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	void SetDefaultSpeedLimit(float InSpeedLimit);
 
 protected:
@@ -213,19 +220,19 @@ private:
 	// ----- Tuning -----
 
 	/** Target speed in cm/s (default ~54 km/h). */
-	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
 	float TargetSpeed;
 
 	/** Distance ahead on the lane path (cm) used as the steering target. */
-	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "100"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "100"))
 	float LookAheadDistance;
 
 	/** Minimum safe following distance behind a leader (cm). */
-	UPROPERTY(EditAnywhere, Category = "Traffic|Proximity", meta = (ClampMin = "100"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "100"))
 	float FollowingDistance;
 
 	/** Maximum forward detection range for vehicles ahead (cm). */
-	UPROPERTY(EditAnywhere, Category = "Traffic|Proximity", meta = (ClampMin = "500"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "500"))
 	float DetectionDistance;
 
 	// ── Lane Change Tuning ──────────────────────────────────
@@ -234,34 +241,40 @@ private:
 	 * Distance over which the lane-change lateral blend occurs (cm).
 	 * Shorter = snappier, longer = smoother.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Traffic|LaneChange", meta = (ClampMin = "200"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|LaneChange", meta = (ClampMin = "200"))
 	float LaneChangeDistance;
 
 	/** Minimum time between successive lane changes (seconds). */
-	UPROPERTY(EditAnywhere, Category = "Traffic|LaneChange", meta = (ClampMin = "0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|LaneChange", meta = (ClampMin = "0"))
 	float LaneChangeCooldownTime;
 
 	/**
 	 * Speed ratio threshold to trigger a lane change (0-1).
 	 * A change is considered when CurrentSpeed / TargetSpeed < this value.
 	 */
-	UPROPERTY(EditAnywhere, Category = "Traffic|LaneChange", meta = (ClampMin = "0", ClampMax = "1"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|LaneChange", meta = (ClampMin = "0", ClampMax = "1"))
 	float LaneChangeSpeedThreshold;
 
 	/** Minimum gap (cm) required on the target lane for a safe merge. */
-	UPROPERTY(EditAnywhere, Category = "Traffic|LaneChange", meta = (ClampMin = "100"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|LaneChange", meta = (ClampMin = "100"))
 	float LaneChangeGapRequired;
 
 	/** Default speed limit (cm/s) used when the provider returns no speed data. */
-	UPROPERTY(EditAnywhere, Category = "Traffic", meta = (ClampMin = "0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
 	float DefaultSpeedLimit;
 
 	/**
 	 * Seed for deterministic random decisions.
 	 * Reserved for future use (e.g. lane choice at intersections).
 	 */
-	UPROPERTY(EditAnywhere, Category = "Traffic")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	int32 RandomSeed;
+
+#if ENABLE_DRAW_DEBUG
+	/** When true, draws the lane polyline, look-ahead target, and leader detection in-game. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Debug")
+	bool bDebugDraw = false;
+#endif
 
 	/**
 	 * Deterministic random stream (seeded from RandomSeed).
