@@ -59,7 +59,7 @@ private:
 	/** Discover roads, lanes, and cache handle maps via reflection. */
 	void CacheRoadData(UWorld* World);
 
-	/** Build lane connectivity from RoadNetworkCorners + proximity detection. */
+	/** Build lane connectivity from RoadNetworkCorners (corner-based fallback; proximity is handled in BuildProximityConnections). */
 	void BuildLaneConnectivity(UWorld* World);
 
 	/** Cache start/end positions and directions for every lane. Called after CacheRoadData. */
@@ -230,6 +230,9 @@ private:
 
 	/** Proximity connections detected — used for junction grouping. */
 	TArray<FProximityConnection> ProximityConnectionList;
+
+	/** Road handle ID → total road width (sum of all lane widths on that road, in cm). */
+	TMap<int32, float> RoadTotalWidthMap;
 
 	// ── Cached reflection pointers (resolved once in CacheRoadData) ─
 

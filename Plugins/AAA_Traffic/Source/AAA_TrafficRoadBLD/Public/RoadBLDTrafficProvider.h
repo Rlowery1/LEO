@@ -173,5 +173,8 @@ private:
 
 	/** Proximity connections detected — used for junction grouping. */
 	TArray<FProximityConnection> ProximityConnectionList;
+
+	/** Road handle ID → total road width (sum of all lane widths on that road, in cm). */
+	TMap<int32, float> RoadTotalWidthMap;
 #endif // WITH_ROADBLD
 };
