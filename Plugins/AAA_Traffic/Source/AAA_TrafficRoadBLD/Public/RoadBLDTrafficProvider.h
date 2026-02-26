@@ -54,8 +54,20 @@ private:
 	/** Scan the world for RoadBLD actors and build internal handle maps. */
 	void CacheRoadData();
 
-	/** Build the lane connectivity table from RoadBLD corner data. */
+	/** Build corner-based lane connectivity from RoadBLD corner data (fallback). */
 	void BuildLaneConnectivity();
+
+	/** Cache start/end positions and directions for every lane. Called after CacheRoadData. */
+	void CacheLaneEndpoints();
+
+	/** Detect through-roads and create virtual lane segments at intersections. */
+	void DetectAndSplitThroughRoads();
+
+	/** Build proximity-based connections between lane endpoints on different roads. */
+	void BuildProximityConnections();
+
+	/** Group connected lane endpoints into junction clusters and assign junction IDs. */
+	void BuildJunctionGrouping();
 
 	/** Detect left/right neighbor lanes on the same road via shared edge curves. */
 	void BuildLaneAdjacency();
@@ -71,6 +83,35 @@ private:
 
 	/** Find the parent ADynamicRoad for a given lane. */
 	ADynamicRoad* GetRoadForLane(UDynamicRoadLane* Lane) const;
+
+	// ----- Structs -----
+
+	/** Cached lane endpoint geometry — computed once after CacheRoadData. */
+	struct FLaneEndpointCache
+	{
+		FVector StartPos = FVector::ZeroVector;
+		FVector EndPos = FVector::ZeroVector;
+		FVector StartDir = FVector::ForwardVector;
+		FVector EndDir = FVector::ForwardVector;
+		TArray<FVector> Polyline;
+		float Width = 0.0f;
+	};
+
+	/** Virtual lane segment info — for through-road splitting. */
+	struct FVirtualLaneInfo
+	{
+		int32 OriginalLaneHandle = 0;
+		int32 StartPointIndex = 0;
+		int32 EndPointIndex = 0;
+	};
+
+	/** Record of a proximity-based connection for junction grouping. */
+	struct FProximityConnection
+	{
+		int32 FromLane = 0;
+		int32 ToLane = 0;
+		FVector Midpoint = FVector::ZeroVector;
+	};
 
 	// ----- Internal state -----
 
@@ -115,5 +156,22 @@ private:
 
 	/** True once CacheRoadData() has run. */
 	bool bCached;
+
+	// ── Proximity connectivity state ────────────────────────
+
+	/** Lane handle → cached endpoint geometry. */
+	TMap<int32, FLaneEndpointCache> LaneEndpointMap;
+
+	/** Virtual lane handle → info about what portion of the original lane it represents. */
+	TMap<int32, FVirtualLaneInfo> VirtualLaneMap;
+
+	/** Original lane handle → ordered list of virtual lane handles that replace it. */
+	TMap<int32, TArray<int32>> OriginalToVirtualMap;
+
+	/** Original lane handles that have been split into virtual segments. */
+	TSet<int32> ReplacedLaneHandles;
+
+	/** Proximity connections detected — used for junction grouping. */
+	TArray<FProximityConnection> ProximityConnectionList;
 #endif // WITH_ROADBLD
 };

@@ -59,8 +59,21 @@ private:
 	/** Discover roads, lanes, and cache handle maps via reflection. */
 	void CacheRoadData(UWorld* World);
 
-	/** Build lane connectivity from RoadNetworkCorners via reflection. */
+	/** Build lane connectivity from RoadNetworkCorners + proximity detection. */
 	void BuildLaneConnectivity(UWorld* World);
+
+	/** Cache start/end positions and directions for every lane. Called after CacheRoadData. */
+	void CacheLaneEndpoints();
+
+	/** Detect through-roads (lanes that pass through an intersection without being split)
+	 *  and create virtual lane segments so vehicles can exit/enter at the intersection. */
+	void DetectAndSplitThroughRoads();
+
+	/** Build proximity-based connections between lane endpoints on different roads. */
+	void BuildProximityConnections();
+
+	/** Group connected lane endpoints into junction clusters and assign junction IDs. */
+	void BuildJunctionGrouping();
 
 	/** Detect left/right neighbor lanes on the same road via shared edge curves. */
 	void BuildLaneAdjacency();
@@ -133,6 +146,33 @@ private:
 		TWeakObjectPtr<UObject> RightEdge;
 	};
 
+	/** Cached lane endpoint geometry — computed once after CacheRoadData. */
+	struct FLaneEndpointCache
+	{
+		FVector StartPos = FVector::ZeroVector;
+		FVector EndPos = FVector::ZeroVector;
+		FVector StartDir = FVector::ForwardVector;
+		FVector EndDir = FVector::ForwardVector;
+		TArray<FVector> Polyline;
+		float Width = 0.0f;
+	};
+
+	/** Virtual lane segment info — for through-road splitting. */
+	struct FVirtualLaneInfo
+	{
+		int32 OriginalLaneHandle = 0;
+		int32 StartPointIndex = 0;
+		int32 EndPointIndex = 0;
+	};
+
+	/** Record of a proximity-based connection for junction grouping. */
+	struct FProximityConnection
+	{
+		int32 FromLane = 0;
+		int32 ToLane = 0;
+		FVector Midpoint = FVector::ZeroVector;
+	};
+
 	// ── Internal state ──────────────────────────────────────
 
 	/** Monotonically increasing handle ID — shared across roads and lanes. */
@@ -173,6 +213,23 @@ private:
 
 	/** True once CacheRoadData() has successfully run. */
 	bool bCached = false;
+
+	// ── Proximity connectivity state ────────────────────────
+
+	/** Lane handle → cached endpoint geometry. */
+	TMap<int32, FLaneEndpointCache> LaneEndpointMap;
+
+	/** Virtual lane handle → info about what portion of the original lane it represents. */
+	TMap<int32, FVirtualLaneInfo> VirtualLaneMap;
+
+	/** Original lane handle → ordered list of virtual lane handles that replace it. */
+	TMap<int32, TArray<int32>> OriginalToVirtualMap;
+
+	/** Original lane handles that have been split into virtual segments. */
+	TSet<int32> ReplacedLaneHandles;
+
+	/** Proximity connections detected — used for junction grouping. */
+	TArray<FProximityConnection> ProximityConnectionList;
 
 	// ── Cached reflection pointers (resolved once in CacheRoadData) ─
 
