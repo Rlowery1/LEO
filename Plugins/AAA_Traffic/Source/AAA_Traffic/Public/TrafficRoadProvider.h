@@ -142,6 +142,14 @@ public:
 	virtual int32 GetJunctionForLane(const FTrafficLaneHandle& Lane) { return 0; }
 
 	/**
+	 * Get the world-space centroid for a junction.
+	 * Returns true and fills OutCentroid if the provider has authoritative
+	 * centroid data for the given junction.  Returns false if not available,
+	 * in which case the caller should compute its own centroid.
+	 */
+	virtual bool GetJunctionCentroid(int32 JunctionId, FVector& OutCentroid) { return false; }
+
+	/**
 	 * Get a smooth path through a junction between two connected lanes.
 	 * Fills OutPath with a series of world-space points representing the junction trajectory.
 	 * Returns true if a path was generated, false otherwise (caller should fall back to straight-line).

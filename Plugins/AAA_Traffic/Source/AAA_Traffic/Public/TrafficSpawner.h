@@ -52,6 +52,7 @@ public:
 	ATrafficSpawner();
 
 	virtual void Tick(float DeltaSeconds) override;
+	virtual bool ShouldTickIfViewportsOnly() const override;
 
 protected:
 	virtual void BeginPlay() override;
@@ -135,6 +136,44 @@ private:
 		bool bIsReverseLane = false;
 	};
 	TArray<FDebugLaneData> DebugLanes;
+
+	// ── Intersection debug data ──
+
+	/** Cache lane endpoints, connections, and junctions from the provider. */
+	void CacheDebugIntersectionData();
+
+	/** Draw intersection visualizations (connections, endpoints, junctions). */
+	void DrawDebugIntersections() const;
+
+	/** Whether the intersection cache has been populated. */
+	bool bIntersectionCacheReady = false;
+
+	/** Whether an intersection cache attempt has been made. */
+	bool bIntersectionCacheAttempted = false;
+
+	/** Cached lane endpoint positions for sphere drawing. */
+	struct FDebugEndpointData
+	{
+		FVector StartPos = FVector::ZeroVector;
+		FVector EndPos = FVector::ZeroVector;
+	};
+	TArray<FDebugEndpointData> DebugEndpoints;
+
+	/** Cached connection between two lane endpoints. */
+	struct FDebugConnectionData
+	{
+		FVector From = FVector::ZeroVector;  // End of source lane.
+		FVector To = FVector::ZeroVector;    // Start of destination lane.
+	};
+	TArray<FDebugConnectionData> DebugConnections;
+
+	/** Cached junction centroid with ID for label drawing. */
+	struct FDebugJunctionData
+	{
+		FVector Centroid = FVector::ZeroVector;
+		int32 JunctionId = 0;
+	};
+	TArray<FDebugJunctionData> DebugJunctions;
 #endif // ENABLE_DRAW_DEBUG
 
 protected:
@@ -226,4 +265,12 @@ protected:
 	 */
 	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")
 	bool bDebugDrawLanes = false;
+
+	/**
+	 * When true (in non-Shipping builds), draws intersection debug overlays:
+	 * lane endpoint markers (blue=start, red=end), connectivity arrows (yellow),
+	 * and junction centroid spheres with ID labels (white).
+	 */
+	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")
+	bool bDebugDrawIntersections = false;
 };
