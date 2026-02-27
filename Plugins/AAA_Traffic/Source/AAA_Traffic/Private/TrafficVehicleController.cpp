@@ -147,6 +147,45 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 	Super::OnPossess(InPawn);
 	RandomStream.Initialize(RandomSeed);
 
+	// --- Diagnostic: log pawn class and movement component details ---
+	if (InPawn)
+	{
+		const FString PawnClass = InPawn->GetClass()->GetName();
+		UPawnMovementComponent* GenericMC = InPawn->GetMovementComponent();
+		const FString MCClass = GenericMC ? GenericMC->GetClass()->GetName() : TEXT("NULL");
+
+		UChaosWheeledVehicleMovementComponent* ChaosMC =
+			Cast<UChaosWheeledVehicleMovementComponent>(GenericMC);
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("VehicleController::OnPossess: Pawn='%s' Class='%s' MovementComponent='%s' ChaosWheeledCast=%s"),
+			*InPawn->GetName(), *PawnClass, *MCClass,
+			ChaosMC ? TEXT("OK") : TEXT("FAILED — vehicles will NOT move"));
+
+		if (!ChaosMC)
+		{
+			UE_LOG(LogAAATraffic, Error,
+				TEXT("VehicleController::OnPossess: CRITICAL — Pawn '%s' (class '%s') does not have a UChaosWheeledVehicleMovementComponent. "
+					 "GetMovementComponent() returned '%s'. The vehicle controller requires ChaosWheeledVehicleMovementComponent to set throttle/steering/brake. "
+					 "Ensure the vehicle Blueprint inherits from AWheeledVehiclePawn or has this component added."),
+				*InPawn->GetName(), *PawnClass, *MCClass);
+
+			// List all components on the pawn for further diagnosis.
+			TArray<UActorComponent*> AllComps;
+			InPawn->GetComponents(AllComps);
+			for (const UActorComponent* Comp : AllComps)
+			{
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("  Component: '%s' Class='%s'"),
+					*Comp->GetName(), *Comp->GetClass()->GetName());
+			}
+		}
+	}
+	else
+	{
+		UE_LOG(LogAAATraffic, Error, TEXT("VehicleController::OnPossess: InPawn is NULL."));
+	}
+
 	if (UWorld* World = GetWorld())
 	{
 		if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
@@ -180,6 +219,16 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 
 	if (!bLaneDataReady || !GetPawn())
 	{
+		// Log once per controller to help diagnose stuck vehicles.
+		if (!bDiagLoggedTickSkip)
+		{
+			bDiagLoggedTickSkip = true;
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("VehicleController::Tick: Skipping — bLaneDataReady=%s, Pawn=%s. "
+					 "Lane will not be followed until both are valid."),
+				bLaneDataReady ? TEXT("true") : TEXT("false"),
+				GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"));
+		}
 		return;
 	}
 
@@ -267,6 +316,20 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		Cast<UChaosWheeledVehicleMovementComponent>(ControlledPawn->GetMovementComponent());
 	if (!VehicleMovement)
 	{
+		// Log once per controller to avoid spam.
+		if (!bDiagLoggedNoMovement)
+		{
+			bDiagLoggedNoMovement = true;
+			UPawnMovementComponent* GenericMC = ControlledPawn->GetMovementComponent();
+			UE_LOG(LogAAATraffic, Error,
+				TEXT("VehicleController::UpdateVehicleInput: ChaosWheeledVehicleMovementComponent cast FAILED for pawn '%s' (class '%s'). "
+					 "GetMovementComponent() returned: %s (class '%s'). Vehicle will be stuck. "
+					 "This pawn must have UChaosWheeledVehicleMovementComponent (inherits AWheeledVehiclePawn)."),
+				*ControlledPawn->GetName(),
+				*ControlledPawn->GetClass()->GetName(),
+				GenericMC ? *GenericMC->GetName() : TEXT("NULL"),
+				GenericMC ? *GenericMC->GetClass()->GetName() : TEXT("N/A"));
+		}
 		return;
 	}
 

@@ -7,6 +7,7 @@
 #include "TrafficSignalController.h"
 #include "TrafficVehiclePool.h"
 #include "TrafficLog.h"
+#include "ChaosWheeledVehicleMovementComponent.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
 #include "EngineUtils.h"
@@ -756,9 +757,20 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 
 		OwnedVehicles.Add(Controller);
 
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("TrafficSpawner: Vehicle %d spawned on lane %d."),
-			VehicleIndex, Lane.HandleId);
+		// --- Spawner diagnostic: confirm possession and movement readiness ---
+		{
+			UPawnMovementComponent* MC = Vehicle->GetMovementComponent();
+			UChaosWheeledVehicleMovementComponent* ChaosMC =
+				Cast<UChaosWheeledVehicleMovementComponent>(MC);
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("TrafficSpawner: Vehicle %d spawned on lane %d. "
+					 "Class='%s' MovementComp='%s' ChaosWheeledCast=%s Possessed=%s"),
+				VehicleIndex, Lane.HandleId,
+				*Vehicle->GetClass()->GetName(),
+				MC ? *MC->GetClass()->GetName() : TEXT("NULL"),
+				ChaosMC ? TEXT("OK") : TEXT("FAILED"),
+				Controller->GetPawn() ? TEXT("Yes") : TEXT("No"));
+		}
 	}
 }
 

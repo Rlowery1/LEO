@@ -275,6 +275,10 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")
 	bool bDebugDraw = false;
 
+	// --- One-shot diagnostic flags (prevent log spam) ---
+	bool bDiagLoggedNoMovement = false;
+	bool bDiagLoggedTickSkip = false;
+
 	/**
 	 * Deterministic random stream (seeded from RandomSeed).
 	 * Reserved for future lane-choice / gap-acceptance randomization.
