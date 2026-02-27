@@ -12,6 +12,7 @@
 #include "ClothoidCurve.h"       // UCurveObject (base of UEdgeCurve, UReferenceLine)
 #include "RoadUtilityLibrary.h"
 #include "EngineUtils.h"         // TActorIterator
+#include "HAL/IConsoleManager.h" // IConsoleManager for CVar lookups
 #endif
 
 // ---------------------------------------------------------------------------
@@ -55,6 +56,14 @@ void URoadBLDTrafficProvider::Deinitialize()
 	LeftNeighborMap.Empty();
 	RightNeighborMap.Empty();
 	LaneToRoadHandleMap.Empty();
+	LaneToJunctionMap.Empty();
+	JunctionCentroids.Empty();
+	LaneEndpointMap.Empty();
+	VirtualLaneMap.Empty();
+	OriginalToVirtualMap.Empty();
+	ReplacedLaneHandles.Empty();
+	ProximityConnectionList.Empty();
+	RoadTotalWidthMap.Empty();
 	CachedRoadNetwork = nullptr;
 	bCached = false;
 #endif
@@ -136,26 +145,38 @@ void URoadBLDTrafficProvider::CacheRoadData()
 
 	bCached = true;
 
-	BuildLaneConnectivity();
-	BuildLaneAdjacency();
+	// Phase ordering: detect reversed lanes and adjacency first (uses original lanes),
+	// then cache endpoints, split through-roads, build connectivity, group junctions.
 	DetectReversedLanes();
+	BuildLaneAdjacency();
+	CacheLaneEndpoints();
+	DetectAndSplitThroughRoads();
+	BuildLaneConnectivity();
+	BuildProximityConnections();
+	BuildJunctionGrouping();
 }
 
 void URoadBLDTrafficProvider::BuildLaneConnectivity()
 {
-	LaneConnectionMap.Empty();
+	// Note: LaneConnectionMap is NOT cleared here — proximity connections
+	// may already be present. Corner-based connections are additive.
 
 	ADynamicRoadNetwork* Network = CachedRoadNetwork.Get();
 	if (!Network)
 	{
-		UE_LOG(LogAAATraffic, Warning,
-			TEXT("RoadBLDTrafficProvider: No road network found — lane connectivity unavailable."));
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDTrafficProvider: No road network found — skipping corner-based connectivity."));
 		return;
 	}
 
 	const TArray<FRoadNetworkCorner>& Corners = Network->RoadNetworkCorners;
+	if (Corners.Num() == 0)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDTrafficProvider: RoadNetworkCorners is empty — no corner-based connectivity."));
+		return;
+	}
 
-	// Helper: collect lane handles adjacent to an edge curve.
 	auto CollectLaneHandles = [this](UEdgeCurve* Edge, TArray<int32>& OutHandles)
 	{
 		if (!Edge) return;
@@ -163,12 +184,6 @@ void URoadBLDTrafficProvider::BuildLaneConnectivity()
 		{
 			if (const int32* Handle = LaneToHandleMap.Find(Left))
 			{
-				if (OutHandles.Contains(*Handle))
-				{
-					UE_LOG(LogAAATraffic, Warning,
-						TEXT("RoadBLDTrafficProvider: Lane '%s' (handle %d) appears multiple times on edge '%s'."),
-						*Left->GetName(), *Handle, *GetNameSafe(Edge));
-				}
 				OutHandles.AddUnique(*Handle);
 			}
 		}
@@ -176,56 +191,437 @@ void URoadBLDTrafficProvider::BuildLaneConnectivity()
 		{
 			if (const int32* Handle = LaneToHandleMap.Find(Right))
 			{
-				if (OutHandles.Contains(*Handle))
-				{
-					UE_LOG(LogAAATraffic, Warning,
-						TEXT("RoadBLDTrafficProvider: Lane '%s' (handle %d) appears multiple times on edge '%s'."),
-						*Right->GetName(), *Handle, *GetNameSafe(Edge));
-				}
 				OutHandles.AddUnique(*Handle);
 			}
 		}
 	};
 
-	// Junction data collection for grouping pass.
-	struct FCornerJunctionEntry
-	{
-		FVector IntersectionPoint;
-		TArray<int32> StartLaneHandles;
-	};
-	TArray<FCornerJunctionEntry> CornerJunctionData;
-
+	int32 CornerConnections = 0;
 	for (const FRoadNetworkCorner& Corner : Corners)
 	{
 		if (Corner.bStale) continue;
 		if (!Corner.StartEdge || !Corner.EndEdge) continue;
 
-		TArray<int32> StartLaneHandles;
-		TArray<int32> EndLaneHandles;
-		CollectLaneHandles(Corner.StartEdge, StartLaneHandles);
-		CollectLaneHandles(Corner.EndEdge, EndLaneHandles);
+		TArray<int32> StartHandles, EndHandles;
+		CollectLaneHandles(Corner.StartEdge, StartHandles);
+		CollectLaneHandles(Corner.EndEdge, EndHandles);
 
-		// Connect lanes on StartEdge to lanes on EndEdge (forward only).
-		// FRoadNetworkCorner is directional: StartEdge flows into EndEdge.
-		// Reverse links are intentionally omitted to prevent wrong-way traversal.
-		for (const int32 SrcHandle : StartLaneHandles)
+		for (const int32 Src : StartHandles)
 		{
-			TArray<FTrafficLaneHandle>& SrcConnections = LaneConnectionMap.FindOrAdd(SrcHandle);
-			for (const int32 DstHandle : EndLaneHandles)
+			TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(Src);
+			for (const int32 Dst : EndHandles)
 			{
-				if (SrcHandle == DstHandle) continue;
-				SrcConnections.AddUnique(FTrafficLaneHandle(DstHandle));
+				if (Src != Dst)
+				{
+					Conns.AddUnique(FTrafficLaneHandle(Dst));
+					++CornerConnections;
+				}
 			}
-		}
-
-		// Collect junction data for grouping pass.
-		if (StartLaneHandles.Num() > 0)
-		{
-			CornerJunctionData.Add({Corner.IntersectionPoint, MoveTemp(StartLaneHandles)});
 		}
 	}
 
-	// Sort each connection list by HandleId for deterministic selection (System.md §4.4).
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDTrafficProvider: Corner-based connectivity added %d links from %d corners."),
+		CornerConnections, Corners.Num());
+}
+
+// ---------------------------------------------------------------------------
+// CacheLaneEndpoints — pre-compute geometry for every lane
+// ---------------------------------------------------------------------------
+
+void URoadBLDTrafficProvider::CacheLaneEndpoints()
+{
+	LaneEndpointMap.Empty();
+
+	TArray<int32> SortedHandles;
+	LaneHandleMap.GetKeys(SortedHandles);
+	SortedHandles.Sort();
+
+	for (const int32 HandleId : SortedHandles)
+	{
+		TArray<FVector> Points;
+		float Width = 0.0f;
+
+		if (!GetLanePath(FTrafficLaneHandle(HandleId), Points, Width) || Points.Num() < 2)
+		{
+			continue;
+		}
+
+		FLaneEndpointCache Cache;
+		Cache.Polyline = Points;
+		Cache.Width = Width;
+		Cache.StartPos = Points[0];
+		Cache.EndPos = Points.Last();
+		Cache.StartDir = (Points[1] - Points[0]).GetSafeNormal();
+		Cache.EndDir = (Points.Last() - Points[Points.Num() - 2]).GetSafeNormal();
+
+		LaneEndpointMap.Add(HandleId, MoveTemp(Cache));
+	}
+
+	// Build RoadTotalWidthMap: sum of all lane widths per road.
+	RoadTotalWidthMap.Empty();
+	for (const int32 HandleId : SortedHandles)
+	{
+		const FLaneEndpointCache* EP = LaneEndpointMap.Find(HandleId);
+		if (!EP) { continue; }
+		const int32* Road = LaneToRoadHandleMap.Find(HandleId);
+		if (!Road) { continue; }
+		float& Total = RoadTotalWidthMap.FindOrAdd(*Road);
+		Total += EP->Width;
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDTrafficProvider: Cached endpoints for %d lanes, road widths for %d roads."),
+		LaneEndpointMap.Num(), RoadTotalWidthMap.Num());
+}
+
+// ---------------------------------------------------------------------------
+// DetectAndSplitThroughRoads — create virtual lane segments
+// ---------------------------------------------------------------------------
+
+void URoadBLDTrafficProvider::DetectAndSplitThroughRoads()
+{
+	VirtualLaneMap.Empty();
+	OriginalToVirtualMap.Empty();
+	ReplacedLaneHandles.Empty();
+
+	// Read CVars by name (registered in the AAA_Traffic module).
+	float SplitRadius = 500.0f;
+	if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("traffic.ThroughRoadRadius")))
+	{
+		SplitRadius = CVar->GetFloat();
+	}
+	const float SplitRadiusSq = SplitRadius * SplitRadius;
+
+	struct FEndpointInfo
+	{
+		int32 LaneHandle;
+		int32 RoadHandle;
+		FVector Position;
+	};
+	TArray<FEndpointInfo> AllEndpoints;
+
+	TArray<int32> SortedRoads;
+	RoadToLaneHandles.GetKeys(SortedRoads);
+	SortedRoads.Sort();
+
+	for (const int32 RoadId : SortedRoads)
+	{
+		const TArray<int32>& Lanes = RoadToLaneHandles[RoadId];
+		for (const int32 LaneId : Lanes)
+		{
+			const FLaneEndpointCache* EP = LaneEndpointMap.Find(LaneId);
+			if (!EP) { continue; }
+			AllEndpoints.Add({ LaneId, RoadId, EP->StartPos });
+			AllEndpoints.Add({ LaneId, RoadId, EP->EndPos });
+		}
+	}
+
+	// Pre-compute AABB per candidate lane for early rejection.
+	struct FLaneAABB
+	{
+		int32 LaneHandle;
+		int32 RoadHandle;
+		FVector Min;
+		FVector Max;
+	};
+	TArray<FLaneAABB> CandidateBoxes;
+	for (const auto& Pair : LaneEndpointMap)
+	{
+		const int32* CandRoad = LaneToRoadHandleMap.Find(Pair.Key);
+		if (!CandRoad) { continue; }
+		const TArray<FVector>& Poly = Pair.Value.Polyline;
+		if (Poly.Num() < 3) { continue; }
+
+		FVector BoxMin = Poly[0];
+		FVector BoxMax = Poly[0];
+		for (int32 p = 1; p < Poly.Num(); ++p)
+		{
+			BoxMin = BoxMin.ComponentMin(Poly[p]);
+			BoxMax = BoxMax.ComponentMax(Poly[p]);
+		}
+		BoxMin -= FVector(SplitRadius);
+		BoxMax += FVector(SplitRadius);
+		CandidateBoxes.Add({ Pair.Key, *CandRoad, BoxMin, BoxMax });
+	}
+
+	TMap<int32, TArray<float>> SplitCandidates;
+
+	for (const FEndpointInfo& EP : AllEndpoints)
+	{
+		for (const FLaneAABB& Cand : CandidateBoxes)
+		{
+			const int32 CandidateLane = Cand.LaneHandle;
+			if (Cand.RoadHandle == EP.RoadHandle) { continue; }
+
+			// AABB early rejection.
+			if (EP.Position.X < Cand.Min.X || EP.Position.X > Cand.Max.X ||
+				EP.Position.Y < Cand.Min.Y || EP.Position.Y > Cand.Max.Y ||
+				EP.Position.Z < Cand.Min.Z || EP.Position.Z > Cand.Max.Z)
+			{
+				continue;
+			}
+
+			const FLaneEndpointCache& CandCache = LaneEndpointMap[CandidateLane];
+			const TArray<FVector>& Poly = CandCache.Polyline;
+
+			float BestDistSq = SplitRadiusSq;
+			int32 BestSegIndex = -1;
+			float BestSegT = 0.0f;
+
+			for (int32 s = 0; s < Poly.Num() - 1; ++s)
+			{
+				const FVector& A = Poly[s];
+				const FVector& B = Poly[s + 1];
+				const FVector AB = B - A;
+				const float SegLenSq = AB.SizeSquared();
+				if (SegLenSq < 1.0f) { continue; }
+
+				float T = FVector::DotProduct(EP.Position - A, AB) / SegLenSq;
+				T = FMath::Clamp(T, 0.0f, 1.0f);
+				const FVector ClosestPt = A + AB * T;
+				const float DistSq = FVector::DistSquared(EP.Position, ClosestPt);
+
+				if (DistSq < BestDistSq)
+				{
+					BestDistSq = DistSq;
+					BestSegIndex = s;
+					BestSegT = T;
+				}
+			}
+
+			if (BestSegIndex < 0) { continue; }
+
+			const float ParamPos = static_cast<float>(BestSegIndex) + BestSegT;
+			const float TotalSegs = static_cast<float>(Poly.Num() - 1);
+			const float NormParam = ParamPos / TotalSegs;
+
+			if (NormParam < 0.10f || NormParam > 0.90f) { continue; }
+
+			SplitCandidates.FindOrAdd(CandidateLane).Add(NormParam);
+		}
+	}
+
+	int32 TotalVirtuals = 0;
+	TArray<int32> SortedCandidates;
+	SplitCandidates.GetKeys(SortedCandidates);
+	SortedCandidates.Sort();
+
+	for (const int32 OriginalLane : SortedCandidates)
+	{
+		TArray<float>& Params = SplitCandidates[OriginalLane];
+		Params.Sort();
+
+		TArray<float> MergedParams;
+		for (const float P : Params)
+		{
+			if (MergedParams.Num() == 0 || (P - MergedParams.Last()) > 0.05f)
+			{
+				MergedParams.Add(P);
+			}
+		}
+
+		const FLaneEndpointCache* OrigCache = LaneEndpointMap.Find(OriginalLane);
+		if (!OrigCache || OrigCache->Polyline.Num() < 3) { continue; }
+
+		const TArray<FVector>& Poly = OrigCache->Polyline;
+		const int32 TotalPoints = Poly.Num();
+
+		TArray<int32> SplitIndices;
+		for (const float NP : MergedParams)
+		{
+			int32 Idx = FMath::RoundToInt32(NP * static_cast<float>(TotalPoints - 1));
+			Idx = FMath::Clamp(Idx, 1, TotalPoints - 2);
+			if (SplitIndices.Num() == 0 || SplitIndices.Last() != Idx)
+			{
+				SplitIndices.Add(Idx);
+			}
+		}
+
+		if (SplitIndices.Num() == 0) { continue; }
+
+		TArray<int32> VirtualHandles;
+		int32 PrevStart = 0;
+
+		for (int32 s = 0; s <= SplitIndices.Num(); ++s)
+		{
+			const int32 SegEnd = (s < SplitIndices.Num()) ? SplitIndices[s] : (TotalPoints - 1);
+			if (SegEnd <= PrevStart) { continue; }
+
+			const int32 VirtualId = NextHandleId++;
+			FVirtualLaneInfo VInfo;
+			VInfo.OriginalLaneHandle = OriginalLane;
+			VInfo.StartPointIndex = PrevStart;
+			VInfo.EndPointIndex = SegEnd;
+			VirtualLaneMap.Add(VirtualId, VInfo);
+			VirtualHandles.Add(VirtualId);
+
+			FLaneEndpointCache VCache;
+			VCache.Width = OrigCache->Width;
+			for (int32 p = PrevStart; p <= SegEnd; ++p)
+			{
+				VCache.Polyline.Add(Poly[p]);
+			}
+			VCache.StartPos = VCache.Polyline[0];
+			VCache.EndPos = VCache.Polyline.Last();
+			if (VCache.Polyline.Num() >= 2)
+			{
+				VCache.StartDir = (VCache.Polyline[1] - VCache.Polyline[0]).GetSafeNormal();
+				VCache.EndDir = (VCache.Polyline.Last() - VCache.Polyline[VCache.Polyline.Num() - 2]).GetSafeNormal();
+			}
+			LaneEndpointMap.Add(VirtualId, MoveTemp(VCache));
+
+			PrevStart = SegEnd;
+		}
+
+		if (VirtualHandles.Num() > 1)
+		{
+			ReplacedLaneHandles.Add(OriginalLane);
+			OriginalToVirtualMap.Add(OriginalLane, MoveTemp(VirtualHandles));
+			TotalVirtuals += OriginalToVirtualMap[OriginalLane].Num();
+
+			const TArray<int32>& Virtuals = OriginalToVirtualMap[OriginalLane];
+			for (int32 v = 0; v < Virtuals.Num() - 1; ++v)
+			{
+				TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(Virtuals[v]);
+				Conns.AddUnique(FTrafficLaneHandle(Virtuals[v + 1]));
+			}
+		}
+		else
+		{
+			for (const int32 VH : VirtualHandles)
+			{
+				VirtualLaneMap.Remove(VH);
+				LaneEndpointMap.Remove(VH);
+			}
+		}
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDTrafficProvider: Through-road splitting created %d virtual segments from %d source lanes."),
+		TotalVirtuals, ReplacedLaneHandles.Num());
+}
+
+// ---------------------------------------------------------------------------
+// BuildProximityConnections — endpoint matching + U-turn gating
+// ---------------------------------------------------------------------------
+
+void URoadBLDTrafficProvider::BuildProximityConnections()
+{
+	ProximityConnectionList.Empty();
+
+	// Read CVars by name (registered in the AAA_Traffic module).
+	float ProxThreshold = 500.0f;
+	float DirectionDotMin = -0.5f;
+	float MinUTurnWidth = 1100.0f;
+
+	if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("traffic.ProximityThreshold")))
+	{
+		ProxThreshold = CVar->GetFloat();
+	}
+	if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("traffic.DirectionDotMin")))
+	{
+		DirectionDotMin = CVar->GetFloat();
+	}
+	if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("traffic.MinUTurnWidth")))
+	{
+		MinUTurnWidth = CVar->GetFloat();
+	}
+
+	const float ProxThresholdSq = ProxThreshold * ProxThreshold;
+
+	TArray<int32> WorkingSet;
+	for (const auto& Pair : LaneEndpointMap)
+	{
+		if (!ReplacedLaneHandles.Contains(Pair.Key))
+		{
+			WorkingSet.Add(Pair.Key);
+		}
+	}
+	WorkingSet.Sort();
+
+	// Precompute effective road handle for each lane in the working set.
+	TMap<int32, int32> EffectiveRoadMap;
+	EffectiveRoadMap.Reserve(WorkingSet.Num());
+	for (const int32 Handle : WorkingSet)
+	{
+		int32 Road = 0;
+		if (const FVirtualLaneInfo* V = VirtualLaneMap.Find(Handle))
+		{
+			const int32* R = LaneToRoadHandleMap.Find(V->OriginalLaneHandle);
+			Road = R ? *R : 0;
+		}
+		else
+		{
+			const int32* R = LaneToRoadHandleMap.Find(Handle);
+			Road = R ? *R : 0;
+		}
+		EffectiveRoadMap.Add(Handle, Road);
+	}
+
+	int32 ProximityLinks = 0;
+
+	for (int32 i = 0; i < WorkingSet.Num(); ++i)
+	{
+		const int32 HandleA = WorkingSet[i];
+		const FLaneEndpointCache* CacheA = LaneEndpointMap.Find(HandleA);
+		if (!CacheA) { continue; }
+
+		const int32 RoadA = EffectiveRoadMap[HandleA];
+
+		for (int32 j = 0; j < WorkingSet.Num(); ++j)
+		{
+			if (i == j) { continue; }
+
+			const int32 HandleB = WorkingSet[j];
+			const FLaneEndpointCache* CacheB = LaneEndpointMap.Find(HandleB);
+			if (!CacheB) { continue; }
+
+			const int32 RoadB = EffectiveRoadMap[HandleB];
+
+			if (RoadA == RoadB && RoadA != 0) { continue; }
+
+			const float DistSq = FVector::DistSquared(CacheA->EndPos, CacheB->StartPos);
+			if (DistSq > ProxThresholdSq) { continue; }
+
+			const float Dot = FVector::DotProduct(CacheA->EndDir, CacheB->StartDir);
+
+			if (Dot >= DirectionDotMin)
+			{
+				TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(HandleA);
+				Conns.AddUnique(FTrafficLaneHandle(HandleB));
+				++ProximityLinks;
+
+				FProximityConnection PC;
+				PC.FromLane = HandleA;
+				PC.ToLane = HandleB;
+				PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
+				ProximityConnectionList.Add(MoveTemp(PC));
+			}
+			else
+			{
+				// U-turn candidate — gate by total road width (not individual lane width).
+				const float* RoadWidthA = RoadTotalWidthMap.Find(RoadA);
+				const float* RoadWidthB = RoadTotalWidthMap.Find(RoadB);
+				const float WidthA = RoadWidthA ? *RoadWidthA : CacheA->Width;
+				const float WidthB = RoadWidthB ? *RoadWidthB : CacheB->Width;
+				const bool bWidthOk = (WidthA >= MinUTurnWidth) && (WidthB >= MinUTurnWidth);
+				if (bWidthOk)
+				{
+					TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(HandleA);
+					Conns.AddUnique(FTrafficLaneHandle(HandleB));
+					++ProximityLinks;
+
+					FProximityConnection PC;
+					PC.FromLane = HandleA;
+					PC.ToLane = HandleB;
+					PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
+					ProximityConnectionList.Add(MoveTemp(PC));
+				}
+			}
+		}
+	}
+
 	for (auto& Pair : LaneConnectionMap)
 	{
 		Pair.Value.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
@@ -234,103 +630,113 @@ void URoadBLDTrafficProvider::BuildLaneConnectivity()
 		});
 	}
 
-	int32 ConnectedLaneCount = 0;
-	for (const auto& Pair : LaneConnectionMap)
-	{
-		ConnectedLaneCount += Pair.Value.Num();
-	}
 	UE_LOG(LogAAATraffic, Log,
-		TEXT("RoadBLDTrafficProvider: Built lane connectivity — %d lanes with connections, %d total links."),
-		LaneConnectionMap.Num(), ConnectedLaneCount);
+		TEXT("RoadBLDTrafficProvider: Proximity connections added %d links (U-turn gating at %.0f cm)."),
+		ProximityLinks, MinUTurnWidth);
+}
 
-	// ── Junction grouping pass ───────────────────────────────────
+// ---------------------------------------------------------------------------
+// BuildJunctionGrouping — cluster proximity connections into junctions
+// ---------------------------------------------------------------------------
+
+void URoadBLDTrafficProvider::BuildJunctionGrouping()
+{
+	if (ProximityConnectionList.Num() == 0)
+	{
+		// No proximity connections — preserve any corner-based junction IDs that may
+		// already exist (from BuildLaneConnectivity). Do NOT clear LaneToJunctionMap.
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDTrafficProvider: No proximity connections — junction grouping skipped (corner IDs preserved)."));
+		return;
+	}
+
+	// Rebuild from proximity data — replaces any pre-existing corner-based IDs.
 	LaneToJunctionMap.Empty();
 	JunctionCentroids.Empty();
 
-	if (CornerJunctionData.Num() > 0)
+	constexpr float JunctionGroupThreshold = 200.0f;
+	const float ThresholdSq = JunctionGroupThreshold * JunctionGroupThreshold;
+
+	const int32 N = ProximityConnectionList.Num();
+
+	TArray<int32> Parent;
+	Parent.SetNumUninitialized(N);
+	for (int32 k = 0; k < N; ++k) { Parent[k] = k; }
+
+	TFunction<int32(int32)> Find = [&Parent, &Find](int32 X) -> int32
 	{
-		constexpr float JunctionGroupThreshold = 200.0f; // cm
-		const float ThresholdSq = JunctionGroupThreshold * JunctionGroupThreshold;
+		if (Parent[X] != X) { Parent[X] = Find(Parent[X]); }
+		return Parent[X];
+	};
 
-		// Union-find for clustering corners by proximity.
-		TArray<int32> Parent;
-		Parent.SetNumUninitialized(CornerJunctionData.Num());
-		for (int32 k = 0; k < Parent.Num(); ++k) { Parent[k] = k; }
+	auto Union = [&Parent, &Find](int32 A, int32 B)
+	{
+		int32 RA = Find(A);
+		int32 RB = Find(B);
+		if (RA != RB) { Parent[RA] = RB; }
+	};
 
-		TFunction<int32(int32)> Find = [&Parent, &Find](int32 X) -> int32
+	for (int32 a = 0; a < N; ++a)
+	{
+		for (int32 b = a + 1; b < N; ++b)
 		{
-			if (Parent[X] != X) { Parent[X] = Find(Parent[X]); }
-			return Parent[X];
-		};
-
-		auto Union = [&Parent, &Find](int32 A, int32 B)
-		{
-			int32 RA = Find(A);
-			int32 RB = Find(B);
-			if (RA != RB) { Parent[RA] = RB; }
-		};
-
-		for (int32 a = 0; a < CornerJunctionData.Num(); ++a)
-		{
-			for (int32 b = a + 1; b < CornerJunctionData.Num(); ++b)
+			if (FVector::DistSquared(ProximityConnectionList[a].Midpoint,
+				ProximityConnectionList[b].Midpoint) <= ThresholdSq)
 			{
-				if (FVector::DistSquared(CornerJunctionData[a].IntersectionPoint,
-					CornerJunctionData[b].IntersectionPoint) <= ThresholdSq)
-				{
-					Union(a, b);
-				}
+				Union(a, b);
 			}
 		}
-
-		TMap<int32, TArray<int32>> Clusters;
-		for (int32 k = 0; k < CornerJunctionData.Num(); ++k)
-		{
-			Clusters.FindOrAdd(Find(k)).Add(k);
-		}
-
-		struct FClusterEntry
-		{
-			FVector Centroid;
-			TArray<int32> CornerIndices;
-		};
-		TArray<FClusterEntry> SortedClusters;
-		for (auto& ClusterPair : Clusters)
-		{
-			FClusterEntry Entry;
-			FVector Sum = FVector::ZeroVector;
-			for (int32 Idx : ClusterPair.Value)
-			{
-				Sum += CornerJunctionData[Idx].IntersectionPoint;
-			}
-			Entry.Centroid = Sum / static_cast<float>(ClusterPair.Value.Num());
-			Entry.CornerIndices = MoveTemp(ClusterPair.Value);
-			SortedClusters.Add(MoveTemp(Entry));
-		}
-		SortedClusters.Sort([](const FClusterEntry& A, const FClusterEntry& B)
-		{
-			if (!FMath::IsNearlyEqual(A.Centroid.X, B.Centroid.X, 1.0f)) return A.Centroid.X < B.Centroid.X;
-			if (!FMath::IsNearlyEqual(A.Centroid.Y, B.Centroid.Y, 1.0f)) return A.Centroid.Y < B.Centroid.Y;
-			return A.Centroid.Z < B.Centroid.Z;
-		});
-
-		for (int32 JIdx = 0; JIdx < SortedClusters.Num(); ++JIdx)
-		{
-			const int32 JunctionId = JIdx + 1;
-			JunctionCentroids.Add(JunctionId, SortedClusters[JIdx].Centroid);
-
-			for (int32 CornerIdx : SortedClusters[JIdx].CornerIndices)
-			{
-				for (int32 LaneHandle : CornerJunctionData[CornerIdx].StartLaneHandles)
-				{
-					LaneToJunctionMap.FindOrAdd(LaneHandle) = JunctionId;
-				}
-			}
-		}
-
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("RoadBLDTrafficProvider: Grouped %d corners into %d junctions, %d lanes mapped."),
-			CornerJunctionData.Num(), SortedClusters.Num(), LaneToJunctionMap.Num());
 	}
+
+	TMap<int32, TArray<int32>> Clusters;
+	for (int32 k = 0; k < N; ++k)
+	{
+		Clusters.FindOrAdd(Find(k)).Add(k);
+	}
+
+	struct FClusterEntry
+	{
+		FVector Centroid;
+		TArray<int32> ConnIndices;
+	};
+	TArray<FClusterEntry> SortedClusters;
+
+	for (auto& ClusterPair : Clusters)
+	{
+		FClusterEntry Entry;
+		FVector Sum = FVector::ZeroVector;
+		for (int32 Idx : ClusterPair.Value)
+		{
+			Sum += ProximityConnectionList[Idx].Midpoint;
+		}
+		Entry.Centroid = Sum / static_cast<float>(ClusterPair.Value.Num());
+		Entry.ConnIndices = MoveTemp(ClusterPair.Value);
+		SortedClusters.Add(MoveTemp(Entry));
+	}
+
+	SortedClusters.Sort([](const FClusterEntry& A, const FClusterEntry& B)
+	{
+		if (!FMath::IsNearlyEqual(A.Centroid.X, B.Centroid.X, 1.0f)) return A.Centroid.X < B.Centroid.X;
+		if (!FMath::IsNearlyEqual(A.Centroid.Y, B.Centroid.Y, 1.0f)) return A.Centroid.Y < B.Centroid.Y;
+		return A.Centroid.Z < B.Centroid.Z;
+	});
+
+	for (int32 JIdx = 0; JIdx < SortedClusters.Num(); ++JIdx)
+	{
+		const int32 JunctionId = JIdx + 1;
+		JunctionCentroids.Add(JunctionId, SortedClusters[JIdx].Centroid);
+
+		for (int32 ConnIdx : SortedClusters[JIdx].ConnIndices)
+		{
+			const FProximityConnection& PC = ProximityConnectionList[ConnIdx];
+			LaneToJunctionMap.FindOrAdd(PC.FromLane) = JunctionId;
+			LaneToJunctionMap.FindOrAdd(PC.ToLane) = JunctionId;
+		}
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDTrafficProvider: Grouped %d connections into %d junctions, %d lanes mapped."),
+		N, SortedClusters.Num(), LaneToJunctionMap.Num());
 }
 
 void URoadBLDTrafficProvider::DetectReversedLanes()
@@ -388,7 +794,12 @@ void URoadBLDTrafficProvider::DetectReversedLanes()
 
 bool URoadBLDTrafficProvider::IsLaneReversed(const FTrafficLaneHandle& Lane)
 {
-	return ReversedLaneSet.Contains(Lane.HandleId);
+	int32 EffectiveId = Lane.HandleId;
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
+	{
+		EffectiveId = VInfo->OriginalLaneHandle;
+	}
+	return ReversedLaneSet.Contains(EffectiveId);
 }
 
 TArray<FTrafficRoadHandle> URoadBLDTrafficProvider::GetAllRoads()
@@ -414,20 +825,25 @@ TArray<FTrafficLaneHandle> URoadBLDTrafficProvider::GetLanesForRoad(const FTraff
 {
 	TArray<FTrafficLaneHandle> Result;
 
-	ADynamicRoad* RoadActor = ResolveRoad(Road);
-	if (!RoadActor) return Result;
+	const TArray<int32>* LaneIds = RoadToLaneHandles.Find(Road.HandleId);
+	if (!LaneIds) return Result;
 
-	TArray<UDynamicRoadLane*> Lanes = RoadActor->GetAllLanes();
-	for (UDynamicRoadLane* Lane : Lanes)
+	for (const int32 LaneId : *LaneIds)
 	{
-		if (!Lane) continue;
-		if (const int32* HandleId = LaneToHandleMap.Find(Lane))
+		// If the lane was split, expose virtual segments instead.
+		if (const TArray<int32>* Virtuals = OriginalToVirtualMap.Find(LaneId))
 		{
-			Result.Emplace(*HandleId);
+			for (const int32 VId : *Virtuals)
+			{
+				Result.Emplace(VId);
+			}
+		}
+		else
+		{
+			Result.Emplace(LaneId);
 		}
 	}
 
-	// Sort by HandleId for deterministic output order (System.md §4.4).
 	Result.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
 	{
 		return A.HandleId < B.HandleId;
@@ -440,14 +856,32 @@ bool URoadBLDTrafficProvider::GetLanePath(
 	TArray<FVector>& OutPoints,
 	float& OutWidth)
 {
+	// Virtual lane — return the cached polyline subset.
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
+	{
+		if (const FLaneEndpointCache* VCache = LaneEndpointMap.Find(Lane.HandleId))
+		{
+			OutPoints = VCache->Polyline;
+			OutWidth = VCache->Width;
+			return OutPoints.Num() >= 2;
+		}
+		return false;
+	}
+
+	// Cached endpoint data available — return it directly.
+	if (const FLaneEndpointCache* Cache = LaneEndpointMap.Find(Lane.HandleId))
+	{
+		OutPoints = Cache->Polyline;
+		OutWidth = Cache->Width;
+		return OutPoints.Num() >= 2;
+	}
+
+	// Fallback: compute from RoadBLD API (only used before CacheLaneEndpoints runs).
 	UDynamicRoadLane* RoadLane = ResolveLane(Lane);
 	if (!RoadLane) return false;
 
 	OutWidth = static_cast<float>(RoadLane->LaneWidth);
 
-	// Build centerline from the lane's own left/right edge curves.
-	// The midpoint of the two edges at each sample gives the true lane center,
-	// avoiding the P1 bug where all lanes shared the road reference line.
 	UEdgeCurve* LeftEdge = RoadLane->LeftEdgeCurve;
 	UEdgeCurve* RightEdge = RoadLane->RightEdgeCurve;
 
@@ -457,7 +891,7 @@ bool URoadBLDTrafficProvider::GetLanePath(
 	const double RoadLength = Road->GetLength();
 	if (RoadLength <= 0.0) return false;
 
-	const double SampleInterval = 100.0; // 1 m in UE units (cm)
+	const double SampleInterval = 100.0;
 	const int32 NumSamples = FMath::Max(2, FMath::CeilToInt(RoadLength / SampleInterval) + 1);
 
 	OutPoints.Reset(NumSamples);
@@ -471,13 +905,11 @@ bool URoadBLDTrafficProvider::GetLanePath(
 
 		if (LeftEdge && RightEdge && Road->ReferenceLine)
 		{
-			// Convert distance from reference-line space to each edge curve's space.
 			const double LeftDist = Road->ConvertDistanceBetweenCurves(
 				Road->ReferenceLine, LeftEdge, Distance);
 			const double RightDist = Road->ConvertDistanceBetweenCurves(
 				Road->ReferenceLine, RightEdge, Distance);
 
-			// UCurveObject::Get3DPositionAtDistance returns FVector (3D world pos).
 			const FVector LeftPos = LeftEdge->Get3DPositionAtDistance(
 				Road->ReferenceLine, LeftDist);
 			const FVector RightPos = RightEdge->Get3DPositionAtDistance(
@@ -487,13 +919,11 @@ bool URoadBLDTrafficProvider::GetLanePath(
 		}
 		else if (Road->ReferenceLine)
 		{
-			// Fallback: use road reference line if edge curves unavailable.
 			Pos = Road->ReferenceLine->Get3DPositionAtDistance(
 				Road->ReferenceLine, Distance);
 		}
 		else
 		{
-			// Last-resort fallback: 2D position from road actor.
 			const FVector2D Pos2D = Road->GetWorldPositionAtDistance(Distance);
 			Pos = FVector(Pos2D.X, Pos2D.Y, Road->GetActorLocation().Z);
 		}
@@ -501,7 +931,6 @@ bool URoadBLDTrafficProvider::GetLanePath(
 		OutPoints.Add(Pos);
 	}
 
-	// Reverse points for lanes whose travel direction opposes the reference line (C3).
 	if (ReversedLaneSet.Contains(Lane.HandleId))
 	{
 		Algo::Reverse(OutPoints);
@@ -512,6 +941,10 @@ bool URoadBLDTrafficProvider::GetLanePath(
 
 FVector URoadBLDTrafficProvider::GetLaneDirection(const FTrafficLaneHandle& Lane)
 {
+	if (const FLaneEndpointCache* Cache = LaneEndpointMap.Find(Lane.HandleId))
+	{
+		return (Cache->EndPos - Cache->StartPos).GetSafeNormal();
+	}
 	TArray<FVector> Points;
 	float Width;
 	if (GetLanePath(Lane, Points, Width) && Points.Num() >= 2)
@@ -532,27 +965,51 @@ TArray<FTrafficLaneHandle> URoadBLDTrafficProvider::GetConnectedLanes(const FTra
 
 FTrafficLaneHandle URoadBLDTrafficProvider::GetLaneAtLocation(const FVector& Location)
 {
-	// Sort road handle keys for deterministic iteration order (System.md §4.4).
-	TArray<int32> Keys;
-	RoadHandleMap.GetKeys(Keys);
-	Keys.Sort();
+	// Point-to-polyline distance for accuracy on curved/long lanes.
+	int32 BestHandle = 0;
+	float BestDistSq = TNumericLimits<float>::Max();
 
-	for (const int32 Key : Keys)
+	// Sort keys for deterministic iteration (System.md §4.4).
+	TArray<int32> EndpointKeys;
+	LaneEndpointMap.GetKeys(EndpointKeys);
+	EndpointKeys.Sort();
+
+	for (const int32 LaneId : EndpointKeys)
 	{
-		ADynamicRoad* Road = RoadHandleMap[Key].Get();
-		if (!Road) continue;
+		if (ReplacedLaneHandles.Contains(LaneId)) { continue; }
 
-		UDynamicRoadLane* Lane = URoadUtilityLibrary::GetLaneAtLocation(Road, Location);
-		if (Lane)
+		const FLaneEndpointCache& Cache = LaneEndpointMap[LaneId];
+		// Walk the cached polyline to find closest point on any segment.
+		float LaneBestDistSq = TNumericLimits<float>::Max();
+		for (int32 s = 0; s < Cache.Polyline.Num() - 1; ++s)
 		{
-			if (const int32* HandleId = LaneToHandleMap.Find(Lane))
+			const FVector& A = Cache.Polyline[s];
+			const FVector& B = Cache.Polyline[s + 1];
+			const FVector AB = B - A;
+			const float SegLenSq = AB.SizeSquared();
+
+			float DistSq;
+			if (SegLenSq <= KINDA_SMALL_NUMBER)
 			{
-				return FTrafficLaneHandle(*HandleId);
+				DistSq = FVector::DistSquared(Location, A);
 			}
+			else
+			{
+				const float T = FMath::Clamp(FVector::DotProduct(Location - A, AB) / SegLenSq, 0.0f, 1.0f);
+				DistSq = FVector::DistSquared(Location, A + AB * T);
+			}
+
+			if (DistSq < LaneBestDistSq) { LaneBestDistSq = DistSq; }
+		}
+
+		if (LaneBestDistSq < BestDistSq)
+		{
+			BestDistSq = LaneBestDistSq;
+			BestHandle = LaneId;
 		}
 	}
 
-	return FTrafficLaneHandle();
+	return FTrafficLaneHandle(BestHandle);
 }
 
 ADynamicRoad* URoadBLDTrafficProvider::ResolveRoad(const FTrafficRoadHandle& Handle) const
@@ -633,9 +1090,33 @@ void URoadBLDTrafficProvider::BuildLaneAdjacency()
 FTrafficLaneHandle URoadBLDTrafficProvider::GetAdjacentLane(
 	const FTrafficLaneHandle& Lane, ETrafficLaneSide Side)
 {
-	const TMap<int32, int32>& Map = (Side == ETrafficLaneSide::Left) ? LeftNeighborMap : RightNeighborMap;
-	if (const int32* NeighborId = Map.Find(Lane.HandleId))
+	int32 EffectiveId = Lane.HandleId;
+	int32 SegmentIndex = -1;
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
 	{
+		EffectiveId = VInfo->OriginalLaneHandle;
+		if (const TArray<int32>* Virtuals = OriginalToVirtualMap.Find(EffectiveId))
+		{
+			for (int32 i = 0; i < Virtuals->Num(); ++i)
+			{
+				if ((*Virtuals)[i] == Lane.HandleId) { SegmentIndex = i; break; }
+			}
+		}
+	}
+
+	const TMap<int32, int32>& Map = (Side == ETrafficLaneSide::Left) ? LeftNeighborMap : RightNeighborMap;
+	if (const int32* NeighborId = Map.Find(EffectiveId))
+	{
+		if (SegmentIndex >= 0)
+		{
+			if (const TArray<int32>* NVirtuals = OriginalToVirtualMap.Find(*NeighborId))
+			{
+				if (SegmentIndex < NVirtuals->Num())
+				{
+					return FTrafficLaneHandle((*NVirtuals)[SegmentIndex]);
+				}
+			}
+		}
 		return FTrafficLaneHandle(*NeighborId);
 	}
 	return FTrafficLaneHandle();
@@ -643,7 +1124,12 @@ FTrafficLaneHandle URoadBLDTrafficProvider::GetAdjacentLane(
 
 FTrafficRoadHandle URoadBLDTrafficProvider::GetRoadForLane(const FTrafficLaneHandle& Lane)
 {
-	if (const int32* RoadId = LaneToRoadHandleMap.Find(Lane.HandleId))
+	int32 EffectiveId = Lane.HandleId;
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
+	{
+		EffectiveId = VInfo->OriginalLaneHandle;
+	}
+	if (const int32* RoadId = LaneToRoadHandleMap.Find(EffectiveId))
 	{
 		return FTrafficRoadHandle(*RoadId);
 	}
@@ -662,6 +1148,13 @@ int32 URoadBLDTrafficProvider::GetJunctionForLane(const FTrafficLaneHandle& Lane
 	{
 		return *JId;
 	}
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
+	{
+		if (const int32* JId = LaneToJunctionMap.Find(VInfo->OriginalLaneHandle))
+		{
+			return *JId;
+		}
+	}
 	return 0;
 }
 
@@ -670,14 +1163,13 @@ bool URoadBLDTrafficProvider::GetJunctionPath(
 	const FTrafficLaneHandle& ToLane,
 	TArray<FVector>& OutPath)
 {
-	const int32* FromJunction = LaneToJunctionMap.Find(FromLane.HandleId);
-	if (!FromJunction || *FromJunction == 0) { return false; }
+	const int32 FromJunctionId = GetJunctionForLane(FromLane);
+	if (FromJunctionId == 0) { return false; }
 
-	// Validate that ToLane maps to the same junction (guards against mismatched lane pairs).
-	const int32* ToJunction = LaneToJunctionMap.Find(ToLane.HandleId);
-	if (!ToJunction || *ToJunction != *FromJunction) { return false; }
+	const int32 ToJunctionId = GetJunctionForLane(ToLane);
+	if (ToJunctionId != FromJunctionId) { return false; }
 
-	const FVector* Centroid = JunctionCentroids.Find(*FromJunction);
+	const FVector* Centroid = JunctionCentroids.Find(FromJunctionId);
 	if (!Centroid) { return false; }
 
 	TArray<FVector> FromPoints;

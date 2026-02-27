@@ -50,6 +50,7 @@ public:
 	virtual FTrafficRoadHandle GetRoadForLane(const FTrafficLaneHandle& Lane) override;
 	virtual float GetLaneSpeedLimit(const FTrafficLaneHandle& Lane) override;
 	virtual int32 GetJunctionForLane(const FTrafficLaneHandle& Lane) override;
+	virtual bool GetJunctionCentroid(int32 JunctionId, FVector& OutCentroid) override;
 	virtual bool GetJunctionPath(const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane, TArray<FVector>& OutPath) override;
 	virtual bool IsLaneReversed(const FTrafficLaneHandle& Lane) override;
 
@@ -59,14 +60,38 @@ private:
 	/** Discover roads, lanes, and cache handle maps via reflection. */
 	void CacheRoadData(UWorld* World);
 
-	/** Build lane connectivity from RoadNetworkCorners via reflection. */
+	/** Build lane connectivity from RoadNetworkCorners (corner-based fallback; proximity is handled in BuildProximityConnections). */
 	void BuildLaneConnectivity(UWorld* World);
+
+	/** Cache start/end positions and directions for every lane. Called after CacheRoadData. */
+	void CacheLaneEndpoints();
+
+	/** Detect through-roads (lanes that pass through an intersection without being split)
+	 *  and create virtual lane segments so vehicles can exit/enter at the intersection. */
+	void DetectAndSplitThroughRoads();
+
+	/** Build proximity-based connections between lane endpoints on different roads. */
+	void BuildProximityConnections();
+
+	/** Group connected lane endpoints into junction clusters and assign junction IDs. */
+	void BuildJunctionGrouping();
+
+	/** Read IntersectionMasks from RoadBLD, group them into physical intersections,
+	 *  and store results so BuildJunctionGrouping can assign correct junction IDs. */
+	void BuildMaskBasedIntersections(UWorld* World);
 
 	/** Detect left/right neighbor lanes on the same road via shared edge curves. */
 	void BuildLaneAdjacency();
 
 	/** Detect lanes whose travel direction is reversed (left-of-center on 2-way roads). */
 	void DetectReversedLanes();
+
+	/** Diagnostic: dump all RoadNetworkCorner data to the log so we can see what RoadBLD actually provides. */
+	void DumpCornerDiagnostics(UWorld* World);
+
+	/** Trigger RoadBLD incremental rebuild and dump diagnostic arrays (pre/post).
+	 *  Separated from BuildLaneConnectivity to keep connectivity logic focused. */
+	void TriggerRoadBLDRebuildAndDiagnostics(UWorld* World, AActor* NetworkActor);
 
 	// ── Reflection helpers ──────────────────────────────────
 
@@ -133,6 +158,45 @@ private:
 		TWeakObjectPtr<UObject> RightEdge;
 	};
 
+	/** Cached lane endpoint geometry — computed once after CacheRoadData. */
+	struct FLaneEndpointCache
+	{
+		FVector StartPos = FVector::ZeroVector;
+		FVector EndPos = FVector::ZeroVector;
+		FVector StartDir = FVector::ForwardVector;
+		FVector EndDir = FVector::ForwardVector;
+		TArray<FVector> Polyline;
+		float Width = 0.0f;
+	};
+
+	/** Virtual lane segment info — for through-road splitting. */
+	struct FVirtualLaneInfo
+	{
+		int32 OriginalLaneHandle = 0;
+		int32 StartPointIndex = 0;
+		int32 EndPointIndex = 0;
+	};
+
+	/** Record of a proximity-based connection for junction grouping. */
+	struct FProximityConnection
+	{
+		int32 FromLane = 0;
+		int32 ToLane = 0;
+		FVector Midpoint = FVector::ZeroVector;
+	};
+
+	/** Cached intersection mask data read from RoadBLD's DynamicRoadNetwork. */
+	struct FIntersectionMaskInfo
+	{
+		TWeakObjectPtr<UObject> ParentRoad;
+		double StartDistance = 0.0;
+		double EndDistance = 0.0;
+		int32 StartCutIndex = -1;
+		int32 EndCutIndex = -1;
+		TArray<int32> CornerIndices; // Collected from PerimeterCuts in [StartCutIndex, EndCutIndex]
+		int32 GroupId = 0; // 1-based intersection group ID
+	};
+
 	// ── Internal state ──────────────────────────────────────
 
 	/** Monotonically increasing handle ID — shared across roads and lanes. */
@@ -173,6 +237,35 @@ private:
 
 	/** True once CacheRoadData() has successfully run. */
 	bool bCached = false;
+
+	// ── Proximity connectivity state ────────────────────────
+
+	/** Lane handle → cached endpoint geometry. */
+	TMap<int32, FLaneEndpointCache> LaneEndpointMap;
+
+	/** Virtual lane handle → info about what portion of the original lane it represents. */
+	TMap<int32, FVirtualLaneInfo> VirtualLaneMap;
+
+	/** Original lane handle → ordered list of virtual lane handles that replace it. */
+	TMap<int32, TArray<int32>> OriginalToVirtualMap;
+
+	/** Original lane handles that have been split into virtual segments. */
+	TSet<int32> ReplacedLaneHandles;
+
+	/** Virtual lane handle → intersection group ID (0 = free-flow, >0 = intersection segment). */
+	TMap<int32, int32> VirtualLaneToGroupId;
+
+	/** Proximity connections detected — used for junction grouping. */
+	TArray<FProximityConnection> ProximityConnectionList;
+
+	/** Cached intersection masks read from RoadBLD — used for mask-based junction grouping. */
+	TArray<FIntersectionMaskInfo> CachedIntersectionMasks;
+
+	/** Intersection group ID (1-based) → world-space centroid (XY from mask centers). */
+	TMap<int32, FVector> IntersectionGroupCentroids;
+
+	/** Road handle ID → total road width (sum of all lane widths on that road, in cm). */
+	TMap<int32, float> RoadTotalWidthMap;
 
 	// ── Cached reflection pointers (resolved once in CacheRoadData) ─
 

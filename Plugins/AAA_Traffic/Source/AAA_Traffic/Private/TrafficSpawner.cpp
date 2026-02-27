@@ -28,7 +28,7 @@ ATrafficSpawner::ATrafficSpawner()
 {
 #if ENABLE_DRAW_DEBUG
 	PrimaryActorTick.bCanEverTick = true;
-	PrimaryActorTick.bStartWithTickEnabled = false;
+	PrimaryActorTick.bStartWithTickEnabled = true; // Tick in editor for debug lane draw
 #else
 	PrimaryActorTick.bCanEverTick = false;
 #endif
@@ -42,10 +42,19 @@ void ATrafficSpawner::BeginPlay()
 	GetWorldTimerManager().SetTimerForNextTick(this, &ATrafficSpawner::SpawnVehicles);
 
 #if ENABLE_DRAW_DEBUG
-	if (bDebugDrawLanes && GetWorld() && GetWorld()->WorldType == EWorldType::PIE)
+	if (bDebugDrawLanes || bDebugDrawIntersections)
 	{
 		SetActorTickEnabled(true);
 	}
+#endif
+}
+
+bool ATrafficSpawner::ShouldTickIfViewportsOnly() const
+{
+#if ENABLE_DRAW_DEBUG
+	return bDebugDrawLanes || bDebugDrawIntersections;
+#else
+	return false;
 #endif
 }
 
@@ -54,19 +63,29 @@ void ATrafficSpawner::Tick(float DeltaSeconds)
 	Super::Tick(DeltaSeconds);
 
 #if ENABLE_DRAW_DEBUG
-	if (!bDebugDrawLanes)
+	if (!bDebugDrawLanes && !bDebugDrawIntersections)
 	{
 		return;
 	}
 
-	if (!bDebugCacheReady && !bDebugCacheAttempted)
+	if (bDebugDrawLanes && !bDebugCacheReady && !bDebugCacheAttempted)
 	{
 		CacheDebugLaneData();
 	}
 
-	if (bDebugCacheReady)
+	if (bDebugDrawIntersections && !bIntersectionCacheReady && !bIntersectionCacheAttempted)
+	{
+		CacheDebugIntersectionData();
+	}
+
+	if (bDebugDrawLanes && bDebugCacheReady)
 	{
 		DrawDebugLanes();
+	}
+
+	if (bDebugDrawIntersections && bIntersectionCacheReady)
+	{
+		DrawDebugIntersections();
 	}
 #endif
 }
@@ -113,9 +132,7 @@ void ATrafficSpawner::CacheDebugLaneData()
 					continue;
 				}
 
-				const FVector Dir = Provider->GetLaneDirection(Lane);
-				const FVector PolyDir = (Points.Last() - Points[0]).GetSafeNormal();
-				const bool bReverse = FVector::DotProduct(Dir, PolyDir) < 0.0f;
+				const bool bReverse = Provider->IsLaneReversed(Lane);
 
 				FDebugLaneData& Entry = DebugLanes.AddDefaulted_GetRef();
 				Entry.Points = MoveTemp(Points);
@@ -437,15 +454,15 @@ void ATrafficSpawner::DrawDebugLanes() const
 	UWorld* World = GetWorld();
 	if (!World) { return; }
 
-	// Cyan = forward lanes, Orange = reverse lanes.  Slight Z lift to avoid
-	// z-fighting with road surface.
-	static constexpr float ZLift = 5.0f;
+	// Green = forward lanes, Magenta = reverse lanes.
+	// Raised above road so lines are clearly visible and not lost in the mesh.
+	static constexpr float ZLift = 50.0f; // cm above road surface
 
 	for (const FDebugLaneData& Lane : DebugLanes)
 	{
 		const FColor Color = Lane.bIsReverseLane
-			? FColor(255, 140, 0)   // Orange
-			: FColor(0, 255, 255);  // Cyan
+			? FColor(255, 0, 255)   // Magenta — reverse lane
+			: FColor(0, 255, 0);    // Green   — forward lane
 
 		for (int32 i = 0; i < Lane.Points.Num() - 1; ++i)
 		{
@@ -454,9 +471,185 @@ void ATrafficSpawner::DrawDebugLanes() const
 			DrawDebugLine(World, A, B, Color,
 				/*bPersistentLines=*/ false,
 				/*LifeTime=*/ -1.0f,
-				/*DepthPriority=*/ 0,
-				/*Thickness=*/ 3.0f);
+				/*DepthPriority=*/ SDPG_Foreground,
+				/*Thickness=*/ 6.0f);
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Intersection debug — cache endpoints, connectivity graph, junction centroids
+// ---------------------------------------------------------------------------
+
+void ATrafficSpawner::CacheDebugIntersectionData()
+{
+	UWorld* World = GetWorld();
+	if (!World) { return; }
+
+	UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>();
+	ITrafficRoadProvider* Provider = TrafficSub ? TrafficSub->GetProvider() : nullptr;
+
+	if (!Provider)
+	{
+		bIntersectionCacheAttempted = true;
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("TrafficSpawner: Intersection debug enabled but no provider available."));
+		return;
+	}
+
+	// Collect all lanes across all roads.
+	TArray<FTrafficLaneHandle> AllLanes;
+	TArray<FTrafficRoadHandle> Roads = Provider->GetAllRoads();
+	for (const FTrafficRoadHandle& Road : Roads)
+	{
+		AllLanes.Append(Provider->GetLanesForRoad(Road));
+	}
+
+	// Build a map from lane handle → (start, end) positions for quick lookup.
+	TMap<int32, FDebugEndpointData> EndpointLookup;
+
+	for (const FTrafficLaneHandle& Lane : AllLanes)
+	{
+		TArray<FVector> Points;
+		float Width;
+		if (!Provider->GetLanePath(Lane, Points, Width) || Points.Num() < 2) { continue; }
+
+		FDebugEndpointData EP;
+		EP.StartPos = Points[0];
+		EP.EndPos = Points.Last();
+		EndpointLookup.Add(Lane.HandleId, EP);
+		DebugEndpoints.Add(EP);
+	}
+
+	// Build connectivity graph: for each lane, draw arrows to connected lanes.
+	// Simultaneously collect junction assignments.
+	TMap<int32, TArray<FVector>> JunctionLaneEndpoints; // JunctionId → participating lane endpoints.
+
+	for (const FTrafficLaneHandle& Lane : AllLanes)
+	{
+		const FDebugEndpointData* SrcEP = EndpointLookup.Find(Lane.HandleId);
+		if (!SrcEP) { continue; }
+
+		// Connections.
+		TArray<FTrafficLaneHandle> Connected = Provider->GetConnectedLanes(Lane);
+		for (const FTrafficLaneHandle& Dst : Connected)
+		{
+			const FDebugEndpointData* DstEP = EndpointLookup.Find(Dst.HandleId);
+			if (!DstEP) { continue; }
+
+			FDebugConnectionData Conn;
+			Conn.From = SrcEP->EndPos;
+			Conn.To = DstEP->StartPos;
+			DebugConnections.Add(Conn);
+		}
+
+		// Junction grouping.
+		const int32 JId = Provider->GetJunctionForLane(Lane);
+		if (JId != 0)
+		{
+			TArray<FVector>& JEPs = JunctionLaneEndpoints.FindOrAdd(JId);
+			JEPs.Add(SrcEP->StartPos);
+			JEPs.Add(SrcEP->EndPos);
+		}
+	}
+
+	// Compute junction centroids.
+	// Prefer provider-supplied centroids (derived from mask data at actual
+	// intersection positions) over lane-endpoint averages (which can be
+	// far from the intersection for through-lanes spanning long roads).
+	for (const auto& Pair : JunctionLaneEndpoints)
+	{
+		FDebugJunctionData JD;
+		JD.JunctionId = Pair.Key;
+
+		FVector ProviderCentroid;
+		if (Provider->GetJunctionCentroid(Pair.Key, ProviderCentroid))
+		{
+			JD.Centroid = ProviderCentroid;
+		}
+		else
+		{
+			// Fallback: average of participating lane endpoints.
+			const int32 NumEndpoints = Pair.Value.Num();
+			if (NumEndpoints > 0)
+			{
+				FVector Sum = FVector::ZeroVector;
+				for (const FVector& P : Pair.Value) { Sum += P; }
+				JD.Centroid = Sum / static_cast<float>(NumEndpoints);
+			}
+			else
+			{
+				// No valid endpoints for this junction; skip to avoid division by zero.
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("TrafficSpawner: Junction %d has no valid lane endpoints; skipping debug centroid."),
+					JD.JunctionId);
+				continue;
+			}
+		}
+
+		DebugJunctions.Add(JD);
+	}
+
+	bIntersectionCacheAttempted = true;
+	bIntersectionCacheReady = (DebugEndpoints.Num() > 0);
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("TrafficSpawner: Intersection debug cached %d endpoints, %d connections, %d junctions."),
+		DebugEndpoints.Num(), DebugConnections.Num(), DebugJunctions.Num());
+}
+
+void ATrafficSpawner::DrawDebugIntersections() const
+{
+	UWorld* World = GetWorld();
+	if (!World) { return; }
+
+	static constexpr float ZLift = 55.0f; // cm above road surface (5cm above lane debug lines to prevent z-fighting)
+
+	// ── Lane endpoint markers: blue=start, red=end ──
+	for (const FDebugEndpointData& EP : DebugEndpoints)
+	{
+		DrawDebugSphere(World,
+			EP.StartPos + FVector(0, 0, ZLift),
+			25.0f, 6, FColor::Blue,
+			/*bPersistentLines=*/ false, /*LifeTime=*/ -1.0f,
+			/*DepthPriority=*/ SDPG_Foreground);
+
+		DrawDebugSphere(World,
+			EP.EndPos + FVector(0, 0, ZLift),
+			25.0f, 6, FColor::Red,
+			/*bPersistentLines=*/ false, /*LifeTime=*/ -1.0f,
+			/*DepthPriority=*/ SDPG_Foreground);
+	}
+
+	// ── Connectivity arrows: yellow lines from lane end → connected lane start ──
+	for (const FDebugConnectionData& Conn : DebugConnections)
+	{
+		const FVector A = Conn.From + FVector(0, 0, ZLift);
+		const FVector B = Conn.To + FVector(0, 0, ZLift);
+
+		DrawDebugLine(World, A, B, FColor::Yellow,
+			/*bPersistentLines=*/ false, /*LifeTime=*/ -1.0f,
+			/*DepthPriority=*/ SDPG_Foreground, /*Thickness=*/ 3.0f);
+
+		// Arrowhead: small sphere at the destination end.
+		DrawDebugSphere(World, B, 15.0f, 4, FColor::Yellow,
+			/*bPersistentLines=*/ false, /*LifeTime=*/ -1.0f,
+			/*DepthPriority=*/ SDPG_Foreground);
+	}
+
+	// ── Junction centroids: white spheres with ID labels ──
+	for (const FDebugJunctionData& JD : DebugJunctions)
+	{
+		const FVector Pos = JD.Centroid + FVector(0, 0, ZLift + 50.0f);
+
+		DrawDebugSphere(World, Pos, 60.0f, 8, FColor::White,
+			/*bPersistentLines=*/ false, /*LifeTime=*/ -1.0f,
+			/*DepthPriority=*/ SDPG_Foreground);
+
+		DrawDebugString(World, Pos + FVector(0, 0, 70.0f),
+			FString::Printf(TEXT("J%d"), JD.JunctionId),
+			nullptr, FColor::White, /*Duration=*/ 0.0f,
+			/*bDrawShadow=*/ true);
 	}
 }
 #endif // ENABLE_DRAW_DEBUG
