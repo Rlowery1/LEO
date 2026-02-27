@@ -432,6 +432,12 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		return;
 	}
 
+	// --- Override Blueprint handbrake every tick ---
+	// Marketplace Blueprints (e.g. DD_Vehicles_Advanced) often re-assert the
+	// handbrake in their own Tick/EventGraph. A single SetHandbrakeInput(false)
+	// in OnPossess is not enough — we must clear it every frame.
+	VehicleMovement->SetHandbrakeInput(false);
+
 	const FVector VehicleLocation = ControlledPawn->GetActorLocation();
 	const FVector VehicleForward = ControlledPawn->GetActorForwardVector();
 	const float CurrentSpeed = VehicleMovement->GetForwardSpeed();
