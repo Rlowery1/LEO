@@ -8,6 +8,7 @@
 #include "GameFramework/Pawn.h"
 #include "Engine/World.h"
 #include "DrawDebugHelpers.h"
+#include "PhysicsEngine/BodyInstance.h"
 
 ATrafficVehicleController::ATrafficVehicleController()
 	: LaneWidth(0.f)
@@ -249,11 +250,55 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 			UChaosWheeledVehicleMovementComponent* DiagMC =
 				Cast<UChaosWheeledVehicleMovementComponent>(GetPawn()->GetMovementComponent());
 			const float FwdSpeed = DiagMC ? DiagMC->GetForwardSpeed() : 0.0f;
-			UE_LOG(LogAAATraffic, Log,
-				TEXT("VehicleController::Tick MOVEMENT CHECK (2s): Pawn='%s' "
-					 "DistFromSpawn=%.1f cm ForwardSpeed=%.1f cm/s %s"),
-				*GetPawn()->GetName(), DistMoved, FwdSpeed,
-				DistMoved > 10.0f ? TEXT("MOVING") : TEXT("STUCK — vehicle has not moved from spawn"));
+
+			// Deep physics state diagnostic.
+			if (DiagMC)
+			{
+				const float EngineRPM = DiagMC->GetEngineRotationSpeed();
+				const int32 CurGear = DiagMC->GetCurrentGear();
+				const int32 TgtGear = DiagMC->GetTargetGear();
+				const bool bMechSim = DiagMC->bMechanicalSimEnabled;
+				const int32 NumWheels = DiagMC->WheelSetups.Num();
+				const int32 NumWheelInstances = DiagMC->Wheels.Num();
+				const bool bHasOutput = (DiagMC->PhysicsVehicleOutput().Get() != nullptr);
+				const bool bCompActive = DiagMC->IsActive();
+				const bool bCompRegistered = DiagMC->IsRegistered();
+
+				// Check physics body simulation state.
+				UPrimitiveComponent* UpdatedPrim = DiagMC->UpdatedPrimitive;
+				bool bSimulatingPhysics = false;
+				bool bBodyAwake = false;
+				if (UpdatedPrim)
+				{
+					bSimulatingPhysics = UpdatedPrim->IsSimulatingPhysics();
+					FBodyInstance* BI = UpdatedPrim->GetBodyInstance();
+					bBodyAwake = BI ? BI->IsInstanceAwake() : false;
+				}
+
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("DEEP DIAG (2s): Pawn='%s' DistFromSpawn=%.1f FwdSpeed=%.1f "
+						 "EngineRPM=%.0f Gear=%d/%d bMechSimEnabled=%s "
+						 "WheelSetups=%d WheelInstances=%d bHasPhysOutput=%s "
+						 "CompActive=%s CompRegistered=%s "
+						 "SimulatingPhysics=%s BodyAwake=%s %s"),
+					*GetPawn()->GetName(), DistMoved, FwdSpeed,
+					EngineRPM, CurGear, TgtGear,
+					bMechSim ? TEXT("true") : TEXT("FALSE"),
+					NumWheels, NumWheelInstances,
+					bHasOutput ? TEXT("true") : TEXT("FALSE"),
+					bCompActive ? TEXT("true") : TEXT("FALSE"),
+					bCompRegistered ? TEXT("true") : TEXT("FALSE"),
+					bSimulatingPhysics ? TEXT("true") : TEXT("FALSE"),
+					bBodyAwake ? TEXT("true") : TEXT("FALSE"),
+					(DistMoved > 100.0f) ? TEXT("DRIVING OK") : TEXT("NOT DRIVING"));
+			}
+			else
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("DEEP DIAG (2s): Pawn='%s' DistFromSpawn=%.1f — "
+						 "No ChaosWheeledVehicleMovementComponent"),
+					*GetPawn()->GetName(), DistMoved);
+			}
 		}
 	}
 
