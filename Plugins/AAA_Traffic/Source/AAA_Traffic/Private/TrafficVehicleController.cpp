@@ -291,6 +291,20 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 					bSimulatingPhysics ? TEXT("true") : TEXT("FALSE"),
 					bBodyAwake ? TEXT("true") : TEXT("FALSE"),
 					(DistMoved > 100.0f) ? TEXT("DRIVING OK") : TEXT("NOT DRIVING"));
+
+				// Per-wheel diagnostics — are wheels touching the ground?
+				for (int32 WIdx = 0; WIdx < NumWheelInstances; ++WIdx)
+				{
+					const FWheelStatus& WS = DiagMC->GetWheelState(WIdx);
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("  WHEEL %d: InContact=%s DriveTorque=%.1f BrakeTorque=%.1f "
+							 "SlipAngle=%.2f NormSuspLen=%.2f SpringForce=%.1f"),
+						WIdx,
+						WS.bInContact ? TEXT("YES") : TEXT("NO"),
+						WS.DriveTorque, WS.BrakeTorque,
+						WS.SlipAngle,
+						WS.NormalizedSuspensionLength, WS.SpringForce);
+				}
 			}
 			else
 			{
