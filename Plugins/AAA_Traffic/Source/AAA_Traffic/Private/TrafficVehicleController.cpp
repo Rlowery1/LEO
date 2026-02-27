@@ -192,10 +192,28 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 			ChaosMC->SetTargetGear(1, /*bImmediate=*/ true);
 			ChaosMC->SetUseAutomaticGears(true);
 
+			// --- Neutralize the handbrake/parking brake torque per wheel ---
+			// The Chaos physics sim applies HandbrakeTorque on any rear wheel
+			// with HandbrakeEnabled whenever EITHER the handbrake input is
+			// nonzero OR ParkingEnabled is true (SetParked). Marketplace
+			// Blueprints can re-assert parking/handbrake state via their own
+			// Tick or EventGraph, overriding our SetParked(false) call above.
+			//
+			// Rather than fighting per-frame to clear that state, we zero out
+			// the HandbrakeTorque magnitude on every wheel. This is a one-time
+			// config change: 0 torque * any input = 0 force. Our AI never
+			// uses the handbrake; we use SetBrakeInput() for all deceleration.
+			const int32 NumWheels = ChaosMC->WheelSetups.Num();
+			for (int32 WIdx = 0; WIdx < NumWheels; ++WIdx)
+			{
+				ChaosMC->SetWheelHandbrakeTorque(WIdx, 0.0f);
+			}
+
 			UE_LOG(LogAAATraffic, Log,
 				TEXT("VehicleController::OnPossess: Vehicle '%s' initialized — "
-					 "Parked=false, Sleeping=false, Handbrake=false, Gear=1, AutoGears=true"),
-				*InPawn->GetName());
+					 "Parked=false, Sleeping=false, Handbrake=false, Gear=1, AutoGears=true, "
+					 "HandbrakeTorque zeroed on %d wheels"),
+				*InPawn->GetName(), NumWheels);
 		}
 	}
 	else
@@ -275,12 +293,21 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 					bBodyAwake = BI ? BI->IsInstanceAwake() : false;
 				}
 
+				// Query internal Chaos vehicle input state (what physics sim actually sees)
+				const bool bIsParked = DiagMC->IsParked();
+				const bool bRawHandbrake = DiagMC->GetHandbrakeInput();
+				// Get the interpolated handbrake value that feeds physics
+				// HandbrakeInput is a protected float member, but GetHandbrakeInput()
+				// returns the raw bool. We can't read the interpolated value directly,
+				// so we check GetParkedState and the raw bool.
+
 				UE_LOG(LogAAATraffic, Warning,
 					TEXT("DEEP DIAG (2s): Pawn='%s' DistFromSpawn=%.1f FwdSpeed=%.1f "
 						 "EngineRPM=%.0f Gear=%d/%d bMechSimEnabled=%s "
 						 "WheelSetups=%d WheelInstances=%d bHasPhysOutput=%s "
 						 "CompActive=%s CompRegistered=%s "
-						 "SimulatingPhysics=%s BodyAwake=%s %s"),
+						 "SimulatingPhysics=%s BodyAwake=%s "
+						 "bParked=%s bRawHandbrake=%s %s"),
 					*GetPawn()->GetName(), DistMoved, FwdSpeed,
 					EngineRPM, CurGear, TgtGear,
 					bMechSim ? TEXT("true") : TEXT("FALSE"),
@@ -290,6 +317,8 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 					bCompRegistered ? TEXT("true") : TEXT("FALSE"),
 					bSimulatingPhysics ? TEXT("true") : TEXT("FALSE"),
 					bBodyAwake ? TEXT("true") : TEXT("FALSE"),
+					bIsParked ? TEXT("PARKED") : TEXT("unparked"),
+					bRawHandbrake ? TEXT("HANDBRAKE-ON") : TEXT("handbrake-off"),
 					(DistMoved > 100.0f) ? TEXT("DRIVING OK") : TEXT("NOT DRIVING"));
 
 				// Per-wheel diagnostics — are wheels touching the ground?
@@ -432,10 +461,10 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		return;
 	}
 
-	// --- Override Blueprint handbrake every tick ---
-	// Marketplace Blueprints (e.g. DD_Vehicles_Advanced) often re-assert the
-	// handbrake in their own Tick/EventGraph. A single SetHandbrakeInput(false)
-	// in OnPossess is not enough — we must clear it every frame.
+	// --- Clear handbrake raw input every tick (belt-and-suspenders) ---
+	// The primary fix is zeroing HandbrakeTorque per wheel in OnPossess,
+	// but we still clear the raw bool so the engine's interpolated
+	// HandbrakeInput doesn't feed nonzero values into other systems.
 	VehicleMovement->SetHandbrakeInput(false);
 
 	const FVector VehicleLocation = ControlledPawn->GetActorLocation();
