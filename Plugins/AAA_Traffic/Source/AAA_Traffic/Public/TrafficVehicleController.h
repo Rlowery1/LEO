@@ -279,6 +279,9 @@ protected:
 	bool bDiagLoggedNoMovement = false;
 	bool bDiagLoggedTickSkip = false;
 	bool bDiagLoggedFirstInput = false;
+	bool bDiagLoggedMovementCheck = false;
+	float DiagElapsedTime = 0.0f;
+	FVector DiagSpawnLocation = FVector::ZeroVector;
 
 	/**
 	 * Deterministic random stream (seeded from RandomSeed).

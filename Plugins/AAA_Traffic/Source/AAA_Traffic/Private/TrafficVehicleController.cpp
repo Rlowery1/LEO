@@ -180,6 +180,22 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 					*Comp->GetName(), *Comp->GetClass()->GetName());
 			}
 		}
+		else
+		{
+			// --- Ensure Chaos vehicle is in a drivable state ---
+			// Marketplace Blueprints often default to parked/sleeping/handbrake-on.
+			// Explicitly wake and unpark the vehicle so throttle input takes effect.
+			ChaosMC->SetParked(false);
+			ChaosMC->SetSleeping(false);
+			ChaosMC->SetHandbrakeInput(false);
+			ChaosMC->SetTargetGear(1, /*bImmediate=*/ true);
+			ChaosMC->SetUseAutomaticGears(true);
+
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("VehicleController::OnPossess: Vehicle '%s' initialized — "
+					 "Parked=false, Sleeping=false, Handbrake=false, Gear=1, AutoGears=true"),
+				*InPawn->GetName());
+		}
 	}
 	else
 	{
@@ -216,6 +232,30 @@ void ATrafficVehicleController::OnUnPossess()
 void ATrafficVehicleController::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+
+	// --- Delayed movement diagnostic: after 2 seconds, check if vehicle moved ---
+	if (!bDiagLoggedMovementCheck && GetPawn())
+	{
+		if (DiagSpawnLocation.IsZero())
+		{
+			DiagSpawnLocation = GetPawn()->GetActorLocation();
+		}
+		DiagElapsedTime += DeltaSeconds;
+		if (DiagElapsedTime >= 2.0f)
+		{
+			bDiagLoggedMovementCheck = true;
+			const FVector CurrentLoc = GetPawn()->GetActorLocation();
+			const float DistMoved = FVector::Dist(DiagSpawnLocation, CurrentLoc);
+			UChaosWheeledVehicleMovementComponent* DiagMC =
+				Cast<UChaosWheeledVehicleMovementComponent>(GetPawn()->GetMovementComponent());
+			const float FwdSpeed = DiagMC ? DiagMC->GetForwardSpeed() : 0.0f;
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("VehicleController::Tick MOVEMENT CHECK (2s): Pawn='%s' "
+					 "DistFromSpawn=%.1f cm ForwardSpeed=%.1f cm/s %s"),
+				*GetPawn()->GetName(), DistMoved, FwdSpeed,
+				DistMoved > 10.0f ? TEXT("MOVING") : TEXT("STUCK — vehicle has not moved from spawn"));
+		}
+	}
 
 	if (!bLaneDataReady || !GetPawn())
 	{
