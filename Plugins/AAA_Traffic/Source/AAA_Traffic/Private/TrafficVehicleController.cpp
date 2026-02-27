@@ -678,6 +678,23 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	VehicleMovement->SetThrottleInput(ThrottleInput);
 	VehicleMovement->SetSteeringInput(SteeringInput);
 	VehicleMovement->SetBrakeInput(BrakeInput);
+
+	// --- Diagnostic: log first tick's driving values per vehicle ---
+	if (!bDiagLoggedFirstInput)
+	{
+		bDiagLoggedFirstInput = true;
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("VehicleController::UpdateVehicleInput FIRST TICK: Pawn='%s' "
+				 "TargetSpeed=%.1f EffectiveTarget=%.1f CurrentSpeed=%.1f "
+				 "Throttle=%.3f Steering=%.3f Brake=%.3f "
+				 "bAtDeadEnd=%s bWaitingAtIntersection=%s LanePoints=%d ClosestIdx=%d"),
+			*ControlledPawn->GetName(),
+			TargetSpeed, EffectiveTargetSpeed, CurrentSpeed,
+			ThrottleInput, SteeringInput, BrakeInput,
+			bAtDeadEnd ? TEXT("true") : TEXT("false"),
+			bWaitingAtIntersection ? TEXT("true") : TEXT("false"),
+			LanePoints.Num(), ClosestIndex);
+	}
 }
 
 int32 ATrafficVehicleController::FindClosestPointIndex(const FVector& VehicleLocation)

@@ -278,6 +278,7 @@ protected:
 	// --- One-shot diagnostic flags (prevent log spam) ---
 	bool bDiagLoggedNoMovement = false;
 	bool bDiagLoggedTickSkip = false;
+	bool bDiagLoggedFirstInput = false;
 
 	/**
 	 * Deterministic random stream (seeded from RandomSeed).
