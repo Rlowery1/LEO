@@ -80,6 +80,8 @@ void URoadBLDReflectionProvider::Deinitialize()
 	OriginalToVirtualMap.Empty();
 	ReplacedLaneHandles.Empty();
 	ProximityConnectionList.Empty();
+	CachedIntersectionMasks.Empty();
+	IntersectionGroupCentroids.Empty();
 	RoadTotalWidthMap.Empty();
 	bCached = false;
 
@@ -147,11 +149,19 @@ void URoadBLDReflectionProvider::OnWorldBeginPlay(UWorld& InWorld)
 	// ── Cache lane endpoint geometry ────────────────────────────
 	CacheLaneEndpoints();
 
-	// ── Detect through-roads and create virtual lane splits ──────
-	DetectAndSplitThroughRoads();
-
 	// ── Corner-based connectivity (RoadNetworkCorners fallback) ──
 	BuildLaneConnectivity(&InWorld);
+
+	// ── Diagnostic: dump all corner data so we can see what RoadBLD provides ──
+	DumpCornerDiagnostics(&InWorld);
+
+	// ── Read IntersectionMasks and group into physical intersections ─
+	// (Must run BEFORE through-road splitting so mask data is available.)
+	BuildMaskBasedIntersections(&InWorld);
+
+	// ── Detect through-roads and create virtual lane splits ──────
+	// Roads with 2+ masks are through-roads; split lanes at mask boundaries.
+	DetectAndSplitThroughRoads();
 
 	// ── Proximity-based connectivity ────────────────────────────
 	BuildProximityConnections();
@@ -662,6 +672,232 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 		return;
 	}
 
+	// ── Dump all RoadBLD intersection arrays BEFORE rebuild ─────
+	// This tells us what data RoadBLD persists from the editor save.
+	{
+		UE_LOG(LogAAATraffic, Log, TEXT("===== PRE-REBUILD ROADBLD INTERSECTION DATA DUMP ====="));
+
+		// 1) RoadNetworkCorners on the network actor
+		{
+			FArrayProperty* CornersArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkCorners")));
+			int32 N = 0;
+			if (CornersArr) { FScriptArrayHelper H(CornersArr, CornersArr->ContainerPtrToValuePtr<void>(NetworkActor)); N = H.Num(); }
+			UE_LOG(LogAAATraffic, Log, TEXT("  RoadNetworkCorners: %d entries"), N);
+		}
+
+		// 2) CornerEditData on the network actor
+		{
+			FArrayProperty* EditArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("CornerEditData")));
+			int32 N = 0;
+			if (EditArr)
+			{
+				FScriptArrayHelper H(EditArr, EditArr->ContainerPtrToValuePtr<void>(NetworkActor));
+				N = H.Num();
+				FStructProperty* SP = CastField<FStructProperty>(EditArr->Inner);
+				if (SP && N > 0)
+				{
+					UScriptStruct* S = SP->Struct;
+					FProperty* SDProp = S->FindPropertyByName(TEXT("StartDistance"));
+					FProperty* EDProp = S->FindPropertyByName(TEXT("EndDistance"));
+					FProperty* SEProp = S->FindPropertyByName(TEXT("StartEdge"));
+					FProperty* EEProp = S->FindPropertyByName(TEXT("EndEdge"));
+					for (int32 i = 0; i < N; ++i)
+					{
+						const uint8* Ptr = H.GetRawPtr(i);
+						double SD = 0, ED = 0;
+						if (FDoubleProperty* DP = CastField<FDoubleProperty>(SDProp)) { SD = DP->GetPropertyValue_InContainer(Ptr); }
+						if (FDoubleProperty* DP = CastField<FDoubleProperty>(EDProp)) { ED = DP->GetPropertyValue_InContainer(Ptr); }
+						FString SE = TEXT("?"), EE = TEXT("?");
+						if (SEProp) { SEProp->ExportTextItem_Direct(SE, Ptr, nullptr, nullptr, PPF_None); }
+						if (EEProp) { EEProp->ExportTextItem_Direct(EE, Ptr, nullptr, nullptr, PPF_None); }
+						UE_LOG(LogAAATraffic, Log, TEXT("    CornerEditData[%d]: StartDist=%.1f EndDist=%.1f StartEdge=%s EndEdge=%s"), i, SD, ED, *SE, *EE);
+					}
+				}
+			}
+			UE_LOG(LogAAATraffic, Log, TEXT("  CornerEditData: %d entries"), N);
+		}
+
+		// 3) IntersectionMasks on the network actor
+		{
+			FArrayProperty* MasksArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("IntersectionMasks")));
+			int32 N = 0;
+			if (MasksArr)
+			{
+				FScriptArrayHelper H(MasksArr, MasksArr->ContainerPtrToValuePtr<void>(NetworkActor));
+				N = H.Num();
+				FStructProperty* SP = CastField<FStructProperty>(MasksArr->Inner);
+				if (SP && N > 0)
+				{
+					UScriptStruct* S = SP->Struct;
+					FProperty* SDProp = S->FindPropertyByName(TEXT("StartDistance"));
+					FProperty* EDProp = S->FindPropertyByName(TEXT("EndDistance"));
+					FProperty* PRProp = S->FindPropertyByName(TEXT("ParentRoad"));
+					FObjectPropertyBase* PRObj = CastField<FObjectPropertyBase>(PRProp);
+					FProperty* SCIProp = S->FindPropertyByName(TEXT("StartCutIndex"));
+					FProperty* ECIProp = S->FindPropertyByName(TEXT("EndCutIndex"));
+					for (int32 i = 0; i < N; ++i)
+					{
+						const uint8* Ptr = H.GetRawPtr(i);
+						double SD = 0, ED = 0;
+						if (FDoubleProperty* DP = CastField<FDoubleProperty>(SDProp)) { SD = DP->GetPropertyValue_InContainer(Ptr); }
+						if (FDoubleProperty* DP = CastField<FDoubleProperty>(EDProp)) { ED = DP->GetPropertyValue_InContainer(Ptr); }
+						UObject* PR = PRObj ? PRObj->GetObjectPropertyValue_InContainer(Ptr) : nullptr;
+						int32 SCI = -1, ECI = -1;
+						if (FIntProperty* IP = CastField<FIntProperty>(SCIProp)) { SCI = IP->GetPropertyValue_InContainer(Ptr); }
+						if (FIntProperty* IP = CastField<FIntProperty>(ECIProp)) { ECI = IP->GetPropertyValue_InContainer(Ptr); }
+						UE_LOG(LogAAATraffic, Log, TEXT("    IntersectionMask[%d]: StartDist=%.1f EndDist=%.1f ParentRoad=%s StartCutIdx=%d EndCutIdx=%d"), i, SD, ED, PR ? *PR->GetName() : TEXT("NULL"), SCI, ECI);
+					}
+				}
+			}
+			UE_LOG(LogAAATraffic, Log, TEXT("  IntersectionMasks: %d entries"), N);
+		}
+
+		// 4) RoadNetworkPerimeterCuts on the network actor — full field dump
+		{
+			FArrayProperty* CutsArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkPerimeterCuts")));
+			int32 N = 0;
+			if (CutsArr)
+			{
+				FScriptArrayHelper H(CutsArr, CutsArr->ContainerPtrToValuePtr<void>(NetworkActor));
+				N = H.Num();
+				FStructProperty* SP2 = CastField<FStructProperty>(CutsArr->Inner);
+				if (SP2 && N > 0)
+				{
+					UScriptStruct* CS = SP2->Struct;
+					FProperty* DistProp  = CS->FindPropertyByName(TEXT("Distance"));
+					FProperty* LCIProp   = CS->FindPropertyByName(TEXT("LeftCornerIndex"));
+					FProperty* RCIProp   = CS->FindPropertyByName(TEXT("RightCornerIndex"));
+					FProperty* DirProp   = CS->FindPropertyByName(TEXT("Direction"));
+					FProperty* PRoadProp = CS->FindPropertyByName(TEXT("ParentRoad"));
+					FObjectPropertyBase* PRoadObj = CastField<FObjectPropertyBase>(PRoadProp);
+					for (int32 i = 0; i < N; ++i)
+					{
+						const uint8* Ptr = H.GetRawPtr(i);
+						double Dist = 0;
+						if (FDoubleProperty* DP = CastField<FDoubleProperty>(DistProp)) { Dist = DP->GetPropertyValue_InContainer(Ptr); }
+						int32 LCI = -1, RCI = -1, Dir = 0;
+						if (FIntProperty* IP = CastField<FIntProperty>(LCIProp)) { LCI = IP->GetPropertyValue_InContainer(Ptr); }
+						if (FIntProperty* IP = CastField<FIntProperty>(RCIProp)) { RCI = IP->GetPropertyValue_InContainer(Ptr); }
+						if (FIntProperty* IP = CastField<FIntProperty>(DirProp)) { Dir = IP->GetPropertyValue_InContainer(Ptr); }
+						UObject* PR = PRoadObj ? PRoadObj->GetObjectPropertyValue_InContainer(Ptr) : nullptr;
+						UE_LOG(LogAAATraffic, Log, TEXT("    PerimeterCut[%d]: Dist=%.1f LeftCorner=%d RightCorner=%d Dir=%d Road=%s"),
+							i, Dist, LCI, RCI, Dir, PR ? *PR->GetName() : TEXT("NULL"));
+					}
+				}
+			}
+			UE_LOG(LogAAATraffic, Log, TEXT("  RoadNetworkPerimeterCuts: %d entries"), N);
+		}
+
+		// 5) IntersectionCutDistances on each DynamicRoad actor
+		if (DynRoadClass)
+		{
+			FProperty* ICDProp = DynRoadClass->FindPropertyByName(TEXT("IntersectionCutDistances"));
+			FArrayProperty* ICDArr = CastField<FArrayProperty>(ICDProp);
+			for (auto& Pair : RoadHandleMap)
+			{
+				UObject* RoadObj = Pair.Value.Get();
+				if (!RoadObj || !ICDArr) { continue; }
+				FScriptArrayHelper H(ICDArr, ICDArr->ContainerPtrToValuePtr<void>(RoadObj));
+				const int32 RN = H.Num();
+				UE_LOG(LogAAATraffic, Log, TEXT("  Road '%s' IntersectionCutDistances: %d entries"), *RoadObj->GetName(), RN);
+				FStructProperty* V2SP = CastField<FStructProperty>(ICDArr->Inner);
+				if (V2SP && RN > 0)
+				{
+					for (int32 i = 0; i < RN; ++i)
+					{
+						const uint8* Ptr = H.GetRawPtr(i);
+						const FVector2D* V = reinterpret_cast<const FVector2D*>(Ptr);
+						UE_LOG(LogAAATraffic, Log, TEXT("    [%d]: X=%.1f Y=%.1f"), i, V->X, V->Y);
+					}
+				}
+			}
+		}
+
+		UE_LOG(LogAAATraffic, Log, TEXT("===== END PRE-REBUILD DUMP ====="));
+	}
+
+	// ── Trigger RoadBLD incremental rebuild with FastPreview ────
+	// Uses bFastPreview=true which "skips expensive RoadGeo operations
+	// and only detects intersections for real-time preview."
+	// This should populate corners WITHOUT regenerating road meshes.
+	{
+		UFunction* RebuildFunc = NetworkActor->FindFunction(TEXT("RebuildRoadNetworkIncremental"));
+		if (RebuildFunc)
+		{
+			// Build the ModifiedRoads array from our cached road actors.
+			TArray<UObject*> AllRoads;
+			for (auto& Pair : RoadHandleMap)
+			{
+				if (UObject* R = Pair.Value.Get()) { AllRoads.Add(R); }
+			}
+
+			// Params layout must match:
+			// TArray<ADynamicRoad*> ModifiedRoads, TArray<ADynamicRoad*> RoadsToIgnore, bool bFastPreview
+			struct
+			{
+				TArray<UObject*> ModifiedRoads;
+				TArray<UObject*> RoadsToIgnore;
+				bool bFastPreview;
+			} Parms;
+			Parms.ModifiedRoads = AllRoads;
+			Parms.RoadsToIgnore = TArray<UObject*>();
+			Parms.bFastPreview  = true;
+
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("RoadBLDReflectionProvider: Calling RebuildRoadNetworkIncremental(bFastPreview=true) with %d roads..."),
+				AllRoads.Num());
+
+			NetworkActor->ProcessEvent(RebuildFunc, &Parms);
+
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("RoadBLDReflectionProvider: RebuildRoadNetworkIncremental completed."));
+		}
+		else
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("RoadBLDReflectionProvider: RebuildRoadNetworkIncremental function not found."));
+		}
+	}
+
+	// ── Post-rebuild dump: check all arrays again ───────────────
+	{
+		UE_LOG(LogAAATraffic, Log, TEXT("===== POST-REBUILD ROADBLD INTERSECTION DATA DUMP ====="));
+
+		FArrayProperty* CornersArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkCorners")));
+		int32 NC = 0;
+		if (CornersArr) { FScriptArrayHelper H(CornersArr, CornersArr->ContainerPtrToValuePtr<void>(NetworkActor)); NC = H.Num(); }
+		UE_LOG(LogAAATraffic, Log, TEXT("  RoadNetworkCorners: %d entries"), NC);
+
+		FArrayProperty* EditArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("CornerEditData")));
+		int32 NE = 0;
+		if (EditArr) { FScriptArrayHelper H(EditArr, EditArr->ContainerPtrToValuePtr<void>(NetworkActor)); NE = H.Num(); }
+		UE_LOG(LogAAATraffic, Log, TEXT("  CornerEditData: %d entries"), NE);
+
+		FArrayProperty* MasksArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("IntersectionMasks")));
+		int32 NM = 0;
+		if (MasksArr) { FScriptArrayHelper H(MasksArr, MasksArr->ContainerPtrToValuePtr<void>(NetworkActor)); NM = H.Num(); }
+		UE_LOG(LogAAATraffic, Log, TEXT("  IntersectionMasks: %d entries"), NM);
+
+		FArrayProperty* CutsArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkPerimeterCuts")));
+		int32 NP = 0;
+		if (CutsArr) { FScriptArrayHelper H(CutsArr, CutsArr->ContainerPtrToValuePtr<void>(NetworkActor)); NP = H.Num(); }
+		UE_LOG(LogAAATraffic, Log, TEXT("  RoadNetworkPerimeterCuts: %d entries"), NP);
+
+		if (DynRoadClass)
+		{
+			FArrayProperty* ICDArr = CastField<FArrayProperty>(DynRoadClass->FindPropertyByName(TEXT("IntersectionCutDistances")));
+			for (auto& Pair : RoadHandleMap)
+			{
+				UObject* RoadObj = Pair.Value.Get();
+				if (!RoadObj || !ICDArr) { continue; }
+				FScriptArrayHelper H(ICDArr, ICDArr->ContainerPtrToValuePtr<void>(RoadObj));
+				UE_LOG(LogAAATraffic, Log, TEXT("  Road '%s' IntersectionCutDistances: %d entries"), *RoadObj->GetName(), H.Num());
+			}
+		}
+
+		UE_LOG(LogAAATraffic, Log, TEXT("===== END POST-REBUILD DUMP ====="));
+	}
+
 	// Access RoadNetworkCorners TArray via reflection.
 	FProperty* CornersProp = DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkCorners"));
 	FArrayProperty* CornerArrayProp = CornersProp ? CastField<FArrayProperty>(CornersProp) : nullptr;
@@ -761,6 +997,189 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 }
 
 // ---------------------------------------------------------------------------
+// DumpCornerDiagnostics — print all RoadNetworkCorner data to the log
+// ---------------------------------------------------------------------------
+
+void URoadBLDReflectionProvider::DumpCornerDiagnostics(UWorld* World)
+{
+	if (!World || !DynNetworkClass)
+	{
+		UE_LOG(LogAAATraffic, Log, TEXT("CornerDump: No world or network class — skipping."));
+		return;
+	}
+
+	// Find the DynamicRoadNetwork actor.
+	AActor* NetworkActor = nullptr;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (It->GetClass()->IsChildOf(DynNetworkClass))
+		{
+			NetworkActor = *It;
+			break;
+		}
+	}
+	if (!NetworkActor)
+	{
+		UE_LOG(LogAAATraffic, Log, TEXT("CornerDump: No DynamicRoadNetwork actor found."));
+		return;
+	}
+
+	// Access RoadNetworkCorners array.
+	FProperty* CornersProp = DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkCorners"));
+	FArrayProperty* CornerArrayProp = CornersProp ? CastField<FArrayProperty>(CornersProp) : nullptr;
+	if (!CornerArrayProp)
+	{
+		UE_LOG(LogAAATraffic, Log, TEXT("CornerDump: RoadNetworkCorners property not found."));
+		return;
+	}
+
+	FScriptArrayHelper ArrayHelper(CornerArrayProp, CornerArrayProp->ContainerPtrToValuePtr<void>(NetworkActor));
+	const int32 NumCorners = ArrayHelper.Num();
+
+	UE_LOG(LogAAATraffic, Log, TEXT("===== CORNER DIAGNOSTIC DUMP: %d corners total ====="), NumCorners);
+
+	if (NumCorners == 0) { return; }
+
+	// Resolve struct.
+	FStructProperty* StructProp = CastField<FStructProperty>(CornerArrayProp->Inner);
+	if (!StructProp) { return; }
+	UScriptStruct* CS = StructProp->Struct;
+
+	// Resolve all corner properties.
+	FProperty* StartEdgeProp    = CS->FindPropertyByName(TEXT("StartEdge"));
+	FProperty* EndEdgeProp      = CS->FindPropertyByName(TEXT("EndEdge"));
+	FProperty* bStaleProp       = CS->FindPropertyByName(TEXT("bStale"));
+	FProperty* IntPointProp     = CS->FindPropertyByName(TEXT("IntersectionPoint"));
+	FProperty* StartDistProp    = CS->FindPropertyByName(TEXT("StartDistance"));
+	FProperty* EndDistProp      = CS->FindPropertyByName(TEXT("EndDistance"));
+	FProperty* StartOffsetProp  = CS->FindPropertyByName(TEXT("StartOffset"));
+	FProperty* EndOffsetProp    = CS->FindPropertyByName(TEXT("EndOffset"));
+	FProperty* DirAProp         = CS->FindPropertyByName(TEXT("DirectionA"));
+	FProperty* DirBProp         = CS->FindPropertyByName(TEXT("DirectionB"));
+	FProperty* RadiusProp       = CS->FindPropertyByName(TEXT("CornerRadius"));
+	FProperty* CornerIDProp     = CS->FindPropertyByName(TEXT("CornerID"));
+
+	FObjectPropertyBase* StartEdgeObj = CastField<FObjectPropertyBase>(StartEdgeProp);
+	FObjectPropertyBase* EndEdgeObj   = CastField<FObjectPropertyBase>(EndEdgeProp);
+	FBoolProperty*       bStaleNat    = CastField<FBoolProperty>(bStaleProp);
+
+	// Resolve edge→lane properties from first valid edge.
+	FObjectPropertyBase* EdgeLeftLaneObj  = nullptr;
+	FObjectPropertyBase* EdgeRightLaneObj = nullptr;
+	for (int32 i = 0; i < NumCorners && !EdgeLeftLaneObj; ++i)
+	{
+		const uint8* Ptr = ArrayHelper.GetRawPtr(i);
+		UObject* Edge = StartEdgeObj ? StartEdgeObj->GetObjectPropertyValue_InContainer(Ptr) : nullptr;
+		if (Edge)
+		{
+			EdgeLeftLaneObj  = CastField<FObjectPropertyBase>(Edge->GetClass()->FindPropertyByName(TEXT("LeftLane")));
+			EdgeRightLaneObj = CastField<FObjectPropertyBase>(Edge->GetClass()->FindPropertyByName(TEXT("RightLane")));
+		}
+	}
+
+	// Helper: read double/float property value.
+	auto ReadNum = [](FProperty* Prop, const void* Container) -> double
+	{
+		if (!Prop) { return 0.0; }
+		if (FDoubleProperty* D = CastField<FDoubleProperty>(Prop)) { return D->GetPropertyValue_InContainer(Container); }
+		if (FFloatProperty* F = CastField<FFloatProperty>(Prop)) { return static_cast<double>(F->GetPropertyValue_InContainer(Container)); }
+		return 0.0;
+	};
+
+	// Helper: read int32 property value.
+	auto ReadInt = [](FProperty* Prop, const void* Container) -> int32
+	{
+		if (!Prop) { return 0; }
+		if (FIntProperty* I = CastField<FIntProperty>(Prop)) { return I->GetPropertyValue_InContainer(Container); }
+		return 0;
+	};
+
+	// Helper: describe an edge and its lanes.
+	auto DescribeEdge = [&](UObject* Edge, const TCHAR* Label) -> FString
+	{
+		if (!Edge) { return FString::Printf(TEXT("%s=NULL"), Label); }
+
+		FString Result = FString::Printf(TEXT("%s=%s"), Label, *Edge->GetName());
+
+		// Resolve lanes on this edge.
+		UObject* LeftLane  = EdgeLeftLaneObj  ? EdgeLeftLaneObj->GetObjectPropertyValue_InContainer(Edge)  : nullptr;
+		UObject* RightLane = EdgeRightLaneObj ? EdgeRightLaneObj->GetObjectPropertyValue_InContainer(Edge) : nullptr;
+
+		auto DescribeLane = [&](UObject* LaneObj, const TCHAR* Side) -> FString
+		{
+			if (!LaneObj) { return FString::Printf(TEXT("%s=NULL"), Side); }
+			const int32* HandlePtr = LaneToHandleMap.Find(LaneObj);
+			const int32 Handle = HandlePtr ? *HandlePtr : -1;
+			// Find owning road.
+			FString RoadName = TEXT("?");
+			if (Handle >= 0)
+			{
+				if (const int32* RoadH = LaneToRoadHandleMap.Find(Handle))
+				{
+					if (const TWeakObjectPtr<UObject>* RoadPtr = RoadHandleMap.Find(*RoadH))
+					{
+						if (UObject* RoadObj = RoadPtr->Get()) { RoadName = RoadObj->GetName(); }
+					}
+				}
+			}
+			return FString::Printf(TEXT("%s=%s H#%d Road=%s"), Side, *LaneObj->GetName(), Handle, *RoadName);
+		};
+
+		Result += TEXT(" [") + DescribeLane(LeftLane, TEXT("L")) + TEXT(", ") + DescribeLane(RightLane, TEXT("R")) + TEXT("]");
+		return Result;
+	};
+
+	// Dump each corner.
+	for (int32 i = 0; i < NumCorners; ++i)
+	{
+		const uint8* Ptr = ArrayHelper.GetRawPtr(i);
+
+		const bool bStale = bStaleNat ? bStaleNat->GetPropertyValue_InContainer(Ptr) : false;
+
+		// IntersectionPoint
+		FVector IntPt = FVector::ZeroVector;
+		if (IntPointProp)
+		{
+			const FVector* ValPtr = IntPointProp->ContainerPtrToValuePtr<FVector>(Ptr);
+			if (ValPtr) { IntPt = *ValPtr; }
+		}
+
+		const double StartDist   = ReadNum(StartDistProp, Ptr);
+		const double EndDist     = ReadNum(EndDistProp, Ptr);
+		const double StartOffset = ReadNum(StartOffsetProp, Ptr);
+		const double EndOffset   = ReadNum(EndOffsetProp, Ptr);
+		const double Radius      = ReadNum(RadiusProp, Ptr);
+		const int32 DirA         = ReadInt(DirAProp, Ptr);
+		const int32 DirB         = ReadInt(DirBProp, Ptr);
+
+		UObject* StartEdge = StartEdgeObj ? StartEdgeObj->GetObjectPropertyValue_InContainer(Ptr) : nullptr;
+		UObject* EndEdge   = EndEdgeObj   ? EndEdgeObj->GetObjectPropertyValue_InContainer(Ptr)   : nullptr;
+
+		FString StartDesc = DescribeEdge(StartEdge, TEXT("StartEdge"));
+		FString EndDesc   = DescribeEdge(EndEdge,   TEXT("EndEdge"));
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("Corner[%d]%s: IntersectionPoint=(%.1f, %.1f, %.1f)"),
+			i, bStale ? TEXT(" [STALE]") : TEXT(""),
+			IntPt.X, IntPt.Y, IntPt.Z);
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("  %s"),
+			*StartDesc);
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("  %s"),
+			*EndDesc);
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("  StartDist=%.1f EndDist=%.1f StartOffset=%.1f EndOffset=%.1f Radius=%.1f DirA=%d DirB=%d"),
+			StartDist, EndDist, StartOffset, EndOffset, Radius, DirA, DirB);
+	}
+
+	UE_LOG(LogAAATraffic, Log, TEXT("===== END CORNER DIAGNOSTIC DUMP ====="));
+}
+
+// ---------------------------------------------------------------------------
 // CacheLaneEndpoints — pre-compute geometry for every lane
 // ---------------------------------------------------------------------------
 
@@ -814,7 +1233,10 @@ void URoadBLDReflectionProvider::CacheLaneEndpoints()
 }
 
 // ---------------------------------------------------------------------------
-// DetectAndSplitThroughRoads — create virtual lane segments
+// DetectAndSplitThroughRoads — create virtual lane segments at intersection
+// mask boundaries.  A road with 2+ masks is a through-road; its lanes are
+// split so each intersection segment gets its own junction mapping.
+// Requires: CachedIntersectionMasks populated (BuildMaskBasedIntersections).
 // ---------------------------------------------------------------------------
 
 void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
@@ -822,235 +1244,577 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 	VirtualLaneMap.Empty();
 	OriginalToVirtualMap.Empty();
 	ReplacedLaneHandles.Empty();
+	VirtualLaneToGroupId.Empty();
 
-	const float SplitRadius = GThroughRoadRadius;
-	const float SplitRadiusSq = SplitRadius * SplitRadius;
-
-	// Collect all lane endpoints (start + end) grouped by road.
-	struct FEndpointInfo
+	if (CachedIntersectionMasks.Num() == 0)
 	{
-		int32 LaneHandle;
-		int32 RoadHandle;
-		FVector Position;
-	};
-	TArray<FEndpointInfo> AllEndpoints;
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: No intersection masks — through-road splitting skipped."));
+		return;
+	}
 
-	// Sort roads deterministically.
-	TArray<int32> SortedRoads;
-	RoadToLaneHandles.GetKeys(SortedRoads);
-	SortedRoads.Sort();
-
-	for (const int32 RoadId : SortedRoads)
+	// ── Step 1: Group masks by ParentRoad UObject ───────────────
+	// Build: RoadActor → list of mask indices (sorted by StartDistance).
+	TMap<UObject*, TArray<int32>> RoadToMaskIndices;
+	for (int32 i = 0; i < CachedIntersectionMasks.Num(); ++i)
 	{
-		const TArray<int32>& Lanes = RoadToLaneHandles[RoadId];
-		for (const int32 LaneId : Lanes)
+		UObject* Road = CachedIntersectionMasks[i].ParentRoad.Get();
+		if (Road)
 		{
-			const FLaneEndpointCache* EP = LaneEndpointMap.Find(LaneId);
-			if (!EP) { continue; }
-			AllEndpoints.Add({ LaneId, RoadId, EP->StartPos });
-			AllEndpoints.Add({ LaneId, RoadId, EP->EndPos });
+			RoadToMaskIndices.FindOrAdd(Road).Add(i);
 		}
 	}
 
-	// For each endpoint on road X, check if it is close to the MIDDLE of any lane
-	// on a DIFFERENT road Y. If so, Y's lane is a through-road that needs splitting.
-	// Key: through-lane handle → list of split distances (0.0–1.0 parameter along polyline).
-	TMap<int32, TArray<float>> SplitCandidates;
-
-	// Pre-compute AABB per candidate lane for early rejection.
-	struct FLaneAABB
+	// Sort each road's mask list by StartDistance for deterministic ordering.
+	for (auto& Pair : RoadToMaskIndices)
 	{
-		int32 LaneHandle;
-		int32 RoadHandle;
-		FVector Min;
-		FVector Max;
-	};
-	TArray<FLaneAABB> CandidateBoxes;
-	for (const auto& Pair : LaneEndpointMap)
-	{
-		const int32* CandRoad = LaneToRoadHandleMap.Find(Pair.Key);
-		if (!CandRoad) { continue; }
-		const TArray<FVector>& Poly = Pair.Value.Polyline;
-		if (Poly.Num() < 3) { continue; }
-
-		FVector BoxMin = Poly[0];
-		FVector BoxMax = Poly[0];
-		for (int32 p = 1; p < Poly.Num(); ++p)
+		Pair.Value.Sort([this](const int32 A, const int32 B)
 		{
-			BoxMin = BoxMin.ComponentMin(Poly[p]);
-			BoxMax = BoxMax.ComponentMax(Poly[p]);
-		}
-		// Expand by SplitRadius.
-		BoxMin -= FVector(SplitRadius);
-		BoxMax += FVector(SplitRadius);
-		CandidateBoxes.Add({ Pair.Key, *CandRoad, BoxMin, BoxMax });
+			return CachedIntersectionMasks[A].StartDistance < CachedIntersectionMasks[B].StartDistance;
+		});
 	}
 
-	for (const FEndpointInfo& EP : AllEndpoints)
+	// ── Step 2: Identify through-roads (roads with 2+ masks) ────
+	// Also need: road handle for each road actor (reverse lookup).
+	TMap<UObject*, int32> RoadActorToHandle;
+	for (const auto& Pair : RoadHandleMap)
 	{
-		for (const FLaneAABB& Cand : CandidateBoxes)
+		UObject* Actor = Pair.Value.Get();
+		if (Actor)
 		{
-			const int32 CandidateLane = Cand.LaneHandle;
-			// Skip same-road lanes.
-			if (Cand.RoadHandle == EP.RoadHandle) { continue; }
+			RoadActorToHandle.Add(Actor, Pair.Key);
+		}
+	}
 
-			// AABB early rejection.
-			if (EP.Position.X < Cand.Min.X || EP.Position.X > Cand.Max.X ||
-				EP.Position.Y < Cand.Min.Y || EP.Position.Y > Cand.Max.Y ||
-				EP.Position.Z < Cand.Min.Z || EP.Position.Z > Cand.Max.Z)
+	int32 TotalVirtuals = 0;
+	int32 ThroughRoadCount = 0;
+
+	for (const auto& RMPair : RoadToMaskIndices)
+	{
+		UObject* RoadActor = RMPair.Key;
+		const TArray<int32>& MaskIndices = RMPair.Value;
+
+		// Only roads with 2+ masks need splitting.
+		if (MaskIndices.Num() < 2) { continue; }
+
+		const int32* RoadHandlePtr = RoadActorToHandle.Find(RoadActor);
+		if (!RoadHandlePtr) { continue; }
+		const int32 RoadHandle = *RoadHandlePtr;
+
+		const TArray<int32>* LaneHandles = RoadToLaneHandles.Find(RoadHandle);
+		if (!LaneHandles || LaneHandles->Num() == 0) { continue; }
+
+		const double RoadLength = GetRoadLength(RoadActor);
+		if (RoadLength <= 0.0) { continue; }
+
+		++ThroughRoadCount;
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("  Through-road %s (handle=%d, length=%.1f): %d masks"),
+			*RoadActor->GetName(), RoadHandle, RoadLength, MaskIndices.Num());
+
+		// ── Step 3: For each lane on this road, compute split indices ──
+		for (const int32 LaneHandle : *LaneHandles)
+		{
+			const FLaneEndpointCache* OrigCache = LaneEndpointMap.Find(LaneHandle);
+			if (!OrigCache || OrigCache->Polyline.Num() < 3) { continue; }
+
+			const TArray<FVector>& Poly = OrigCache->Polyline;
+			const int32 TotalPoints = Poly.Num();
+
+			// Build split-point list from mask StartDistance/EndDistance.
+			// Each mask produces TWO split points: one at its start, one at its end.
+			// This creates segments: [road-start..mask1-start], [mask1-start..mask1-end],
+			// [mask1-end..mask2-start], [mask2-start..mask2-end], ... [maskN-end..road-end]
+			struct FSplitPoint
 			{
-				continue;
+				int32 PolyIndex;
+				int32 GroupId; // >0 = start of intersection segment, 0 = start of free segment
+			};
+			TArray<FSplitPoint> SplitPoints;
+
+			for (const int32 MaskIdx : MaskIndices)
+			{
+				const FIntersectionMaskInfo& Mask = CachedIntersectionMasks[MaskIdx];
+
+				// Convert reference-line distance to polyline index.
+				// Polyline is sampled uniformly: point[i] = distance (RoadLength * i) / (NumSamples - 1)
+				// So: index = round(Distance / RoadLength * (TotalPoints - 1))
+				const float StartNorm = static_cast<float>(Mask.StartDistance / RoadLength);
+				const float EndNorm = static_cast<float>(Mask.EndDistance / RoadLength);
+
+				int32 StartIdx = FMath::RoundToInt32(StartNorm * static_cast<float>(TotalPoints - 1));
+				int32 EndIdx = FMath::RoundToInt32(EndNorm * static_cast<float>(TotalPoints - 1));
+
+				// Clamp to valid range (never at very first or last point).
+				StartIdx = FMath::Clamp(StartIdx, 1, TotalPoints - 2);
+				EndIdx = FMath::Clamp(EndIdx, StartIdx + 1, TotalPoints - 1);
+
+				// Mark start of intersection segment and start of free segment after it.
+				SplitPoints.Add({ StartIdx, Mask.GroupId });
+				if (EndIdx < TotalPoints - 1)
+				{
+					SplitPoints.Add({ EndIdx, 0 }); // Free segment starts after intersection
+				}
+
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("    Lane %d: Mask group=%d → StartDist=%.1f (idx=%d), EndDist=%.1f (idx=%d)"),
+					LaneHandle, Mask.GroupId, Mask.StartDistance, StartIdx, Mask.EndDistance, EndIdx);
 			}
 
-			const FLaneEndpointCache& CandCache = LaneEndpointMap[CandidateLane];
-			const TArray<FVector>& Poly = CandCache.Polyline;
-
-			// Walk the polyline to find closest point.
-			float BestDistSq = SplitRadiusSq;
-			int32 BestSegIndex = -1;
-			float BestSegT = 0.0f;
-
-			for (int32 s = 0; s < Poly.Num() - 1; ++s)
+			// Sort split points by poly index (deterministic).
+			SplitPoints.Sort([](const FSplitPoint& A, const FSplitPoint& B)
 			{
-				const FVector& A = Poly[s];
-				const FVector& B = Poly[s + 1];
-				const FVector AB = B - A;
-				const float SegLenSq = AB.SizeSquared();
-				if (SegLenSq < 1.0f) { continue; }
+				return A.PolyIndex < B.PolyIndex;
+			});
 
-				float T = FVector::DotProduct(EP.Position - A, AB) / SegLenSq;
-				T = FMath::Clamp(T, 0.0f, 1.0f);
-				const FVector ClosestPt = A + AB * T;
-				const float DistSq = FVector::DistSquared(EP.Position, ClosestPt);
-
-				if (DistSq < BestDistSq)
+			// Remove duplicates (same poly index).
+			for (int32 i = SplitPoints.Num() - 1; i > 0; --i)
+			{
+				if (SplitPoints[i].PolyIndex == SplitPoints[i - 1].PolyIndex)
 				{
-					BestDistSq = DistSq;
-					BestSegIndex = s;
-					BestSegT = T;
+					SplitPoints.RemoveAt(i);
 				}
 			}
 
-			if (BestSegIndex < 0) { continue; }
+			if (SplitPoints.Num() == 0) { continue; }
 
-			// Calculate the parametric position along the full polyline (0..NumSeg).
-			const float ParamPos = static_cast<float>(BestSegIndex) + BestSegT;
-			const float TotalSegs = static_cast<float>(Poly.Num() - 1);
-			const float NormParam = ParamPos / TotalSegs;
+			// ── Step 4: Create virtual segments ──────────────
+			TArray<int32> VirtualHandles;
+			int32 PrevStart = 0;
+			int32 PrevGroupId = 0; // First segment before any intersection = free
 
-			// Only split if in the middle 10%-90% of the polyline (not near endpoints).
-			if (NormParam < 0.10f || NormParam > 0.90f) { continue; }
-
-			SplitCandidates.FindOrAdd(CandidateLane).Add(NormParam);
-		}
-	}
-
-	// Process each candidate: merge nearby split points, create virtual segments.
-	int32 TotalVirtuals = 0;
-	TArray<int32> SortedCandidates;
-	SplitCandidates.GetKeys(SortedCandidates);
-	SortedCandidates.Sort();
-
-	for (const int32 OriginalLane : SortedCandidates)
-	{
-		TArray<float>& Params = SplitCandidates[OriginalLane];
-		Params.Sort();
-
-		// Merge nearby split points (within 5% of polyline length).
-		TArray<float> MergedParams;
-		for (const float P : Params)
-		{
-			if (MergedParams.Num() == 0 || (P - MergedParams.Last()) > 0.05f)
+			for (int32 s = 0; s <= SplitPoints.Num(); ++s)
 			{
-				MergedParams.Add(P);
+				const int32 SegEnd = (s < SplitPoints.Num())
+					? SplitPoints[s].PolyIndex
+					: (TotalPoints - 1);
+
+				if (SegEnd <= PrevStart) { PrevStart = SegEnd; continue; }
+
+				const int32 VirtualId = NextHandleId++;
+				FVirtualLaneInfo VInfo;
+				VInfo.OriginalLaneHandle = LaneHandle;
+				VInfo.StartPointIndex = PrevStart;
+				VInfo.EndPointIndex = SegEnd;
+				VirtualLaneMap.Add(VirtualId, VInfo);
+				VirtualHandles.Add(VirtualId);
+
+				// Tag this virtual lane with its group (0 = free, >0 = intersection).
+				VirtualLaneToGroupId.Add(VirtualId, PrevGroupId);
+
+				// Cache endpoint data for the virtual segment.
+				FLaneEndpointCache VCache;
+				VCache.Width = OrigCache->Width;
+				for (int32 p = PrevStart; p <= SegEnd; ++p)
+				{
+					VCache.Polyline.Add(Poly[p]);
+				}
+				VCache.StartPos = VCache.Polyline[0];
+				VCache.EndPos = VCache.Polyline.Last();
+				if (VCache.Polyline.Num() >= 2)
+				{
+					VCache.StartDir = (VCache.Polyline[1] - VCache.Polyline[0]).GetSafeNormal();
+					VCache.EndDir = (VCache.Polyline.Last() - VCache.Polyline[VCache.Polyline.Num() - 2]).GetSafeNormal();
+				}
+				LaneEndpointMap.Add(VirtualId, MoveTemp(VCache));
+
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("      Virtual %d: points [%d..%d], group=%d (%s)"),
+					VirtualId, PrevStart, SegEnd, PrevGroupId,
+					PrevGroupId > 0 ? TEXT("intersection") : TEXT("free-flow"));
+
+				PrevStart = SegEnd;
+				// Next segment's group: if this was the split point, use its GroupId.
+				PrevGroupId = (s < SplitPoints.Num()) ? SplitPoints[s].GroupId : 0;
 			}
-		}
 
-		const FLaneEndpointCache* OrigCache = LaneEndpointMap.Find(OriginalLane);
-		if (!OrigCache || OrigCache->Polyline.Num() < 3) { continue; }
-
-		const TArray<FVector>& Poly = OrigCache->Polyline;
-		const int32 TotalPoints = Poly.Num();
-
-		// Convert normalized params to point indices.
-		TArray<int32> SplitIndices;
-		for (const float NP : MergedParams)
-		{
-			int32 Idx = FMath::RoundToInt32(NP * static_cast<float>(TotalPoints - 1));
-			Idx = FMath::Clamp(Idx, 1, TotalPoints - 2); // Never split at very first/last point.
-			if (SplitIndices.Num() == 0 || SplitIndices.Last() != Idx)
+			if (VirtualHandles.Num() > 1)
 			{
-				SplitIndices.Add(Idx);
+				ReplacedLaneHandles.Add(LaneHandle);
+				OriginalToVirtualMap.Add(LaneHandle, MoveTemp(VirtualHandles));
+				TotalVirtuals += OriginalToVirtualMap[LaneHandle].Num();
+
+				// Connect consecutive virtual segments internally.
+				const TArray<int32>& Virtuals = OriginalToVirtualMap[LaneHandle];
+				for (int32 v = 0; v < Virtuals.Num() - 1; ++v)
+				{
+					TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(Virtuals[v]);
+					Conns.AddUnique(FTrafficLaneHandle(Virtuals[v + 1]));
+				}
 			}
-		}
-
-		if (SplitIndices.Num() == 0) { continue; }
-
-		// Create N+1 virtual segments.
-		TArray<int32> VirtualHandles;
-		int32 PrevStart = 0;
-
-		for (int32 s = 0; s <= SplitIndices.Num(); ++s)
-		{
-			const int32 SegEnd = (s < SplitIndices.Num()) ? SplitIndices[s] : (TotalPoints - 1);
-
-			if (SegEnd <= PrevStart) { continue; }
-
-			const int32 VirtualId = NextHandleId++;
-			FVirtualLaneInfo VInfo;
-			VInfo.OriginalLaneHandle = OriginalLane;
-			VInfo.StartPointIndex = PrevStart;
-			VInfo.EndPointIndex = SegEnd;
-			VirtualLaneMap.Add(VirtualId, VInfo);
-			VirtualHandles.Add(VirtualId);
-
-			// Cache endpoint data for the virtual segment.
-			FLaneEndpointCache VCache;
-			VCache.Width = OrigCache->Width;
-			for (int32 p = PrevStart; p <= SegEnd; ++p)
+			else
 			{
-				VCache.Polyline.Add(Poly[p]);
-			}
-			VCache.StartPos = VCache.Polyline[0];
-			VCache.EndPos = VCache.Polyline.Last();
-			if (VCache.Polyline.Num() >= 2)
-			{
-				VCache.StartDir = (VCache.Polyline[1] - VCache.Polyline[0]).GetSafeNormal();
-				VCache.EndDir = (VCache.Polyline.Last() - VCache.Polyline[VCache.Polyline.Num() - 2]).GetSafeNormal();
-			}
-			LaneEndpointMap.Add(VirtualId, MoveTemp(VCache));
-
-			PrevStart = SegEnd; // Next segment starts where this one ends.
-		}
-
-		if (VirtualHandles.Num() > 1)
-		{
-			ReplacedLaneHandles.Add(OriginalLane);
-			OriginalToVirtualMap.Add(OriginalLane, MoveTemp(VirtualHandles));
-			TotalVirtuals += OriginalToVirtualMap[OriginalLane].Num();
-
-			// Connect consecutive virtual segments internally.
-			const TArray<int32>& Virtuals = OriginalToVirtualMap[OriginalLane];
-			for (int32 v = 0; v < Virtuals.Num() - 1; ++v)
-			{
-				TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(Virtuals[v]);
-				Conns.AddUnique(FTrafficLaneHandle(Virtuals[v + 1]));
-			}
-		}
-		else
-		{
-			// Only one segment — splitting didn't help. Clean up.
-			for (const int32 VH : VirtualHandles)
-			{
-				VirtualLaneMap.Remove(VH);
-				LaneEndpointMap.Remove(VH);
+				// Only one segment — splitting didn't help. Clean up.
+				for (const int32 VH : VirtualHandles)
+				{
+					VirtualLaneMap.Remove(VH);
+					LaneEndpointMap.Remove(VH);
+					VirtualLaneToGroupId.Remove(VH);
+				}
 			}
 		}
 	}
 
 	UE_LOG(LogAAATraffic, Log,
-		TEXT("RoadBLDReflectionProvider: Through-road splitting created %d virtual segments from %d source lanes."),
-		TotalVirtuals, ReplacedLaneHandles.Num());
+		TEXT("RoadBLDReflectionProvider: Through-road splitting — %d through-roads, %d virtual segments from %d source lanes."),
+		ThroughRoadCount, TotalVirtuals, ReplacedLaneHandles.Num());
+}
+
+// ---------------------------------------------------------------------------
+// BuildMaskBasedIntersections — read IntersectionMasks from RoadBLD and
+// group them into physical intersection clusters for junction assignment
+// ---------------------------------------------------------------------------
+
+void URoadBLDReflectionProvider::BuildMaskBasedIntersections(UWorld* World)
+{
+	CachedIntersectionMasks.Empty();
+	IntersectionGroupCentroids.Empty();
+
+	if (!DynNetworkClass || !World)
+	{
+		return;
+	}
+
+	// Find the DynamicRoadNetwork actor deterministically.
+	AActor* NetworkActor = nullptr;
+	{
+		TArray<AActor*> Candidates;
+		for (FActorIterator It(World); It; ++It)
+		{
+			if (It->IsA(DynNetworkClass))
+			{
+				Candidates.Add(*It);
+			}
+		}
+		if (Candidates.Num() > 0)
+		{
+			Candidates.Sort([](const AActor& A, const AActor& B) { return A.GetName() < B.GetName(); });
+			NetworkActor = Candidates[0];
+		}
+	}
+	if (!NetworkActor)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: No DynamicRoadNetwork actor — mask-based intersections skipped."));
+		return;
+	}
+
+	// ── Step 1: Read IntersectionMasks ──────────────────────────
+	FArrayProperty* MasksArr = CastField<FArrayProperty>(
+		DynNetworkClass->FindPropertyByName(TEXT("IntersectionMasks")));
+	if (!MasksArr)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: IntersectionMasks property not found — mask-based intersections skipped."));
+		return;
+	}
+
+	FScriptArrayHelper MaskHelper(MasksArr, MasksArr->ContainerPtrToValuePtr<void>(NetworkActor));
+	const int32 NumMasks = MaskHelper.Num();
+	if (NumMasks == 0)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: IntersectionMasks is empty — no intersections to group."));
+		return;
+	}
+
+	FStructProperty* MaskStructProp = CastField<FStructProperty>(MasksArr->Inner);
+	if (!MaskStructProp) { return; }
+
+	UScriptStruct* MaskStruct = MaskStructProp->Struct;
+	FDoubleProperty* MaskSDProp = CastField<FDoubleProperty>(MaskStruct->FindPropertyByName(TEXT("StartDistance")));
+	FDoubleProperty* MaskEDProp = CastField<FDoubleProperty>(MaskStruct->FindPropertyByName(TEXT("EndDistance")));
+	FObjectPropertyBase* MaskPRObj = CastField<FObjectPropertyBase>(MaskStruct->FindPropertyByName(TEXT("ParentRoad")));
+	FIntProperty* MaskSCIProp = CastField<FIntProperty>(MaskStruct->FindPropertyByName(TEXT("StartCutIndex")));
+	FIntProperty* MaskECIProp = CastField<FIntProperty>(MaskStruct->FindPropertyByName(TEXT("EndCutIndex")));
+
+	if (!MaskSDProp || !MaskEDProp || !MaskPRObj || !MaskSCIProp || !MaskECIProp)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("RoadBLDReflectionProvider: IntersectionMask struct missing expected properties (SD=%d ED=%d PR=%d SCI=%d ECI=%d)."),
+			!!MaskSDProp, !!MaskEDProp, !!MaskPRObj, !!MaskSCIProp, !!MaskECIProp);
+		return;
+	}
+
+	// ── Step 2: Read RoadNetworkPerimeterCuts ───────────────────
+	FArrayProperty* CutsArr = CastField<FArrayProperty>(
+		DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkPerimeterCuts")));
+	if (!CutsArr)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("RoadBLDReflectionProvider: RoadNetworkPerimeterCuts property not found — cannot group masks."));
+		return;
+	}
+
+	FScriptArrayHelper CutHelper(CutsArr, CutsArr->ContainerPtrToValuePtr<void>(NetworkActor));
+	const int32 NumCuts = CutHelper.Num();
+	if (NumCuts == 0)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("RoadBLDReflectionProvider: RoadNetworkPerimeterCuts is empty — cannot group masks."));
+		return;
+	}
+
+	FStructProperty* CutStructProp = CastField<FStructProperty>(CutsArr->Inner);
+	if (!CutStructProp) { return; }
+
+	UScriptStruct* CutStruct = CutStructProp->Struct;
+	FIntProperty* CutLCIProp = CastField<FIntProperty>(CutStruct->FindPropertyByName(TEXT("LeftCornerIndex")));
+	FIntProperty* CutRCIProp = CastField<FIntProperty>(CutStruct->FindPropertyByName(TEXT("RightCornerIndex")));
+
+	if (!CutLCIProp || !CutRCIProp)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("RoadBLDReflectionProvider: PerimeterCut struct missing LeftCornerIndex/RightCornerIndex."));
+		return;
+	}
+
+	// ── Step 3: Parse masks, collect corner indices, compute world positions ─
+	// We compute the world-space centroid for each mask here (needed for
+	// grouping in Step 4). Corner indices are also collected as a supplementary
+	// signal but may be all -1 in practice (confirmed from FastPreview rebuilds).
+	TArray<FVector> MaskWorldPositions;
+	MaskWorldPositions.SetNum(NumMasks);
+
+	for (int32 i = 0; i < NumMasks; ++i)
+	{
+		const uint8* MaskPtr = MaskHelper.GetRawPtr(i);
+
+		FIntersectionMaskInfo MaskInfo;
+		MaskInfo.StartDistance = MaskSDProp->GetPropertyValue_InContainer(MaskPtr);
+		MaskInfo.EndDistance   = MaskEDProp->GetPropertyValue_InContainer(MaskPtr);
+		MaskInfo.ParentRoad    = MaskPRObj->GetObjectPropertyValue_InContainer(MaskPtr);
+		MaskInfo.StartCutIndex = MaskSCIProp->GetPropertyValue_InContainer(MaskPtr);
+		MaskInfo.EndCutIndex   = MaskECIProp->GetPropertyValue_InContainer(MaskPtr);
+
+		// Collect all unique corner indices from this mask's cuts.
+		// Handle inverted ranges (StartCutIndex > EndCutIndex).
+		const int32 CutLo = FMath::Min(MaskInfo.StartCutIndex, MaskInfo.EndCutIndex);
+		const int32 CutHi = FMath::Max(MaskInfo.StartCutIndex, MaskInfo.EndCutIndex);
+		for (int32 CutIdx = CutLo; CutIdx <= CutHi && CutIdx < NumCuts; ++CutIdx)
+		{
+			if (CutIdx < 0) { continue; }
+			const uint8* CutPtr = CutHelper.GetRawPtr(CutIdx);
+			const int32 LCI = CutLCIProp->GetPropertyValue_InContainer(CutPtr);
+			const int32 RCI = CutRCIProp->GetPropertyValue_InContainer(CutPtr);
+			if (LCI >= 0) { MaskInfo.CornerIndices.AddUnique(LCI); }
+			if (RCI >= 0) { MaskInfo.CornerIndices.AddUnique(RCI); }
+		}
+
+		// Compute world-space position at mask midpoint for grouping.
+		FVector WorldPos = FVector::ZeroVector;
+		UObject* RoadActor = MaskInfo.ParentRoad.Get();
+		if (RoadActor)
+		{
+			const double MidDist = (MaskInfo.StartDistance + MaskInfo.EndDistance) * 0.5;
+			UObject* RefLine = GetReferenceLine(RoadActor);
+			if (RefLine && Get3DPosFunc)
+			{
+				WorldPos = Get3DPositionAtDistance(RefLine, RefLine, MidDist);
+			}
+		}
+		MaskWorldPositions[i] = WorldPos;
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("  Mask[%d]: Road=%s Dist=[%.1f, %.1f] Cuts=[%d, %d] Corners=%d WorldPos=(%.1f, %.1f, %.1f)"),
+			i,
+			MaskInfo.ParentRoad.IsValid() ? *MaskInfo.ParentRoad->GetName() : TEXT("NULL"),
+			MaskInfo.StartDistance, MaskInfo.EndDistance,
+			MaskInfo.StartCutIndex, MaskInfo.EndCutIndex,
+			MaskInfo.CornerIndices.Num(),
+			WorldPos.X, WorldPos.Y, WorldPos.Z);
+
+		CachedIntersectionMasks.Add(MoveTemp(MaskInfo));
+	}
+
+	// ── Step 4: Group masks using two complementary signals ─────
+	//
+	// Signal A — Corner indices (structural):
+	//   Two masks sharing a corner index belong to the same intersection.
+	//   Currently all PerimeterCut corner indices return -1 at runtime,
+	//   so this signal may produce 0 links. Kept for forward compatibility.
+	//
+	// Signal B — World-position proximity:
+	//   Masks at the same physical intersection have nearby X,Y world
+	//   positions. For straight crossroads the midpoints are nearly identical,
+	//   but for angled or roundabout junctions, road reference-line offsets
+	//   can separate them by up to ~500 cm. Uses 800 cm proximity threshold.
+	//
+	// Both signals feed into the same union-find.
+
+	// Filter: exclude masks with no valid ParentRoad (phantom/orphan masks).
+	TArray<bool> MaskValid;
+	MaskValid.SetNumUninitialized(NumMasks);
+	int32 ValidCount = 0;
+	for (int32 k = 0; k < NumMasks; ++k)
+	{
+		MaskValid[k] = CachedIntersectionMasks[k].ParentRoad.IsValid();
+		if (!MaskValid[k])
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("  Mask[%d] has NULL ParentRoad — excluded from grouping"), k);
+		}
+		else
+		{
+			++ValidCount;
+		}
+	}
+	UE_LOG(LogAAATraffic, Log, TEXT("  %d/%d masks valid for grouping"), ValidCount, NumMasks);
+
+	TArray<int32> Parent;
+	Parent.SetNumUninitialized(NumMasks);
+	for (int32 k = 0; k < NumMasks; ++k) { Parent[k] = k; }
+
+	TFunction<int32(int32)> Find = [&Parent, &Find](int32 X) -> int32
+	{
+		if (Parent[X] != X) { Parent[X] = Find(Parent[X]); }
+		return Parent[X];
+	};
+
+	auto Union = [&Parent, &Find](int32 A, int32 B)
+	{
+		const int32 RA = Find(A);
+		const int32 RB = Find(B);
+		if (RA != RB) { Parent[RA] = RB; }
+	};
+
+	// Signal A: corner-index grouping.
+	int32 CornerLinkCount = 0;
+	{
+		TMap<int32, TArray<int32>> CornerToMasks;
+		for (int32 MaskIdx = 0; MaskIdx < NumMasks; ++MaskIdx)
+		{
+			if (!MaskValid[MaskIdx]) { continue; }
+			for (const int32 CornerIdx : CachedIntersectionMasks[MaskIdx].CornerIndices)
+			{
+				CornerToMasks.FindOrAdd(CornerIdx).Add(MaskIdx);
+			}
+		}
+		for (const auto& Pair : CornerToMasks)
+		{
+			const TArray<int32>& MaskIndices = Pair.Value;
+			for (int32 m = 1; m < MaskIndices.Num(); ++m)
+			{
+				Union(MaskIndices[0], MaskIndices[m]);
+				++CornerLinkCount;
+			}
+		}
+	}
+
+	// Signal B: world-position proximity.
+	// Masks whose XY world positions are within a spatial tolerance belong
+	// to the same physical intersection. For straight crossroads the mask
+	// midpoints are nearly identical, but for angled or roundabout junctions
+	// each road's reference-line offset can place the midpoints up to ~500 cm
+	// apart. 800 cm (squared = 640000) covers observed offsets with margin
+	// while staying well under the minimum distance between genuinely
+	// distinct intersections (~3300 cm in tested layouts).
+	constexpr float PositionEpsilonSq = 640000.0f; // 800 cm radius squared
+	int32 PositionLinkCount = 0;
+	for (int32 i = 0; i < NumMasks; ++i)
+	{
+		if (!MaskValid[i]) { continue; }
+		for (int32 j = i + 1; j < NumMasks; ++j)
+		{
+			if (!MaskValid[j]) { continue; }
+			const float DX = MaskWorldPositions[i].X - MaskWorldPositions[j].X;
+			const float DY = MaskWorldPositions[i].Y - MaskWorldPositions[j].Y;
+			const float XYDistSq = DX * DX + DY * DY;
+			if (XYDistSq <= PositionEpsilonSq)
+			{
+				Union(i, j);
+				++PositionLinkCount;
+
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("    Masks [%d] and [%d] grouped by world-position proximity (XY dist=%.1f cm)"),
+					i, j, FMath::Sqrt(XYDistSq));
+			}
+		}
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("  Grouping signals: %d corner-index links, %d world-position links"),
+		CornerLinkCount, PositionLinkCount);
+
+	// ── Step 5: Collect groups ─────────────────────────────────
+	TMap<int32, TArray<int32>> Groups;
+	for (int32 k = 0; k < NumMasks; ++k)
+	{
+		if (!MaskValid[k]) { continue; }
+		Groups.FindOrAdd(Find(k)).Add(k);
+	}
+
+	// Sort groups deterministically.
+	// Use the minimum (StartDistance, ParentRoad name) in each group as sort key
+	// so junction IDs are stable across rebuilds.
+	struct FGroupEntry
+	{
+		FString SortKey;
+		TArray<int32> MaskIndices;
+	};
+	TArray<FGroupEntry> SortedGroups;
+
+	for (auto& GroupPair : Groups)
+	{
+		FGroupEntry Entry;
+		Entry.MaskIndices = MoveTemp(GroupPair.Value);
+
+		// Build sort key from first mask (by road name + start distance).
+		Entry.MaskIndices.Sort();
+		const FIntersectionMaskInfo& FirstMask = CachedIntersectionMasks[Entry.MaskIndices[0]];
+		const FString RoadName = FirstMask.ParentRoad.IsValid() ? FirstMask.ParentRoad->GetName() : TEXT("_");
+		Entry.SortKey = FString::Printf(TEXT("%s_%.1f"), *RoadName, FirstMask.StartDistance);
+
+		SortedGroups.Add(MoveTemp(Entry));
+	}
+
+	SortedGroups.Sort([](const FGroupEntry& A, const FGroupEntry& B)
+	{
+		return A.SortKey < B.SortKey;
+	});
+
+	// ── Step 6: Assign group IDs and compute centroids ─────────
+	// Centroids are averaged from mask world positions computed in Step 3.
+	for (int32 GIdx = 0; GIdx < SortedGroups.Num(); ++GIdx)
+	{
+		const int32 GroupId = GIdx + 1;
+
+		FVector CentroidSum = FVector::ZeroVector;
+		int32 CentroidCount = 0;
+
+		for (const int32 MaskIdx : SortedGroups[GIdx].MaskIndices)
+		{
+			CachedIntersectionMasks[MaskIdx].GroupId = GroupId;
+
+			const FIntersectionMaskInfo& Mask = CachedIntersectionMasks[MaskIdx];
+			const FVector& WorldPos = MaskWorldPositions[MaskIdx];
+
+			CentroidSum += WorldPos;
+			++CentroidCount;
+
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("    Group %d Mask[%d]: Road=%s Dist=[%.1f, %.1f] WorldPos=(%.1f, %.1f, %.1f)"),
+				GroupId, MaskIdx,
+				Mask.ParentRoad.IsValid() ? *Mask.ParentRoad->GetName() : TEXT("NULL"),
+				Mask.StartDistance, Mask.EndDistance,
+				WorldPos.X, WorldPos.Y, WorldPos.Z);
+		}
+
+		if (CentroidCount > 0)
+		{
+			const FVector Centroid = CentroidSum / static_cast<float>(CentroidCount);
+			IntersectionGroupCentroids.Add(GroupId, Centroid);
+
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("    Group %d centroid: (%.1f, %.1f, %.1f) from %d masks"),
+				GroupId, Centroid.X, Centroid.Y, Centroid.Z, CentroidCount);
+		}
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDReflectionProvider: Mask-based intersections — %d masks, %d corner links, %d position links, %d intersection groups."),
+		NumMasks, CornerLinkCount, PositionLinkCount, SortedGroups.Num());
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,112 +1943,216 @@ void URoadBLDReflectionProvider::BuildProximityConnections()
 }
 
 // ---------------------------------------------------------------------------
-// BuildJunctionGrouping — cluster proximity connections into junctions
+// BuildJunctionGrouping — register mask-based junctions, then assign
+// proximity connections
 // ---------------------------------------------------------------------------
 
 void URoadBLDReflectionProvider::BuildJunctionGrouping()
 {
-	if (ProximityConnectionList.Num() == 0)
-	{
-		// No proximity connections — preserve any corner-based junction IDs that may
-		// already exist (from BuildLaneConnectivity). Do NOT clear LaneToJunctionMap.
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("RoadBLDReflectionProvider: No proximity connections — junction grouping skipped (corner IDs preserved)."));
-		return;
-	}
-
-	// Rebuild from proximity data — replaces any pre-existing corner-based IDs.
 	LaneToJunctionMap.Empty();
 	JunctionCentroids.Empty();
 
-	constexpr float JunctionGroupThreshold = 200.0f; // cm
-	const float ThresholdSq = JunctionGroupThreshold * JunctionGroupThreshold;
-
-	const int32 N = ProximityConnectionList.Num();
-
-	// Union-find for clustering connections by midpoint proximity.
-	TArray<int32> Parent;
-	Parent.SetNumUninitialized(N);
-	for (int32 k = 0; k < N; ++k) { Parent[k] = k; }
-
-	TFunction<int32(int32)> Find = [&Parent, &Find](int32 X) -> int32
+	// ── Mask-based junctions (primary path) ─────────────────────
+	// When IntersectionGroupCentroids is populated, mask groups define the
+	// authoritative set of junctions. Junctions are registered FIRST from
+	// mask data, then ProximityConnections are assigned to them.
+	if (IntersectionGroupCentroids.Num() > 0)
 	{
-		if (Parent[X] != X) { Parent[X] = Find(Parent[X]); }
-		return Parent[X];
-	};
-
-	auto Union = [&Parent, &Find](int32 A, int32 B)
-	{
-		int32 RA = Find(A);
-		int32 RB = Find(B);
-		if (RA != RB) { Parent[RA] = RB; }
-	};
-
-	// O(N^2) clustering — N is typically small (number of intersection connections).
-	for (int32 a = 0; a < N; ++a)
-	{
-		for (int32 b = a + 1; b < N; ++b)
+		// Step 1: Register all mask group centroids as junctions.
+		for (const auto& Pair : IntersectionGroupCentroids)
 		{
-			if (FVector::DistSquared(ProximityConnectionList[a].Midpoint,
-				ProximityConnectionList[b].Midpoint) <= ThresholdSq)
+			JunctionCentroids.Add(Pair.Key, Pair.Value);
+		}
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("  Registered %d mask-based junctions with centroids."),
+			JunctionCentroids.Num());
+
+		// Step 2: Build GroupId → set of road handles from mask data.
+		// Also build reverse map: road handle → list of GroupIds (for
+		// through-roads that participate in multiple intersections).
+		TMap<int32, TSet<int32>> GroupToRoadHandles;
+		TMap<int32, TArray<int32>> RoadHandleToGroups;
+		TMap<int32, TSet<UObject*>> GroupToRoads; // For proximity connection matching.
+
+		for (const FIntersectionMaskInfo& Mask : CachedIntersectionMasks)
+		{
+			UObject* RoadActor = Mask.ParentRoad.Get();
+			if (!RoadActor || Mask.GroupId <= 0) { continue; }
+
+			GroupToRoads.FindOrAdd(Mask.GroupId).Add(RoadActor);
+
+			// Resolve road handle for this road actor.
+			for (const auto& RHPair : RoadHandleMap)
 			{
-				Union(a, b);
+				if (RHPair.Value.Get() == RoadActor)
+				{
+					GroupToRoadHandles.FindOrAdd(Mask.GroupId).Add(RHPair.Key);
+					RoadHandleToGroups.FindOrAdd(RHPair.Key).AddUnique(Mask.GroupId);
+					break;
+				}
 			}
 		}
-	}
 
-	// Collect clusters.
-	TMap<int32, TArray<int32>> Clusters;
-	for (int32 k = 0; k < N; ++k)
-	{
-		Clusters.FindOrAdd(Find(k)).Add(k);
-	}
-
-	// Sort clusters by centroid for deterministic ID assignment.
-	struct FClusterEntry
-	{
-		FVector Centroid;
-		TArray<int32> ConnIndices; // Indices into ProximityConnectionList.
-	};
-	TArray<FClusterEntry> SortedClusters;
-
-	for (auto& ClusterPair : Clusters)
-	{
-		FClusterEntry Entry;
-		FVector Sum = FVector::ZeroVector;
-		for (int32 Idx : ClusterPair.Value)
+		// Step 3: Map lanes to junctions using road participation.
+		// For through-roads that were split by DetectAndSplitThroughRoads,
+		// each virtual segment already has its group ID in VirtualLaneToGroupId.
+		// For non-split lanes, map directly by road participation.
+		int32 LanesMapped = 0;
+		for (const auto& GroupPair : GroupToRoadHandles)
 		{
-			Sum += ProximityConnectionList[Idx].Midpoint;
+			const int32 JunctionId = GroupPair.Key;
+
+			for (const int32 RoadHandle : GroupPair.Value)
+			{
+				const TArray<int32>* Lanes = RoadToLaneHandles.Find(RoadHandle);
+				if (!Lanes) { continue; }
+
+				for (const int32 LaneHandle : *Lanes)
+				{
+					// Check if this lane was split into virtual segments.
+					if (ReplacedLaneHandles.Contains(LaneHandle))
+					{
+						// Through-road lane was split. Map each virtual segment
+						// using its pre-computed group ID from splitting.
+						const TArray<int32>* Virtuals = OriginalToVirtualMap.Find(LaneHandle);
+						if (Virtuals)
+						{
+							for (const int32 VH : *Virtuals)
+							{
+								const int32* VGroupId = VirtualLaneToGroupId.Find(VH);
+								if (VGroupId && *VGroupId > 0)
+								{
+									LaneToJunctionMap.FindOrAdd(VH) = *VGroupId;
+									++LanesMapped;
+								}
+								// VGroupId == 0 → free-flow segment, no junction.
+							}
+						}
+						continue; // Don't map the original lane.
+					}
+
+					LaneToJunctionMap.Add(LaneHandle, JunctionId);
+					++LanesMapped;
+				}
+			}
 		}
-		Entry.Centroid = Sum / static_cast<float>(ClusterPair.Value.Num());
-		Entry.ConnIndices = MoveTemp(ClusterPair.Value);
-		SortedClusters.Add(MoveTemp(Entry));
-	}
 
-	SortedClusters.Sort([](const FClusterEntry& A, const FClusterEntry& B)
-	{
-		if (!FMath::IsNearlyEqual(A.Centroid.X, B.Centroid.X, 1.0f)) return A.Centroid.X < B.Centroid.X;
-		if (!FMath::IsNearlyEqual(A.Centroid.Y, B.Centroid.Y, 1.0f)) return A.Centroid.Y < B.Centroid.Y;
-		return A.Centroid.Z < B.Centroid.Z;
-	});
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("  Mapped %d lanes to mask-based junctions."), LanesMapped);
 
-	// Assign junction IDs (1-based) and map all participating lanes.
-	for (int32 JIdx = 0; JIdx < SortedClusters.Num(); ++JIdx)
-	{
-		const int32 JunctionId = JIdx + 1;
-		JunctionCentroids.Add(JunctionId, SortedClusters[JIdx].Centroid);
+		// Step 4: Process ProximityConnections.
+		// These represent end-to-end road joins found by endpoint matching.
+		// Assign each to an existing mask junction or create a new one.
 
-		for (int32 ConnIdx : SortedClusters[JIdx].ConnIndices)
+		// Helper: resolve a lane handle to its road UObject.
+		auto ResolveRoadActor = [&](int32 LaneHandle) -> UObject*
 		{
-			const FProximityConnection& PC = ProximityConnectionList[ConnIdx];
-			LaneToJunctionMap.FindOrAdd(PC.FromLane) = JunctionId;
-			LaneToJunctionMap.FindOrAdd(PC.ToLane) = JunctionId;
+			int32 EffectiveLane = LaneHandle;
+			if (const FVirtualLaneInfo* V = VirtualLaneMap.Find(LaneHandle))
+			{
+				EffectiveLane = V->OriginalLaneHandle;
+			}
+			const int32* RoadHandlePtr = LaneToRoadHandleMap.Find(EffectiveLane);
+			if (!RoadHandlePtr) { return nullptr; }
+			return RoadHandleMap.FindRef(*RoadHandlePtr).Get();
+		};
+
+		int32 PCMatched = 0;
+		int32 PCSkipped = 0;
+
+		for (const FProximityConnection& PC : ProximityConnectionList)
+		{
+			UObject* RoadA = ResolveRoadActor(PC.FromLane);
+			UObject* RoadB = ResolveRoadActor(PC.ToLane);
+
+			// Try to find an intersection group that contains both roads.
+			int32 GroupId = 0;
+			TArray<int32> Candidates;
+			if (RoadA && RoadB)
+			{
+				for (const auto& GPair : GroupToRoads)
+				{
+					if (GPair.Value.Contains(RoadA) && GPair.Value.Contains(RoadB))
+					{
+						Candidates.Add(GPair.Key);
+					}
+				}
+			}
+
+			if (Candidates.Num() == 1)
+			{
+				GroupId = Candidates[0];
+			}
+			else if (Candidates.Num() > 1)
+			{
+				// Tiebreak: nearest centroid.
+				float BestDistSq = TNumericLimits<float>::Max();
+				for (const int32 CandId : Candidates)
+				{
+					const FVector* C = JunctionCentroids.Find(CandId);
+					if (C)
+					{
+						const float DSq = FVector::DistSquared(PC.Midpoint, *C);
+						if (DSq < BestDistSq) { BestDistSq = DSq; GroupId = CandId; }
+					}
+				}
+			}
+			else
+			{
+				// Neither road shares a mask group with the other.
+				// This is a simple end-to-end road join (e.g. user extended a
+				// road by drawing a new piece), NOT an intersection.
+				// Do NOT assign a junction — the lane connectivity (next-lane)
+				// already handles the hand-off; adding a junction here would
+				// cause vehicles to stop at a non-intersection join point.
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("  Connection FromLane=%d -> ToLane=%d (Road=%s -> Road=%s): road continuation (no shared mask group) — skipping junction assignment."),
+					PC.FromLane, PC.ToLane,
+					RoadA ? *RoadA->GetName() : TEXT("NULL"),
+					RoadB ? *RoadB->GetName() : TEXT("NULL"));
+				++PCSkipped;
+				continue;
+			}
+
+			if (GroupId > 0)
+			{
+				++PCMatched;
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("  Connection FromLane=%d -> ToLane=%d -> matched junction %d"),
+					PC.FromLane, PC.ToLane, GroupId);
+			}
+
+			// Map these lanes to the junction.
+			LaneToJunctionMap.FindOrAdd(PC.FromLane) = GroupId;
+			LaneToJunctionMap.FindOrAdd(PC.ToLane) = GroupId;
 		}
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: Junction grouping — %d mask junctions, %d proximity connections (%d matched to junctions, %d skipped as road continuations), %d total junctions, %d lanes mapped."),
+			IntersectionGroupCentroids.Num(), ProximityConnectionList.Num(),
+			PCMatched, PCSkipped, JunctionCentroids.Num(), LaneToJunctionMap.Num());
+		return;
 	}
 
+	// ── No mask data + no connections ──────────────────────────
+	if (ProximityConnectionList.Num() == 0)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: No mask data and no proximity connections — junction grouping skipped."));
+		return;
+	}
+
+	// ── No mask data: all proximity connections are road continuations ──
+	// RoadBLD is the authoritative source for intersection data.
+	// Zero masks means RoadBLD determined there are no intersections in
+	// this road network (e.g. an overpass, or isolated road segments).
+	// Proximity connections still provide lane-to-lane handoffs, but no
+	// junctions should be created — creating them would spawn false
+	// junction markers at simple road joins.
 	UE_LOG(LogAAATraffic, Log,
-		TEXT("RoadBLDReflectionProvider: Grouped %d connections into %d junctions, %d lanes mapped."),
-		N, SortedClusters.Num(), LaneToJunctionMap.Num());
+		TEXT("RoadBLDReflectionProvider: No mask data — %d proximity connections treated as road continuations, 0 junctions created."),
+		ProximityConnectionList.Num());
 }
 
 // ---------------------------------------------------------------------------
@@ -1430,6 +2298,17 @@ int32 URoadBLDReflectionProvider::GetJunctionForLane(const FTrafficLaneHandle& L
 		}
 	}
 	return 0;
+}
+
+bool URoadBLDReflectionProvider::GetJunctionCentroid(int32 JunctionId, FVector& OutCentroid)
+{
+	const FVector* C = JunctionCentroids.Find(JunctionId);
+	if (C)
+	{
+		OutCentroid = *C;
+		return true;
+	}
+	return false;
 }
 
 bool URoadBLDReflectionProvider::GetJunctionPath(

@@ -554,15 +554,27 @@ void ATrafficSpawner::CacheDebugIntersectionData()
 	}
 
 	// Compute junction centroids.
+	// Prefer provider-supplied centroids (derived from mask data at actual
+	// intersection positions) over lane-endpoint averages (which can be
+	// far from the intersection for through-lanes spanning long roads).
 	for (const auto& Pair : JunctionLaneEndpoints)
 	{
-		FVector Sum = FVector::ZeroVector;
-		for (const FVector& P : Pair.Value) { Sum += P; }
-		const FVector Centroid = Sum / static_cast<float>(Pair.Value.Num());
-
 		FDebugJunctionData JD;
-		JD.Centroid = Centroid;
 		JD.JunctionId = Pair.Key;
+
+		FVector ProviderCentroid;
+		if (Provider->GetJunctionCentroid(Pair.Key, ProviderCentroid))
+		{
+			JD.Centroid = ProviderCentroid;
+		}
+		else
+		{
+			// Fallback: average of participating lane endpoints.
+			FVector Sum = FVector::ZeroVector;
+			for (const FVector& P : Pair.Value) { Sum += P; }
+			JD.Centroid = Sum / static_cast<float>(Pair.Value.Num());
+		}
+
 		DebugJunctions.Add(JD);
 	}
 
