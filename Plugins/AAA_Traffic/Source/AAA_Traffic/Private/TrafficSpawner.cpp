@@ -455,8 +455,8 @@ void ATrafficSpawner::DrawDebugLanes() const
 	if (!World) { return; }
 
 	// Green = forward lanes, Magenta = reverse lanes.
-	// Raised 50 cm above road so lines are clearly visible and not lost in the mesh.
-	static constexpr float ZLift = 50.0f;
+	// Raised above road so lines are clearly visible and not lost in the mesh.
+	static constexpr float ZLift = 50.0f; // cm above road surface
 
 	for (const FDebugLaneData& Lane : DebugLanes)
 	{
@@ -570,9 +570,21 @@ void ATrafficSpawner::CacheDebugIntersectionData()
 		else
 		{
 			// Fallback: average of participating lane endpoints.
-			FVector Sum = FVector::ZeroVector;
-			for (const FVector& P : Pair.Value) { Sum += P; }
-			JD.Centroid = Sum / static_cast<float>(Pair.Value.Num());
+			const int32 NumEndpoints = Pair.Value.Num();
+			if (NumEndpoints > 0)
+			{
+				FVector Sum = FVector::ZeroVector;
+				for (const FVector& P : Pair.Value) { Sum += P; }
+				JD.Centroid = Sum / static_cast<float>(NumEndpoints);
+			}
+			else
+			{
+				// No valid endpoints for this junction; skip to avoid division by zero.
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("TrafficSpawner: Junction %d has no valid lane endpoints; skipping debug centroid."),
+					JD.JunctionId);
+				continue;
+			}
 		}
 
 		DebugJunctions.Add(JD);
@@ -591,7 +603,7 @@ void ATrafficSpawner::DrawDebugIntersections() const
 	UWorld* World = GetWorld();
 	if (!World) { return; }
 
-	static constexpr float ZLift = 55.0f; // Slightly above lane lines (50cm).
+	static constexpr float ZLift = 55.0f; // cm above road surface (5cm above lane debug lines to prevent z-fighting)
 
 	// ── Lane endpoint markers: blue=start, red=end ──
 	for (const FDebugEndpointData& EP : DebugEndpoints)

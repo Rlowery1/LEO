@@ -89,6 +89,10 @@ private:
 	/** Diagnostic: dump all RoadNetworkCorner data to the log so we can see what RoadBLD actually provides. */
 	void DumpCornerDiagnostics(UWorld* World);
 
+	/** Trigger RoadBLD incremental rebuild and dump diagnostic arrays (pre/post).
+	 *  Separated from BuildLaneConnectivity to keep connectivity logic focused. */
+	void TriggerRoadBLDRebuildAndDiagnostics(UWorld* World, AActor* NetworkActor);
+
 	// ── Reflection helpers ──────────────────────────────────
 
 	/**
