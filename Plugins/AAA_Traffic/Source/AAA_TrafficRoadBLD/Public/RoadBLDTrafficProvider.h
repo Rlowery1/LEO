@@ -69,6 +69,9 @@ private:
 	/** Group connected lane endpoints into junction clusters and assign junction IDs. */
 	void BuildJunctionGrouping();
 
+	/** Run connectivity invariants + summary diagnostics (gated by traffic.Diagnostics* CVars). */
+	void RunConnectivityDiagnostics(const TCHAR* PhaseTag) const;
+
 	/** Detect left/right neighbor lanes on the same road via shared edge curves. */
 	void BuildLaneAdjacency();
 

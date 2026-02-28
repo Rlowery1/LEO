@@ -141,6 +141,12 @@ private:
 	 */
 	void AbortLaneChange();
 
+	/** Append one lane-decision trace record into the bounded diagnostics ring buffer. */
+	void AddLaneDecisionTrace(const TCHAR* EventName, int32 CandidateLane, float MetricA, float MetricB, const FString& Detail = FString());
+
+	/** Flush the current decision trace buffer to log with a reason label, then clear it. */
+	void FlushLaneDecisionTrace(const TCHAR* Reason, bool bAsWarning);
+
 	// ----- State -----
 
 	/** Handle to the lane currently being followed. */
@@ -216,6 +222,24 @@ private:
 
 	/** Base target speed before lane speed-limit adjustments. */
 	float BaseTargetSpeed;
+
+	/** Single lane-decision trace record for forensic debugging. */
+	struct FLaneDecisionTrace
+	{
+		double WorldTimeSeconds = 0.0;
+		FString EventName;
+		int32 CurrentLaneId = 0;
+		int32 CandidateLaneId = 0;
+		float MetricA = 0.0f;
+		float MetricB = 0.0f;
+		FString Detail;
+	};
+
+	/** Bounded decision trace buffer (ring behavior by removing oldest). */
+	TArray<FLaneDecisionTrace> LaneDecisionTraceBuffer;
+
+	/** Effective max entries for LaneDecisionTraceBuffer (read from CVar). */
+	int32 LaneDecisionTraceMaxEntries = 256;
 
 protected:
 	// ----- Tuning -----

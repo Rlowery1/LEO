@@ -76,6 +76,9 @@ private:
 	/** Group connected lane endpoints into junction clusters and assign junction IDs. */
 	void BuildJunctionGrouping();
 
+	/** Run connectivity invariants + summary diagnostics (gated by traffic.Diagnostics* CVars). */
+	void RunConnectivityDiagnostics(const TCHAR* PhaseTag) const;
+
 	/** Read IntersectionMasks from RoadBLD, group them into physical intersections,
 	 *  and store results so BuildJunctionGrouping can assign correct junction IDs. */
 	void BuildMaskBasedIntersections(UWorld* World);

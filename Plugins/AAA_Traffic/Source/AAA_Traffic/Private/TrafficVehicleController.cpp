@@ -8,6 +8,53 @@
 #include "GameFramework/Pawn.h"
 #include "Engine/World.h"
 #include "DrawDebugHelpers.h"
+#include "PhysicsEngine/BodyInstance.h"
+#include "PhysicsProxy/SingleParticlePhysicsProxy.h"  // Chaos::ESleepType::NeverSleep
+#include "HAL/IConsoleManager.h"
+#include "UObject/UnrealType.h"                        // FBoolProperty for BP reflection
+
+static int32 GTrafficVehicleDecisionTrace = 0;
+static FAutoConsoleVariableRef CVarTrafficVehicleDecisionTrace(
+	TEXT("traffic.VehicleDecisionTrace"),
+	GTrafficVehicleDecisionTrace,
+	TEXT("Vehicle decision tracing: 0=off, 1=trace lane transitions/lane changes and flush on failures, 2=verbose per-candidate traces."),
+	ECVF_Default);
+
+static int32 GTrafficVehicleDecisionTraceMax = 256;
+static FAutoConsoleVariableRef CVarTrafficVehicleDecisionTraceMax(
+	TEXT("traffic.VehicleDecisionTraceMax"),
+	GTrafficVehicleDecisionTraceMax,
+	TEXT("Max decision-trace entries held per vehicle before oldest records are evicted."),
+	ECVF_Default);
+
+static bool GTrafficVehicleTraceFlushOnSuccess = false;
+static FAutoConsoleVariableRef CVarTrafficVehicleTraceFlushOnSuccess(
+	TEXT("traffic.VehicleTraceFlushOnSuccess"),
+	GTrafficVehicleTraceFlushOnSuccess,
+	TEXT("Flush lane decision trace buffer on successful transitions/lane changes (default false)."),
+	ECVF_Default);
+
+static float GTrafficWakeGuardMinThrottle = 0.20f;
+static FAutoConsoleVariableRef CVarTrafficWakeGuardMinThrottle(
+	TEXT("traffic.WakeGuardMinThrottle"),
+	GTrafficWakeGuardMinThrottle,
+	TEXT("Minimum throttle request to trigger anti-sleep wake guard."),
+	ECVF_Default);
+
+static float GTrafficWakeGuardMaxSpeed = 120.0f;
+static FAutoConsoleVariableRef CVarTrafficWakeGuardMaxSpeed(
+	TEXT("traffic.WakeGuardMaxSpeed"),
+	GTrafficWakeGuardMaxSpeed,
+	TEXT("Maximum absolute speed (cm/s) where anti-sleep wake guard is allowed to trigger."),
+	ECVF_Default);
+
+namespace
+{
+	static bool IsVehicleTraceEnabled(const int32 RequiredLevel)
+	{
+		return GTrafficVehicleDecisionTrace >= RequiredLevel;
+	}
+}
 
 ATrafficVehicleController::ATrafficVehicleController()
 	: LaneWidth(0.f)
@@ -109,9 +156,17 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 	if (Provider->GetLanePath(CurrentLane, LanePoints, LaneWidth) && LanePoints.Num() >= 2)
 	{
 		bLaneDataReady = true;
+
+		// Compute total lane length for diagnostics.
+		float TotalLaneLength = 0.0f;
+		for (int32 i = 0; i < LanePoints.Num() - 1; ++i)
+		{
+			TotalLaneLength += FVector::Dist(LanePoints[i], LanePoints[i + 1]);
+		}
+
 		UE_LOG(LogAAATraffic, Log,
-			TEXT("TrafficVehicleController: Lane loaded — %d points, width %.1f cm."),
-			LanePoints.Num(), LaneWidth);
+			TEXT("TrafficVehicleController: Lane loaded — %d points, width %.1f cm, length %.1f cm (%.1f m)."),
+			LanePoints.Num(), LaneWidth, TotalLaneLength, TotalLaneLength / 100.0f);
 
 		// Query lane speed limit from the provider.
 		const float LaneSpeedLimit = Provider->GetLaneSpeedLimit(CurrentLane);
@@ -147,6 +202,180 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 	Super::OnPossess(InPawn);
 	RandomStream.Initialize(RandomSeed);
 
+	// --- Diagnostic: log pawn class and movement component details ---
+	if (InPawn)
+	{
+		const FString PawnClass = InPawn->GetClass()->GetName();
+		UPawnMovementComponent* GenericMC = InPawn->GetMovementComponent();
+		const FString MCClass = GenericMC ? GenericMC->GetClass()->GetName() : TEXT("NULL");
+
+		UChaosWheeledVehicleMovementComponent* ChaosMC =
+			Cast<UChaosWheeledVehicleMovementComponent>(GenericMC);
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("VehicleController::OnPossess: Pawn='%s' Class='%s' MovementComponent='%s' ChaosWheeledCast=%s"),
+			*InPawn->GetName(), *PawnClass, *MCClass,
+			ChaosMC ? TEXT("OK") : TEXT("FAILED — vehicles will NOT move"));
+
+		if (!ChaosMC)
+		{
+			UE_LOG(LogAAATraffic, Error,
+				TEXT("VehicleController::OnPossess: CRITICAL — Pawn '%s' (class '%s') does not have a UChaosWheeledVehicleMovementComponent. "
+					 "GetMovementComponent() returned '%s'. The vehicle controller requires ChaosWheeledVehicleMovementComponent to set throttle/steering/brake. "
+					 "Ensure the vehicle Blueprint inherits from AWheeledVehiclePawn or has this component added."),
+				*InPawn->GetName(), *PawnClass, *MCClass);
+
+			// List all components on the pawn for further diagnosis.
+			TArray<UActorComponent*> AllComps;
+			InPawn->GetComponents(AllComps);
+			for (const UActorComponent* Comp : AllComps)
+			{
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("  Component: '%s' Class='%s'"),
+					*Comp->GetName(), *Comp->GetClass()->GetName());
+			}
+		}
+		else
+		{
+			// --- Ensure Chaos vehicle is in a drivable state ---
+			// Marketplace Blueprints often default to parked/sleeping/handbrake-on.
+			// Explicitly wake and unpark the vehicle so throttle input takes effect.
+			ChaosMC->SetParked(false);
+			ChaosMC->SetSleeping(false);
+			ChaosMC->SetHandbrakeInput(false);
+			ChaosMC->SetTargetGear(1, /*bImmediate=*/ true);
+			ChaosMC->SetUseAutomaticGears(true);
+
+			// --- Prevent ProcessSleeping from re-sleeping the physics body ---
+			// PROVEN by diagnostic: BodyAwake=NO at T=2s despite per-tick
+			// SetSleeping(false). The engine's ProcessSleeping uses a speed-
+			// based sleep threshold (default 10 cm/s) and an interpolated
+			// ThrottleInput (gated by bRequiresControllerForInputs). Two
+			// belt-and-suspenders fixes:
+			//
+			// 1) SetRequiresControllerForInputs(false): ensures ThrottleInput
+			//    interpolation always runs in UpdateState regardless of
+			//    controller type, so ProcessSleeping sees throttle > wake
+			//    tolerance and keeps the body awake.
+			//
+			// 2) SleepThreshold = 0: the speed-based sleep path requires
+			//    speed² < threshold². With threshold=0 this is never true,
+			//    so ProcessSleeping's sleep counter never increments even if
+			//    the vehicle is momentarily stationary.
+			ChaosMC->SetRequiresControllerForInputs(false);
+			ChaosMC->SleepThreshold = 0.0f;
+
+			// --- Prevent Chaos solver from putting the physics body to sleep ---
+			// PROVEN through 3 test runs: GT-level sleep prevention (SleepThreshold,
+			// RequiresControllerForInputs, per-tick SetSleeping) all failed because
+			// the Chaos physics solver independently sleeps rigid bodies based on
+			// kinetic energy via the Island Manager. The Island Manager only skips
+			// sleep for particles where SleepType == NeverSleep.
+			if (UPrimitiveComponent* Prim = ChaosMC->UpdatedPrimitive)
+			{
+				if (FBodyInstance* BI = Prim->GetBodyInstance())
+				{
+					FPhysicsActorHandle PhysHandle = BI->GetPhysicsActorHandle();
+					if (PhysHandle)
+					{
+						PhysHandle->GetGameThreadAPI().SetSleepType(Chaos::ESleepType::NeverSleep);
+						UE_LOG(LogAAATraffic, Log,
+							TEXT("VehicleController::OnPossess: Set Chaos ESleepType::NeverSleep on '%s'"),
+							*InPawn->GetName());
+					}
+				}
+			}
+
+			// --- Neutralize the handbrake/parking brake torque per wheel ---
+			// The Chaos physics sim applies HandbrakeTorque on any rear wheel
+			// with HandbrakeEnabled whenever EITHER the handbrake input is
+			// nonzero OR ParkingEnabled is true (SetParked). Marketplace
+			// Blueprints can re-assert parking/handbrake state via their own
+			// Tick or EventGraph, overriding our SetParked(false) call above.
+			//
+			// Rather than fighting per-frame to clear that state, we zero out
+			// the HandbrakeTorque magnitude on every wheel. This is a one-time
+			// config change: 0 torque * any input = 0 force. Our AI never
+			// uses the handbrake; we use SetBrakeInput() for all deceleration.
+			const int32 NumWheels = ChaosMC->WheelSetups.Num();
+			for (int32 WIdx = 0; WIdx < NumWheels; ++WIdx)
+			{
+				ChaosMC->SetWheelHandbrakeTorque(WIdx, 0.0f);
+			}
+
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("VehicleController::OnPossess: Vehicle '%s' initialized — "
+					 "Parked=false, Sleeping=false, Handbrake=false, Gear=1, AutoGears=true, "
+					 "HandbrakeTorque zeroed on %d wheels, "
+					 "RequiresControllerForInputs=false, SleepThreshold=0"),
+				*InPawn->GetName(), NumWheels);
+		}
+
+		// --- Neutralize marketplace BP physics-optimization parking ---
+		// PROVEN ROOT CAUSE: The parent vehicle Blueprint (DD_Vehicles_Advanced)
+		// runs "Physics optimization" every tick via EventTick → Sequence Then 0.
+		// Entry gate: (Base Vehicle Initialized AND Optimized AND GameTime > BeginPlayMargin)
+		// Once this gate opens (~2s), the Optimization Unpossessed block detects
+		// that the vehicle has no PlayerController (only our AIController), treats
+		// it as "unpossessed", and calls CE_StopCar → CE Set Parked (Parked=true),
+		// killing the drivetrain every frame.
+		//
+		// Fix: use UE reflection to set the BP's "Optimized" variable to false.
+		// This disables the entry gate, preventing the entire parking chain from
+		// ever firing. All other parent EventTick behavior (engine sound, wheel
+		// effects, smoke VFX, crash impacts, lights) continues unaffected because
+		// those are on Sequence Then 1-4, which do not check 'Optimized'.
+		//
+		// Also set "Can Sleep" to false as a secondary safety net — this is the
+		// inner gate checked by CE_CheckVehicleSleep before evaluating wake/sleep.
+		{
+			UClass* VehicleBPClass = InPawn->GetClass();
+			int32 PropertiesNeutralized = 0;
+
+			// Disable the 'Optimized' gate (prevents Physics optimization from running).
+			if (FBoolProperty* OptimizedProp = FindFProperty<FBoolProperty>(VehicleBPClass, TEXT("Optimized")))
+			{
+				OptimizedProp->SetPropertyValue_InContainer(InPawn, false);
+				++PropertiesNeutralized;
+			}
+
+			// Disable the 'Can Sleep' inner gate (prevents CE_CheckVehicleSleep from
+			// evaluating wake/sleep even if the Optimized gate is bypassed).
+			if (FBoolProperty* CanSleepProp = FindFProperty<FBoolProperty>(VehicleBPClass, TEXT("Can Sleep")))
+			{
+				CanSleepProp->SetPropertyValue_InContainer(InPawn, false);
+				++PropertiesNeutralized;
+			}
+
+			if (PropertiesNeutralized > 0)
+			{
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("VehicleController::OnPossess: Neutralized %d BP optimization properties on '%s' "
+						 "(Optimized=false, CanSleep=false) — parent BP parking chain disabled."),
+					PropertiesNeutralized, *InPawn->GetName());
+			}
+			else
+			{
+				// Property names may differ across marketplace pack versions. Log all
+				// boolean properties so the developer can identify the correct FName.
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("VehicleController::OnPossess: Could not find 'Optimized' or 'Can Sleep' "
+						 "boolean properties on '%s' (class '%s'). The parent BP may still park this vehicle. "
+						 "Listing all boolean properties for diagnosis:"),
+					*InPawn->GetName(), *VehicleBPClass->GetName());
+
+				for (TFieldIterator<FBoolProperty> It(VehicleBPClass); It; ++It)
+				{
+					UE_LOG(LogAAATraffic, Warning, TEXT("  Bool property: '%s'"), *It->GetName());
+				}
+			}
+		}
+	}
+	else
+	{
+		UE_LOG(LogAAATraffic, Error, TEXT("VehicleController::OnPossess: InPawn is NULL."));
+	}
+
 	if (UWorld* World = GetWorld())
 	{
 		if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
@@ -178,8 +407,252 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
+	// --- Delayed movement diagnostic: after 2 seconds, check if vehicle moved ---
+	if (!bDiagLoggedMovementCheck && GetPawn())
+	{
+		if (DiagSpawnLocation.IsZero())
+		{
+			DiagSpawnLocation = GetPawn()->GetActorLocation();
+		}
+		DiagElapsedTime += DeltaSeconds;
+		if (DiagElapsedTime >= 2.0f)
+		{
+			bDiagLoggedMovementCheck = true;
+			const FVector CurrentLoc = GetPawn()->GetActorLocation();
+			const float DistMoved = FVector::Dist(DiagSpawnLocation, CurrentLoc);
+			UChaosWheeledVehicleMovementComponent* DiagMC =
+				Cast<UChaosWheeledVehicleMovementComponent>(GetPawn()->GetMovementComponent());
+			const float FwdSpeed = DiagMC ? DiagMC->GetForwardSpeed() : 0.0f;
+
+			// Deep physics state diagnostic.
+			if (DiagMC)
+			{
+				const float EngineRPM = DiagMC->GetEngineRotationSpeed();
+				const int32 CurGear = DiagMC->GetCurrentGear();
+				const int32 TgtGear = DiagMC->GetTargetGear();
+				const bool bMechSim = DiagMC->bMechanicalSimEnabled;
+				const int32 NumWheels = DiagMC->WheelSetups.Num();
+				const int32 NumWheelInstances = DiagMC->Wheels.Num();
+				const bool bHasOutput = (DiagMC->PhysicsVehicleOutput().Get() != nullptr);
+				const bool bCompActive = DiagMC->IsActive();
+				const bool bCompRegistered = DiagMC->IsRegistered();
+
+				// Check physics body simulation state.
+				UPrimitiveComponent* UpdatedPrim = DiagMC->UpdatedPrimitive;
+				bool bSimulatingPhysics = false;
+				bool bBodyAwake = false;
+				if (UpdatedPrim)
+				{
+					bSimulatingPhysics = UpdatedPrim->IsSimulatingPhysics();
+					FBodyInstance* BI = UpdatedPrim->GetBodyInstance();
+					bBodyAwake = BI ? BI->IsInstanceAwake() : false;
+				}
+
+				// Query internal Chaos vehicle input state (what physics sim actually sees)
+				const bool bIsParked = DiagMC->IsParked();
+				const bool bRawHandbrake = DiagMC->GetHandbrakeInput();
+				// Get the interpolated handbrake value that feeds physics
+				// HandbrakeInput is a protected float member, but GetHandbrakeInput()
+				// returns the raw bool. We can't read the interpolated value directly,
+				// so we check GetParkedState and the raw bool.
+
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("DEEP DIAG (2s): Pawn='%s' DistFromSpawn=%.1f FwdSpeed=%.1f "
+						 "EngineRPM=%.0f Gear=%d/%d bMechSimEnabled=%s "
+						 "WheelSetups=%d WheelInstances=%d bHasPhysOutput=%s "
+						 "CompActive=%s CompRegistered=%s "
+						 "SimulatingPhysics=%s BodyAwake=%s "
+						 "bParked=%s bRawHandbrake=%s %s"),
+					*GetPawn()->GetName(), DistMoved, FwdSpeed,
+					EngineRPM, CurGear, TgtGear,
+					bMechSim ? TEXT("true") : TEXT("FALSE"),
+					NumWheels, NumWheelInstances,
+					bHasOutput ? TEXT("true") : TEXT("FALSE"),
+					bCompActive ? TEXT("true") : TEXT("FALSE"),
+					bCompRegistered ? TEXT("true") : TEXT("FALSE"),
+					bSimulatingPhysics ? TEXT("true") : TEXT("FALSE"),
+					bBodyAwake ? TEXT("true") : TEXT("FALSE"),
+					bIsParked ? TEXT("PARKED") : TEXT("unparked"),
+					bRawHandbrake ? TEXT("HANDBRAKE-ON") : TEXT("handbrake-off"),
+					(DistMoved > 100.0f) ? TEXT("DRIVING OK") : TEXT("NOT DRIVING"));
+
+				// Per-wheel diagnostics — are wheels touching the ground?
+				for (int32 WIdx = 0; WIdx < NumWheelInstances; ++WIdx)
+				{
+					const FWheelStatus& WS = DiagMC->GetWheelState(WIdx);
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("  WHEEL %d: InContact=%s DriveTorque=%.1f BrakeTorque=%.1f "
+							 "SlipAngle=%.2f NormSuspLen=%.2f SpringForce=%.1f"),
+						WIdx,
+						WS.bInContact ? TEXT("YES") : TEXT("NO"),
+						WS.DriveTorque, WS.BrakeTorque,
+						WS.SlipAngle,
+						WS.NormalizedSuspensionLength, WS.SpringForce);
+				}
+			}
+			else
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("DEEP DIAG (2s): Pawn='%s' DistFromSpawn=%.1f — "
+						 "No ChaosWheeledVehicleMovementComponent"),
+					*GetPawn()->GetName(), DistMoved);
+			}
+		}
+	}
+
+	// --- Periodic diagnostic: comprehensive vehicle state every 2 seconds ---
+	if (GetPawn() && bLaneDataReady)
+	{
+		DiagPeriodicTimer += DeltaSeconds;
+
+		UChaosWheeledVehicleMovementComponent* PeriodicMC =
+			Cast<UChaosWheeledVehicleMovementComponent>(GetPawn()->GetMovementComponent());
+		const float CurSpeed = PeriodicMC ? PeriodicMC->GetForwardSpeed() : 0.0f;
+
+		// --- STOPPED one-shot: fires the instant speed drops to 0 after moving ---
+		if (!bDiagWasMoving && FMath::Abs(CurSpeed) > 10.0f)
+		{
+			bDiagWasMoving = true;
+		}
+		if (bDiagWasMoving && !bDiagLoggedStopped && FMath::Abs(CurSpeed) < 1.0f)
+		{
+			bDiagLoggedStopped = true;
+
+			// Gather comprehensive state at the exact moment of stop.
+			bool bStopBodyAwake = false;
+			float StopRPM = 0.0f;
+			int32 StopGear = 0, StopTgtGear = 0;
+			float StopRawThrottle = 0.0f, StopRawBrake = 0.0f, StopRawSteering = 0.0f;
+			bool StopHandbrake = false, StopParked = false;
+			bool StopMechSim = false, StopAutoGears = false;
+			if (PeriodicMC)
+			{
+				StopRPM = PeriodicMC->GetEngineRotationSpeed();
+				StopGear = PeriodicMC->GetCurrentGear();
+				StopTgtGear = PeriodicMC->GetTargetGear();
+				StopRawThrottle = PeriodicMC->GetThrottleInput();
+				StopRawBrake = PeriodicMC->GetBrakeInput();
+				StopRawSteering = PeriodicMC->GetSteeringInput();
+				StopHandbrake = PeriodicMC->GetHandbrakeInput();
+				StopParked = PeriodicMC->IsParked();
+				StopMechSim = PeriodicMC->bMechanicalSimEnabled;
+				StopAutoGears = PeriodicMC->GetUseAutoGears();
+
+				UPrimitiveComponent* UpdPrim = PeriodicMC->UpdatedPrimitive;
+				if (UpdPrim)
+				{
+					FBodyInstance* BI = UpdPrim->GetBodyInstance();
+					bStopBodyAwake = BI ? BI->IsInstanceAwake() : false;
+				}
+			}
+
+			const FVector VehLoc = GetPawn()->GetActorLocation();
+			const int32 CIdx = FindClosestPointIndex(VehLoc);
+
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT(">>STOPPED<< Pawn='%s' at T=%.1fs | "
+					 "Speed=%.1f Loc=(%.0f,%.0f,%.0f) ClosestIdx=%d/%d DistTraveled=%.1f | "
+					 "BodyAwake=%s | "
+					 "Parked=%s Handbrake=%s MechSim=%s AutoGears=%s | "
+					 "RPM=%.0f Gear=%d/%d RawThrottle=%.2f RawBrake=%.2f RawSteering=%.2f | "
+					 "bAtDeadEnd=%s bWaitingAtIntersection=%s LaneChangeState=%d"),
+				*GetPawn()->GetName(), DiagElapsedTime,
+				CurSpeed, VehLoc.X, VehLoc.Y, VehLoc.Z,
+				CIdx, LanePoints.Num(), DistanceTraveledOnLane,
+				bStopBodyAwake ? TEXT("YES") : TEXT("NO"),
+				StopParked ? TEXT("YES") : TEXT("no"),
+				StopHandbrake ? TEXT("YES") : TEXT("no"),
+				StopMechSim ? TEXT("yes") : TEXT("NO"),
+				StopAutoGears ? TEXT("yes") : TEXT("NO"),
+				StopRPM, StopGear, StopTgtGear,
+				StopRawThrottle, StopRawBrake, StopRawSteering,
+				bAtDeadEnd ? TEXT("YES") : TEXT("no"),
+				bWaitingAtIntersection ? TEXT("YES") : TEXT("no"),
+				static_cast<int32>(LaneChangeState));
+
+			// Per-wheel state at stop
+			if (PeriodicMC)
+			{
+				for (int32 WIdx = 0; WIdx < PeriodicMC->Wheels.Num(); ++WIdx)
+				{
+					const FWheelStatus& WS = PeriodicMC->GetWheelState(WIdx);
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT(">>STOPPED<< %s WHEEL %d: InContact=%s DriveTorque=%.1f "
+							 "BrakeTorque=%.1f SlipAngle=%.2f SpringForce=%.1f"),
+						*GetPawn()->GetName(), WIdx,
+						WS.bInContact ? TEXT("YES") : TEXT("NO"),
+						WS.DriveTorque, WS.BrakeTorque,
+						WS.SlipAngle, WS.SpringForce);
+				}
+			}
+		}
+
+		// --- Periodic log every DiagPeriodicInterval seconds ---
+		if (DiagPeriodicTimer >= DiagPeriodicInterval)
+		{
+			DiagPeriodicTimer -= DiagPeriodicInterval;
+
+			const FVector VehLoc = GetPawn()->GetActorLocation();
+			const int32 CIdx = FindClosestPointIndex(VehLoc);
+			const float RemDist = GetRemainingDistance(CIdx);
+			const float ThrshVal = FMath::Max(LookAheadDistance, FMath::Abs(CurSpeed) * 1.0f);
+
+			bool bBodyAwake = false;
+			float DiagRPM = 0.0f;
+			int32 DiagGear = 0, DiagTgtGear = 0;
+			float DiagThrottle = 0.0f, DiagBrake = 0.0f, DiagSteering = 0.0f;
+			bool bDiagParked = false, bDiagHandbrake = false;
+			if (PeriodicMC)
+			{
+				DiagRPM = PeriodicMC->GetEngineRotationSpeed();
+				DiagGear = PeriodicMC->GetCurrentGear();
+				DiagTgtGear = PeriodicMC->GetTargetGear();
+				DiagThrottle = PeriodicMC->GetThrottleInput();
+				DiagBrake = PeriodicMC->GetBrakeInput();
+				DiagSteering = PeriodicMC->GetSteeringInput();
+				bDiagParked = PeriodicMC->IsParked();
+				bDiagHandbrake = PeriodicMC->GetHandbrakeInput();
+
+				UPrimitiveComponent* UpdPrim = PeriodicMC->UpdatedPrimitive;
+				if (UpdPrim)
+				{
+					FBodyInstance* BI = UpdPrim->GetBodyInstance();
+					bBodyAwake = BI ? BI->IsInstanceAwake() : false;
+				}
+			}
+
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("LANE PROGRESS: Pawn='%s' Speed=%.1f ClosestIdx=%d/%d "
+					 "RemainDist=%.1f DistTraveled=%.1f Threshold=%.1f "
+					 "bAtDeadEnd=%s bWaitingAtIntersection=%s | "
+					 "BodyAwake=%s "
+					 "Parked=%s Handbrake=%s "
+					 "RPM=%.0f Gear=%d/%d Throttle=%.2f Brake=%.2f Steering=%.2f"),
+				*GetPawn()->GetName(), CurSpeed,
+				CIdx, LanePoints.Num(),
+				RemDist, DistanceTraveledOnLane, ThrshVal,
+				bAtDeadEnd ? TEXT("YES") : TEXT("no"),
+				bWaitingAtIntersection ? TEXT("YES") : TEXT("no"),
+				bBodyAwake ? TEXT("YES") : TEXT("NO"),
+				bDiagParked ? TEXT("YES") : TEXT("no"),
+				bDiagHandbrake ? TEXT("YES") : TEXT("no"),
+				DiagRPM, DiagGear, DiagTgtGear,
+				DiagThrottle, DiagBrake, DiagSteering);
+		}
+	}
+
 	if (!bLaneDataReady || !GetPawn())
 	{
+		// Log once per controller to help diagnose stuck vehicles.
+		if (!bDiagLoggedTickSkip)
+		{
+			bDiagLoggedTickSkip = true;
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("VehicleController::Tick: Skipping — bLaneDataReady=%s, Pawn=%s. "
+					 "Lane will not be followed until both are valid."),
+				bLaneDataReady ? TEXT("true") : TEXT("false"),
+				GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"));
+		}
 		return;
 	}
 
@@ -267,8 +740,32 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		Cast<UChaosWheeledVehicleMovementComponent>(ControlledPawn->GetMovementComponent());
 	if (!VehicleMovement)
 	{
+		// Log once per controller to avoid spam.
+		if (!bDiagLoggedNoMovement)
+		{
+			bDiagLoggedNoMovement = true;
+			UPawnMovementComponent* GenericMC = ControlledPawn->GetMovementComponent();
+			UE_LOG(LogAAATraffic, Error,
+				TEXT("VehicleController::UpdateVehicleInput: ChaosWheeledVehicleMovementComponent cast FAILED for pawn '%s' (class '%s'). "
+					 "GetMovementComponent() returned: %s (class '%s'). Vehicle will be stuck. "
+					 "This pawn must have UChaosWheeledVehicleMovementComponent (inherits AWheeledVehiclePawn)."),
+				*ControlledPawn->GetName(),
+				*ControlledPawn->GetClass()->GetName(),
+				GenericMC ? *GenericMC->GetName() : TEXT("NULL"),
+				GenericMC ? *GenericMC->GetClass()->GetName() : TEXT("N/A"));
+		}
 		return;
 	}
+
+	// --- Safety net: force unpark + wake every tick ---
+	// PRIMARY FIX is in OnPossess: we set the parent BP's 'Optimized' variable
+	// to false via reflection, which disables the entire Physics optimization
+	// → Optimization Unpossessed → CE_StopCar → CE Set Parked(true) chain.
+	// These per-tick calls remain as a cheap safety net in case a future
+	// marketplace pack update re-introduces parking through a different path.
+	VehicleMovement->SetParked(false);
+	VehicleMovement->SetSleeping(false);   // calls WakeAllEnabledRigidBodies()
+	VehicleMovement->SetHandbrakeInput(false);
 
 	const FVector VehicleLocation = ControlledPawn->GetActorLocation();
 	const FVector VehicleForward = ControlledPawn->GetActorForwardVector();
@@ -612,9 +1109,49 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		ThrottleInput *= 0.5f;
 	}
 
+	if (ThrottleInput >= GTrafficWakeGuardMinThrottle
+		&& BrakeInput <= KINDA_SMALL_NUMBER
+		&& FMath::Abs(CurrentSpeed) <= GTrafficWakeGuardMaxSpeed)
+	{
+		VehicleMovement->SetParked(false);
+		VehicleMovement->SetSleeping(false);
+		VehicleMovement->SetHandbrakeInput(false);
+
+		if (UPrimitiveComponent* Prim = VehicleMovement->UpdatedPrimitive)
+		{
+			Prim->WakeAllRigidBodies();
+			if (FBodyInstance* BI = Prim->GetBodyInstance())
+			{
+				BI->WakeInstance();
+				FPhysicsActorHandle PhysHandle = BI->GetPhysicsActorHandle();
+				if (PhysHandle)
+				{
+					PhysHandle->GetGameThreadAPI().SetSleepType(Chaos::ESleepType::NeverSleep);
+				}
+			}
+		}
+	}
+
 	VehicleMovement->SetThrottleInput(ThrottleInput);
 	VehicleMovement->SetSteeringInput(SteeringInput);
 	VehicleMovement->SetBrakeInput(BrakeInput);
+
+	// --- Diagnostic: log first tick's driving values per vehicle ---
+	if (!bDiagLoggedFirstInput)
+	{
+		bDiagLoggedFirstInput = true;
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("VehicleController::UpdateVehicleInput FIRST TICK: Pawn='%s' "
+				 "TargetSpeed=%.1f EffectiveTarget=%.1f CurrentSpeed=%.1f "
+				 "Throttle=%.3f Steering=%.3f Brake=%.3f "
+				 "bAtDeadEnd=%s bWaitingAtIntersection=%s LanePoints=%d ClosestIdx=%d"),
+			*ControlledPawn->GetName(),
+			TargetSpeed, EffectiveTargetSpeed, CurrentSpeed,
+			ThrottleInput, SteeringInput, BrakeInput,
+			bAtDeadEnd ? TEXT("true") : TEXT("false"),
+			bWaitingAtIntersection ? TEXT("true") : TEXT("false"),
+			LanePoints.Num(), ClosestIndex);
+	}
 }
 
 int32 ATrafficVehicleController::FindClosestPointIndex(const FVector& VehicleLocation)
@@ -725,11 +1262,100 @@ float ATrafficVehicleController::GetRemainingDistance(int32 FromIndex) const
 	return Distance;
 }
 
+void ATrafficVehicleController::AddLaneDecisionTrace(const TCHAR* EventName, int32 CandidateLane, float MetricA, float MetricB, const FString& Detail)
+{
+	if (!IsVehicleTraceEnabled(1))
+	{
+		return;
+	}
+
+	LaneDecisionTraceMaxEntries = FMath::Max(32, GTrafficVehicleDecisionTraceMax);
+	while (LaneDecisionTraceBuffer.Num() >= LaneDecisionTraceMaxEntries)
+	{
+		LaneDecisionTraceBuffer.RemoveAt(0, 1, EAllowShrinking::No);
+	}
+
+	FLaneDecisionTrace Record;
+	if (const UWorld* World = GetWorld())
+	{
+		Record.WorldTimeSeconds = World->GetTimeSeconds();
+	}
+	Record.EventName = EventName;
+	Record.CurrentLaneId = CurrentLane.HandleId;
+	Record.CandidateLaneId = CandidateLane;
+	Record.MetricA = MetricA;
+	Record.MetricB = MetricB;
+	Record.Detail = Detail;
+
+	LaneDecisionTraceBuffer.Add(MoveTemp(Record));
+}
+
+void ATrafficVehicleController::FlushLaneDecisionTrace(const TCHAR* Reason, bool bAsWarning)
+{
+	if (!IsVehicleTraceEnabled(1) || LaneDecisionTraceBuffer.Num() == 0)
+	{
+		return;
+	}
+
+	if (bAsWarning)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("TrafficVehicleController: DecisionTraceFlush Reason=%s Entries=%d Pawn=%s CurrentLane=%d"),
+			Reason,
+			LaneDecisionTraceBuffer.Num(),
+			GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+			CurrentLane.HandleId);
+	}
+	else
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("TrafficVehicleController: DecisionTraceFlush Reason=%s Entries=%d Pawn=%s CurrentLane=%d"),
+			Reason,
+			LaneDecisionTraceBuffer.Num(),
+			GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+			CurrentLane.HandleId);
+	}
+
+	for (const FLaneDecisionTrace& Record : LaneDecisionTraceBuffer)
+	{
+		if (bAsWarning)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("  [%.2f] Event=%s Cur=%d Cand=%d A=%.3f B=%.3f Detail=%s"),
+				Record.WorldTimeSeconds,
+				*Record.EventName,
+				Record.CurrentLaneId,
+				Record.CandidateLaneId,
+				Record.MetricA,
+				Record.MetricB,
+				Record.Detail.IsEmpty() ? TEXT("-") : *Record.Detail);
+		}
+		else
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("  [%.2f] Event=%s Cur=%d Cand=%d A=%.3f B=%.3f Detail=%s"),
+				Record.WorldTimeSeconds,
+				*Record.EventName,
+				Record.CurrentLaneId,
+				Record.CandidateLaneId,
+				Record.MetricA,
+				Record.MetricB,
+				Record.Detail.IsEmpty() ? TEXT("-") : *Record.Detail);
+		}
+	}
+
+	LaneDecisionTraceBuffer.Reset();
+}
+
 void ATrafficVehicleController::CheckLaneTransition()
 {
+	AddLaneDecisionTrace(TEXT("TransitionCheck.Start"), 0, static_cast<float>(CurrentLane.HandleId), 0.0f, TEXT("Entering lane-end transition check"));
+
 	if (!CachedProvider)
 	{
 		bAtDeadEnd = true;
+		AddLaneDecisionTrace(TEXT("TransitionCheck.NoProvider"), 0, 0.0f, 0.0f, TEXT("No cached provider"));
+		FlushLaneDecisionTrace(TEXT("NoProviderDeadEnd"), true);
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("TrafficVehicleController: No provider cached — dead end on lane %d."),
 			CurrentLane.HandleId);
@@ -737,9 +1363,12 @@ void ATrafficVehicleController::CheckLaneTransition()
 	}
 
 	TArray<FTrafficLaneHandle> Connected = CachedProvider->GetConnectedLanes(CurrentLane);
+	AddLaneDecisionTrace(TEXT("TransitionCheck.ConnectedFetched"), 0, static_cast<float>(Connected.Num()), 0.0f, TEXT("Fetched connected lanes"));
 	if (Connected.IsEmpty())
 	{
 		bAtDeadEnd = true;
+		AddLaneDecisionTrace(TEXT("TransitionCheck.NoConnected"), 0, 0.0f, 0.0f, TEXT("No connected lanes"));
+		FlushLaneDecisionTrace(TEXT("NoConnectedDeadEnd"), true);
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("TrafficVehicleController: No connected lanes from lane %d — dead end."),
 			CurrentLane.HandleId);
@@ -768,6 +1397,15 @@ void ATrafficVehicleController::CheckLaneTransition()
 		const float W = FMath::Max(Dot + 1.0f, 0.01f);
 		Weights.Add(W);
 		TotalWeight += W;
+		if (IsVehicleTraceEnabled(2))
+		{
+			AddLaneDecisionTrace(
+				TEXT("TransitionCheck.CandidateWeight"),
+				Candidate.HandleId,
+				Dot,
+				W,
+				FString::Printf(TEXT("CandidateDir=(%.3f,%.3f,%.3f)"), CandDir.X, CandDir.Y, CandDir.Z));
+		}
 	}
 
 	// Pick via CDF with the seeded random stream.
@@ -785,6 +1423,12 @@ void ATrafficVehicleController::CheckLaneTransition()
 	}
 
 	const FTrafficLaneHandle NextLane = Connected[LaneIndex];
+	AddLaneDecisionTrace(
+		TEXT("TransitionCheck.SelectedNextLane"),
+		NextLane.HandleId,
+		Roll,
+		TotalWeight,
+		FString::Printf(TEXT("LaneIndex=%d CandidateCount=%d"), LaneIndex, Connected.Num()));
 
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("TrafficVehicleController: Transitioning from lane %d to lane %d (%d candidates)."),
@@ -812,10 +1456,18 @@ void ATrafficVehicleController::CheckLaneTransition()
 	if (!bLaneDataReady)
 	{
 		bAtDeadEnd = true;
+		AddLaneDecisionTrace(TEXT("TransitionCheck.InitializeFailed"), NextLane.HandleId, 0.0f, 0.0f, TEXT("InitializeLaneFollowing failed"));
+		FlushLaneDecisionTrace(TEXT("TransitionInitializeFailed"), true);
 		UE_LOG(LogAAATraffic, Warning,
 			TEXT("TrafficVehicleController: Failed to initialize lane following for lane %d from lane %d — treating as dead end."),
 			NextLane.HandleId, CurrentLane.HandleId);
 		return;
+	}
+
+	AddLaneDecisionTrace(TEXT("TransitionCheck.InitializeSucceeded"), NextLane.HandleId, static_cast<float>(LanePoints.Num()), 0.0f, TEXT("Lane initialized"));
+	if (GTrafficVehicleTraceFlushOnSuccess)
+	{
+		FlushLaneDecisionTrace(TEXT("TransitionSuccess"), false);
 	}
 
 	// Generate junction transition points.
@@ -864,6 +1516,7 @@ void ATrafficVehicleController::CheckLaneTransition()
 void ATrafficVehicleController::EvaluateLaneChange()
 {
 	if (!CachedProvider || !bLaneDataReady) { return; }
+	AddLaneDecisionTrace(TEXT("LaneChange.EvaluateStart"), 0, static_cast<float>(CurrentLane.HandleId), 0.0f, TEXT("Lane-change evaluation"));
 
 	const APawn* ControlledPawn = GetPawn();
 	if (!ControlledPawn) { return; }
@@ -878,6 +1531,10 @@ void ATrafficVehicleController::EvaluateLaneChange()
 	// Only consider lane change if we're significantly slower than desired.
 	if (CurrentSpeed / EffectiveTarget >= LaneChangeSpeedThreshold)
 	{
+		if (IsVehicleTraceEnabled(2))
+		{
+			AddLaneDecisionTrace(TEXT("LaneChange.RejectSpeedRatio"), 0, CurrentSpeed / EffectiveTarget, LaneChangeSpeedThreshold, TEXT("Not slow enough"));
+		}
 		return;
 	}
 
@@ -886,6 +1543,10 @@ void ATrafficVehicleController::EvaluateLaneChange()
 	const float LeaderDist = GetLeaderDistance(LeaderSpeed);
 	if (LeaderDist < 0.0f || LeaderDist > DetectionDistance * 0.75f)
 	{
+		if (IsVehicleTraceEnabled(2))
+		{
+			AddLaneDecisionTrace(TEXT("LaneChange.RejectLeaderDistance"), 0, LeaderDist, DetectionDistance * 0.75f, TEXT("No close slow leader"));
+		}
 		return; // No close leader — speed issue is not from congestion.
 	}
 
@@ -897,11 +1558,26 @@ void ATrafficVehicleController::EvaluateLaneChange()
 	for (ETrafficLaneSide Side : Sides)
 	{
 		FTrafficLaneHandle CandidateLane = CachedProvider->GetAdjacentLane(CurrentLane, Side);
-		if (!CandidateLane.IsValid()) { continue; }
+		if (!CandidateLane.IsValid())
+		{
+			if (IsVehicleTraceEnabled(2))
+			{
+				AddLaneDecisionTrace(TEXT("LaneChange.RejectNoAdjacent"), 0, Side == ETrafficLaneSide::Left ? -1.0f : 1.0f, 0.0f, TEXT("No adjacent lane"));
+			}
+			continue;
+		}
 
 		// Direction safety: only allow same-direction lanes (dot > 0).
 		const FVector CandidateDir = CachedProvider->GetLaneDirection(CandidateLane);
-		if (FVector::DotProduct(MyDirection, CandidateDir) <= 0.0f) { continue; }
+		const float DirDot = FVector::DotProduct(MyDirection, CandidateDir);
+		if (DirDot <= 0.0f)
+		{
+			if (IsVehicleTraceEnabled(2))
+			{
+				AddLaneDecisionTrace(TEXT("LaneChange.RejectDirection"), CandidateLane.HandleId, DirDot, 0.0f, TEXT("Opposite direction lane"));
+			}
+			continue;
+		}
 
 		// Gap check via per-lane registry (deterministic — no physics sweep).
 		UWorld* World = GetWorld();
@@ -924,6 +1600,10 @@ void ATrafficVehicleController::EvaluateLaneChange()
 			if (DistToNeighbor < LaneChangeGapRequired)
 			{
 				bGapClear = false;
+				if (IsVehicleTraceEnabled(2))
+				{
+					AddLaneDecisionTrace(TEXT("LaneChange.RejectGap"), CandidateLane.HandleId, DistToNeighbor, LaneChangeGapRequired, TEXT("Neighbor too close"));
+				}
 				break;
 			}
 		}
@@ -935,6 +1615,10 @@ void ATrafficVehicleController::EvaluateLaneChange()
 		float CandidateWidth;
 		if (!CachedProvider->GetLanePath(CandidateLane, CandidatePoints, CandidateWidth) || CandidatePoints.Num() < 2)
 		{
+			if (IsVehicleTraceEnabled(2))
+			{
+				AddLaneDecisionTrace(TEXT("LaneChange.RejectPath"), CandidateLane.HandleId, static_cast<float>(CandidatePoints.Num()), 2.0f, TEXT("Target lane path unavailable"));
+			}
 			continue;
 		}
 
@@ -948,7 +1632,13 @@ void ATrafficVehicleController::EvaluateLaneChange()
 			TEXT("TrafficVehicleController: Beginning lane change from lane %d to lane %d (%s)."),
 			CurrentLane.HandleId, CandidateLane.HandleId,
 			Side == ETrafficLaneSide::Left ? TEXT("left") : TEXT("right"));
+		AddLaneDecisionTrace(TEXT("LaneChange.Begin"), CandidateLane.HandleId, LeaderDist, CurrentSpeed, Side == ETrafficLaneSide::Left ? TEXT("Left") : TEXT("Right"));
 		return;
+	}
+
+	if (IsVehicleTraceEnabled(2))
+	{
+		AddLaneDecisionTrace(TEXT("LaneChange.NoCandidateAccepted"), 0, LeaderDist, CurrentSpeed, TEXT("All adjacent lanes rejected"));
 	}
 }
 
@@ -972,6 +1662,7 @@ FVector ATrafficVehicleController::UpdateLaneChangeBlend(const FVector& VehicleL
 				if (!NeighborPawn) continue;
 				if (FVector::Dist(VehicleLocation, NeighborPawn->GetActorLocation()) < AbortGapThreshold)
 				{
+					AddLaneDecisionTrace(TEXT("LaneChange.AbortUnsafeGap"), TargetLaneHandle.HandleId, FVector::Dist(VehicleLocation, NeighborPawn->GetActorLocation()), AbortGapThreshold, TEXT("Continuous merge check failed"));
 					AbortLaneChange();
 					// Return source lane point after aborting.
 					return GetLookAheadPoint(VehicleLocation, ClosestIndex);
@@ -1043,6 +1734,7 @@ FVector ATrafficVehicleController::UpdateLaneChangeBlend(const FVector& VehicleL
 
 void ATrafficVehicleController::FinalizeLaneChange()
 {
+	AddLaneDecisionTrace(TEXT("LaneChange.Finalize"), TargetLaneHandle.HandleId, LaneChangeProgress, LaneChangeCooldownTime, TEXT("Lane change finalized"));
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("TrafficVehicleController: Lane change complete — now on lane %d."),
 		TargetLaneHandle.HandleId);
@@ -1089,10 +1781,16 @@ void ATrafficVehicleController::FinalizeLaneChange()
 			TrafficSub->UpdateVehicleLane(this, CurrentLane);
 		}
 	}
+
+	if (GTrafficVehicleTraceFlushOnSuccess)
+	{
+		FlushLaneDecisionTrace(TEXT("LaneChangeSuccess"), false);
+	}
 }
 
 void ATrafficVehicleController::AbortLaneChange()
 {
+	AddLaneDecisionTrace(TEXT("LaneChange.Abort"), CurrentLane.HandleId, LaneChangeProgress, LaneChangeCooldownTime, TEXT("AbortLaneChange called"));
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("TrafficVehicleController: Lane change ABORTED (unsafe gap) — staying on lane %d."),
 		CurrentLane.HandleId);
@@ -1103,6 +1801,7 @@ void ATrafficVehicleController::AbortLaneChange()
 	LaneChangeProgress = 0.0f;
 	LaneChangeSettleTimer = 0.0f;
 	LaneChangeCooldownRemaining = LaneChangeCooldownTime;
+	FlushLaneDecisionTrace(TEXT("LaneChangeAbort"), true);
 }
 
 float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const

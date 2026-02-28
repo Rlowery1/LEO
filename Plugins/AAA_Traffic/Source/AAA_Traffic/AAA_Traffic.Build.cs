@@ -17,7 +17,8 @@ public class AAA_Traffic : ModuleRules
 				"InputCore",
 				"EnhancedInput",
 				"AIModule",
-				"ChaosVehicles"
+				"ChaosVehicles",
+				"Chaos"
 			}
 		);
 

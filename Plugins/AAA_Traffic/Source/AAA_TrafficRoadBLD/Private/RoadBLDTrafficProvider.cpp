@@ -13,6 +13,44 @@
 #include "RoadUtilityLibrary.h"
 #include "EngineUtils.h"         // TActorIterator
 #include "HAL/IConsoleManager.h" // IConsoleManager for CVar lookups
+#include "HAL/PlatformTime.h"
+#endif
+
+#if WITH_ROADBLD
+namespace
+{
+	static int32 GetTrafficDiagnosticsLevel()
+	{
+		if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("traffic.DiagnosticsLevel")))
+		{
+			return CVar->GetInt();
+		}
+		return 0;
+	}
+
+	static int32 GetTrafficDiagnosticsSampleLimit()
+	{
+		if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("traffic.DiagnosticsSampleLimit")))
+		{
+			return FMath::Max(1, CVar->GetInt());
+		}
+		return 24;
+	}
+
+	static bool GetTrafficDiagnosticsValidateGraph()
+	{
+		if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("traffic.DiagnosticsValidateGraph")))
+		{
+			return CVar->GetBool();
+		}
+		return false;
+	}
+
+	static bool ShouldLogDiagnosticsLevel(const int32 Level)
+	{
+		return GetTrafficDiagnosticsLevel() >= Level;
+	}
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -95,6 +133,28 @@ void URoadBLDTrafficProvider::OnWorldBeginPlay(UWorld& InWorld)
 void URoadBLDTrafficProvider::CacheRoadData()
 {
 	if (bCached) return;
+	const bool bDiagPhaseSummary = ShouldLogDiagnosticsLevel(1);
+
+	auto RunDiagPhase = [this, bDiagPhaseSummary](const TCHAR* PhaseName, TFunctionRef<void()> Fn)
+	{
+		const double StartSeconds = FPlatformTime::Seconds();
+		Fn();
+		if (bDiagPhaseSummary)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("RoadBLDTrafficProvider: Phase=%s Time=%.2f ms Roads=%d Lanes=%d LaneConnKeys=%d ProxConns=%d JunctionLanes=%d Junctions=%d VirtualLanes=%d ReplacedLanes=%d"),
+				PhaseName,
+				(FPlatformTime::Seconds() - StartSeconds) * 1000.0,
+				RoadHandleMap.Num(),
+				LaneHandleMap.Num(),
+				LaneConnectionMap.Num(),
+				ProximityConnectionList.Num(),
+				LaneToJunctionMap.Num(),
+				JunctionCentroids.Num(),
+				VirtualLaneMap.Num(),
+				ReplacedLaneHandles.Num());
+		}
+	};
 
 	UWorld* World = GetWorld();
 	if (!World) return;
@@ -147,13 +207,18 @@ void URoadBLDTrafficProvider::CacheRoadData()
 
 	// Phase ordering: detect reversed lanes and adjacency first (uses original lanes),
 	// then cache endpoints, split through-roads, build connectivity, group junctions.
-	DetectReversedLanes();
-	BuildLaneAdjacency();
-	CacheLaneEndpoints();
-	DetectAndSplitThroughRoads();
-	BuildLaneConnectivity();
-	BuildProximityConnections();
-	BuildJunctionGrouping();
+	RunDiagPhase(TEXT("DetectReversedLanes"), [&]() { DetectReversedLanes(); });
+	RunDiagPhase(TEXT("BuildLaneAdjacency"), [&]() { BuildLaneAdjacency(); });
+	RunDiagPhase(TEXT("CacheLaneEndpoints"), [&]() { CacheLaneEndpoints(); });
+	RunDiagPhase(TEXT("DetectAndSplitThroughRoads"), [&]() { DetectAndSplitThroughRoads(); });
+	RunDiagPhase(TEXT("BuildLaneConnectivity"), [&]() { BuildLaneConnectivity(); });
+	RunDiagPhase(TEXT("BuildProximityConnections"), [&]() { BuildProximityConnections(); });
+	RunDiagPhase(TEXT("BuildJunctionGrouping"), [&]() { BuildJunctionGrouping(); });
+
+	if (GetTrafficDiagnosticsValidateGraph() || ShouldLogDiagnosticsLevel(2))
+	{
+		RunConnectivityDiagnostics(TEXT("CacheRoadData"));
+	}
 }
 
 void URoadBLDTrafficProvider::BuildLaneConnectivity()
@@ -560,6 +625,19 @@ void URoadBLDTrafficProvider::BuildProximityConnections()
 	}
 
 	int32 ProximityLinks = 0;
+	int32 PairComparisons = 0;
+	int32 SkipSameRoad = 0;
+	int32 SkipDistance = 0;
+	int32 ForwardAccepted = 0;
+	int32 UTurnCandidates = 0;
+	int32 UTurnAccepted = 0;
+	int32 UTurnRejectedWidth = 0;
+	int32 DuplicateConnectionAttempts = 0;
+
+	TArray<FString> SampledRejects;
+	TArray<FString> SampledAccepts;
+	const bool bSampleDiagnostics = ShouldLogDiagnosticsLevel(3);
+	const int32 MaxSamples = GetTrafficDiagnosticsSampleLimit();
 
 	for (int32 i = 0; i < WorkingSet.Num(); ++i)
 	{
@@ -572,6 +650,7 @@ void URoadBLDTrafficProvider::BuildProximityConnections()
 		for (int32 j = 0; j < WorkingSet.Num(); ++j)
 		{
 			if (i == j) { continue; }
+			++PairComparisons;
 
 			const int32 HandleB = WorkingSet[j];
 			const FLaneEndpointCache* CacheB = LaneEndpointMap.Find(HandleB);
@@ -579,27 +658,62 @@ void URoadBLDTrafficProvider::BuildProximityConnections()
 
 			const int32 RoadB = EffectiveRoadMap[HandleB];
 
-			if (RoadA == RoadB && RoadA != 0) { continue; }
+			if (RoadA == RoadB && RoadA != 0)
+			{
+				++SkipSameRoad;
+				continue;
+			}
 
 			const float DistSq = FVector::DistSquared(CacheA->EndPos, CacheB->StartPos);
-			if (DistSq > ProxThresholdSq) { continue; }
+			if (DistSq > ProxThresholdSq)
+			{
+				++SkipDistance;
+				if (bSampleDiagnostics && SampledRejects.Num() < MaxSamples)
+				{
+					const float Dist = FMath::Sqrt(DistSq);
+					if (FMath::Abs(Dist - ProxThreshold) <= 150.0f)
+					{
+						SampledRejects.Add(FString::Printf(
+							TEXT("RejectDistance A=%d B=%d Dist=%.2f Threshold=%.2f RoadA=%d RoadB=%d"),
+							HandleA, HandleB, Dist, ProxThreshold, RoadA, RoadB));
+					}
+				}
+				continue;
+			}
 
 			const float Dot = FVector::DotProduct(CacheA->EndDir, CacheB->StartDir);
 
 			if (Dot >= DirectionDotMin)
 			{
 				TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(HandleA);
+				const int32 PrevCount = Conns.Num();
 				Conns.AddUnique(FTrafficLaneHandle(HandleB));
-				++ProximityLinks;
+				if (Conns.Num() == PrevCount)
+				{
+					++DuplicateConnectionAttempts;
+				}
+				else
+				{
+					++ProximityLinks;
+					++ForwardAccepted;
+				}
 
 				FProximityConnection PC;
 				PC.FromLane = HandleA;
 				PC.ToLane = HandleB;
 				PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
 				ProximityConnectionList.Add(MoveTemp(PC));
+
+				if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
+				{
+					SampledAccepts.Add(FString::Printf(
+						TEXT("AcceptForward A=%d B=%d Dist=%.2f Dot=%.3f RoadA=%d RoadB=%d"),
+						HandleA, HandleB, FMath::Sqrt(DistSq), Dot, RoadA, RoadB));
+				}
 			}
 			else
 			{
+				++UTurnCandidates;
 				// U-turn candidate — gate by total road width (not individual lane width).
 				const float* RoadWidthA = RoadTotalWidthMap.Find(RoadA);
 				const float* RoadWidthB = RoadTotalWidthMap.Find(RoadB);
@@ -609,14 +723,40 @@ void URoadBLDTrafficProvider::BuildProximityConnections()
 				if (bWidthOk)
 				{
 					TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(HandleA);
+					const int32 PrevCount = Conns.Num();
 					Conns.AddUnique(FTrafficLaneHandle(HandleB));
-					++ProximityLinks;
+					if (Conns.Num() == PrevCount)
+					{
+						++DuplicateConnectionAttempts;
+					}
+					else
+					{
+						++ProximityLinks;
+						++UTurnAccepted;
+					}
 
 					FProximityConnection PC;
 					PC.FromLane = HandleA;
 					PC.ToLane = HandleB;
 					PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
 					ProximityConnectionList.Add(MoveTemp(PC));
+
+					if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
+					{
+						SampledAccepts.Add(FString::Printf(
+							TEXT("AcceptUTurn A=%d B=%d Dist=%.2f Dot=%.3f WidthA=%.1f WidthB=%.1f"),
+							HandleA, HandleB, FMath::Sqrt(DistSq), Dot, WidthA, WidthB));
+					}
+				}
+				else
+				{
+					++UTurnRejectedWidth;
+					if (bSampleDiagnostics && SampledRejects.Num() < MaxSamples)
+					{
+						SampledRejects.Add(FString::Printf(
+							TEXT("RejectUTurnWidth A=%d B=%d Dist=%.2f Dot=%.3f WidthA=%.1f WidthB=%.1f MinWidth=%.1f"),
+							HandleA, HandleB, FMath::Sqrt(DistSq), Dot, WidthA, WidthB, MinUTurnWidth));
+					}
 				}
 			}
 		}
@@ -633,6 +773,130 @@ void URoadBLDTrafficProvider::BuildProximityConnections()
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("RoadBLDTrafficProvider: Proximity connections added %d links (U-turn gating at %.0f cm)."),
 		ProximityLinks, MinUTurnWidth);
+
+	if (ShouldLogDiagnosticsLevel(2))
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDTrafficProvider: ProximityDiag PairComparisons=%d WorkingSet=%d SkipSameRoad=%d SkipDistance=%d ForwardAccepted=%d UTurnCandidates=%d UTurnAccepted=%d UTurnRejectedWidth=%d DuplicateAttempts=%d"),
+			PairComparisons,
+			WorkingSet.Num(),
+			SkipSameRoad,
+			SkipDistance,
+			ForwardAccepted,
+			UTurnCandidates,
+			UTurnAccepted,
+			UTurnRejectedWidth,
+			DuplicateConnectionAttempts);
+	}
+
+	if (bSampleDiagnostics)
+	{
+		for (const FString& Line : SampledAccepts)
+		{
+			UE_LOG(LogAAATraffic, Log, TEXT("RoadBLDTrafficProvider: ProximitySample %s"), *Line);
+		}
+		for (const FString& Line : SampledRejects)
+		{
+			UE_LOG(LogAAATraffic, Log, TEXT("RoadBLDTrafficProvider: ProximitySample %s"), *Line);
+		}
+	}
+}
+
+void URoadBLDTrafficProvider::RunConnectivityDiagnostics(const TCHAR* PhaseTag) const
+{
+	if (!(GetTrafficDiagnosticsValidateGraph() || ShouldLogDiagnosticsLevel(2)))
+	{
+		return;
+	}
+
+	int32 MissingSourceLane = 0;
+	int32 MissingTargetLane = 0;
+	int32 DuplicateEdges = 0;
+	int32 SelfEdges = 0;
+	int32 AsymmetricAdjacency = 0;
+	int32 JunctionWithoutCentroid = 0;
+
+	for (const auto& Pair : LaneConnectionMap)
+	{
+		const int32 Source = Pair.Key;
+		if (!LaneEndpointMap.Contains(Source) && !LaneHandleMap.Contains(Source))
+		{
+			++MissingSourceLane;
+		}
+
+		TSet<int32> SeenTargets;
+		for (const FTrafficLaneHandle& TargetHandle : Pair.Value)
+		{
+			const int32 Target = TargetHandle.HandleId;
+			if (Source == Target)
+			{
+				++SelfEdges;
+			}
+			if (SeenTargets.Contains(Target))
+			{
+				++DuplicateEdges;
+			}
+			else
+			{
+				SeenTargets.Add(Target);
+			}
+			if (!LaneEndpointMap.Contains(Target) && !LaneHandleMap.Contains(Target))
+			{
+				++MissingTargetLane;
+			}
+		}
+	}
+
+	for (const auto& Pair : RightNeighborMap)
+	{
+		const int32 RightOf = Pair.Key;
+		const int32 RightLane = Pair.Value;
+		const int32* LeftBack = LeftNeighborMap.Find(RightLane);
+		if (!LeftBack || *LeftBack != RightOf)
+		{
+			++AsymmetricAdjacency;
+		}
+	}
+
+	for (const auto& Pair : LeftNeighborMap)
+	{
+		const int32 LeftOf = Pair.Key;
+		const int32 LeftLane = Pair.Value;
+		const int32* RightBack = RightNeighborMap.Find(LeftLane);
+		if (!RightBack || *RightBack != LeftOf)
+		{
+			++AsymmetricAdjacency;
+		}
+	}
+
+	for (const auto& Pair : LaneToJunctionMap)
+	{
+		if (Pair.Value > 0 && !JunctionCentroids.Contains(Pair.Value))
+		{
+			++JunctionWithoutCentroid;
+		}
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDTrafficProvider: GraphDiag Phase=%s LaneConnKeys=%d ProxConns=%d MissingSource=%d MissingTarget=%d DuplicateEdges=%d SelfEdges=%d AsymmetricAdjacency=%d JunctionWithoutCentroid=%d"),
+		PhaseTag,
+		LaneConnectionMap.Num(),
+		ProximityConnectionList.Num(),
+		MissingSourceLane,
+		MissingTargetLane,
+		DuplicateEdges,
+		SelfEdges,
+		AsymmetricAdjacency,
+		JunctionWithoutCentroid);
+
+	if (GetTrafficDiagnosticsValidateGraph())
+	{
+		ensureMsgf(MissingSourceLane == 0, TEXT("RoadBLDTrafficProvider: connectivity references missing source lanes."));
+		ensureMsgf(MissingTargetLane == 0, TEXT("RoadBLDTrafficProvider: connectivity references missing target lanes."));
+		ensureMsgf(SelfEdges == 0, TEXT("RoadBLDTrafficProvider: self-loop connectivity edges detected."));
+		ensureMsgf(AsymmetricAdjacency == 0, TEXT("RoadBLDTrafficProvider: left/right adjacency symmetry violation detected."));
+		ensureMsgf(JunctionWithoutCentroid == 0, TEXT("RoadBLDTrafficProvider: lane mapped to junction without centroid."));
+	}
 }
 
 // ---------------------------------------------------------------------------
