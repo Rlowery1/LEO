@@ -21,6 +21,6 @@ public class AAA_Traffic : ModuleRules
 			}
 		);
 
-		PrivateDependencyModuleNames.AddRange(new string[] { });
+		PrivateDependencyModuleNames.AddRange(new string[] { "Chaos" });
 	}
 }

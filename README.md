@@ -27,3 +27,32 @@ The workflow expects UE at `C:\\Program Files\\Epic Games\\UE_5.7` (see `.github
 Open `HostProject/HostProject.uproject` in Unreal Editor and let it compile.
 
 > Note: This repo intentionally excludes all `.uasset`/`.umap` content and any third-party plugins/assets.
+
+## Deep diagnostics (connectivity + vehicle decisions)
+
+Use these runtime CVars in PIE/Standalone to gather full proximity-lane forensic traces:
+
+- `traffic.DiagnosticsLevel`
+	- `0`: off
+	- `1`: phase timing summaries for provider build pipeline
+	- `2`: proximity reason counters + graph diagnostics summary
+	- `3`: sampled candidate accept/reject trace lines near thresholds
+- `traffic.DiagnosticsSampleLimit` — max sampled records emitted per phase at level `3`.
+- `traffic.DiagnosticsValidateGraph` — enables invariant validation (`ensureMsgf`) for dangling handles, self-edges, adjacency asymmetry, and junction-centroid mismatches.
+- `traffic.VehicleDecisionTrace`
+	- `0`: off
+	- `1`: trace lane transition/lane-change decisions and flush on failure paths
+	- `2`: include per-candidate lane-change and weighted-selection records
+- `traffic.VehicleDecisionTraceMax` — per-vehicle bounded trace-buffer size.
+- `traffic.VehicleTraceFlushOnSuccess` — if true, flushes decision traces for successful transitions/lane-changes.
+- Existing high-volume dump switch remains available: `traffic.EnableDiagnosticDumps`.
+
+Suggested "maximum diagnostics" preset:
+
+- `traffic.DiagnosticsLevel 3`
+- `traffic.DiagnosticsSampleLimit 64`
+- `traffic.DiagnosticsValidateGraph 1`
+- `traffic.VehicleDecisionTrace 2`
+- `traffic.VehicleDecisionTraceMax 1024`
+- `traffic.VehicleTraceFlushOnSuccess 1`
+- `traffic.EnableDiagnosticDumps 1`
