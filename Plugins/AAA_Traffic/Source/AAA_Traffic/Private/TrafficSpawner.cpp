@@ -1073,8 +1073,12 @@ void ATrafficSpawner::PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Prov
 			LanesByRoad.FindOrAdd(Road.HandleId).Add(Lane);
 		}
 
-		// Spawn the signal controller at the world origin (no visible component needed).
-		ATrafficSignalController* Signal = World->SpawnActor<ATrafficSignalController>();
+		// --- Use deferred spawn so JunctionId and PhaseGroups are set BEFORE
+		// BeginPlay fires. Previously, SpawnActor triggered BeginPlay immediately,
+		// which saw JunctionId==0, logged a warning, and disabled the signal's tick.
+		FTransform SignalTransform = FTransform::Identity;
+		ATrafficSignalController* Signal = World->SpawnActorDeferred<ATrafficSignalController>(
+			ATrafficSignalController::StaticClass(), SignalTransform);
 		if (!Signal) { continue; }
 
 		Signal->JunctionId = JId;
@@ -1092,6 +1096,9 @@ void ATrafficSpawner::PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Prov
 			Group.GreenLanes = LanesByRoad[RoadId];
 			Signal->PhaseGroups.Add(MoveTemp(Group));
 		}
+
+		// Finish spawning — now BeginPlay sees the correct JunctionId and registers.
+		Signal->FinishSpawning(SignalTransform);
 
 		++SignalsPlaced;
 	}
