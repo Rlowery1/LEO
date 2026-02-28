@@ -299,6 +299,23 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")
 	bool bDebugDraw = false;
 
+	// --- One-shot diagnostic flags (prevent log spam, gated by traffic.VehicleDiagnostics CVar) ---
+	bool bDiagLoggedNoMovement = false;
+	bool bDiagLoggedTickSkip = false;
+	bool bDiagLoggedFirstInput = false;
+	bool bDiagLoggedMovementCheck = false;
+	float DiagElapsedTime = 0.0f;
+	FVector DiagSpawnLocation = FVector::ZeroVector;
+
+	/** Periodic diagnostic timer — fires every DiagPeriodicInterval seconds. */
+	float DiagPeriodicTimer = 0.0f;
+	static constexpr float DiagPeriodicInterval = 2.0f;
+
+	/** True once the vehicle has been observed moving (Speed > 10 cm/s). Enables STOPPED one-shot. */
+	bool bDiagWasMoving = false;
+	/** True once the STOPPED one-shot has fired. Prevents spam. */
+	bool bDiagLoggedStopped = false;
+
 	/**
 	 * Deterministic random stream (seeded from RandomSeed).
 	 * Reserved for future lane-choice / gap-acceptance randomization.

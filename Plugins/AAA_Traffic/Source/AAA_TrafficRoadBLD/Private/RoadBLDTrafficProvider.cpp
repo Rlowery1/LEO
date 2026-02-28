@@ -696,19 +696,19 @@ void URoadBLDTrafficProvider::BuildProximityConnections()
 				{
 					++ProximityLinks;
 					++ForwardAccepted;
-				}
 
-				FProximityConnection PC;
-				PC.FromLane = HandleA;
-				PC.ToLane = HandleB;
-				PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
-				ProximityConnectionList.Add(MoveTemp(PC));
+					FProximityConnection PC;
+					PC.FromLane = HandleA;
+					PC.ToLane = HandleB;
+					PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
+					ProximityConnectionList.Add(MoveTemp(PC));
 
-				if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
-				{
-					SampledAccepts.Add(FString::Printf(
-						TEXT("AcceptForward A=%d B=%d Dist=%.2f Dot=%.3f RoadA=%d RoadB=%d"),
-						HandleA, HandleB, FMath::Sqrt(DistSq), Dot, RoadA, RoadB));
+					if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
+					{
+						SampledAccepts.Add(FString::Printf(
+							TEXT("AcceptForward A=%d B=%d Dist=%.2f Dot=%.3f RoadA=%d RoadB=%d"),
+							HandleA, HandleB, FMath::Sqrt(DistSq), Dot, RoadA, RoadB));
+					}
 				}
 			}
 			else
@@ -733,19 +733,19 @@ void URoadBLDTrafficProvider::BuildProximityConnections()
 					{
 						++ProximityLinks;
 						++UTurnAccepted;
-					}
 
-					FProximityConnection PC;
-					PC.FromLane = HandleA;
-					PC.ToLane = HandleB;
-					PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
-					ProximityConnectionList.Add(MoveTemp(PC));
+						FProximityConnection PC;
+						PC.FromLane = HandleA;
+						PC.ToLane = HandleB;
+						PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
+						ProximityConnectionList.Add(MoveTemp(PC));
 
-					if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
-					{
-						SampledAccepts.Add(FString::Printf(
-							TEXT("AcceptUTurn A=%d B=%d Dist=%.2f Dot=%.3f WidthA=%.1f WidthB=%.1f"),
-							HandleA, HandleB, FMath::Sqrt(DistSq), Dot, WidthA, WidthB));
+						if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
+						{
+							SampledAccepts.Add(FString::Printf(
+								TEXT("AcceptUTurn A=%d B=%d Dist=%.2f Dot=%.3f WidthA=%.1f WidthB=%.1f"),
+								HandleA, HandleB, FMath::Sqrt(DistSq), Dot, WidthA, WidthB));
+						}
 					}
 				}
 				else

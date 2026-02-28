@@ -9,7 +9,9 @@
 #include "Engine/World.h"
 #include "DrawDebugHelpers.h"
 #include "PhysicsEngine/BodyInstance.h"
-#include "PhysicsProxy/SingleParticlePhysicsProxy.h"  // Chaos::ESleepType::NeverSleep
+// Needed for FPhysicsActorHandle->GetGameThreadAPI().SetSleepType(Chaos::ESleepType::NeverSleep).
+// This header is engine-internal; Chaos is a private dependency to limit downstream coupling.
+#include "PhysicsProxy/SingleParticlePhysicsProxy.h"
 #include "HAL/IConsoleManager.h"
 #include "UObject/UnrealType.h"                        // FBoolProperty for BP reflection
 
@@ -46,6 +48,13 @@ static FAutoConsoleVariableRef CVarTrafficWakeGuardMaxSpeed(
 	TEXT("traffic.WakeGuardMaxSpeed"),
 	GTrafficWakeGuardMaxSpeed,
 	TEXT("Maximum absolute speed (cm/s) where anti-sleep wake guard is allowed to trigger."),
+	ECVF_Default);
+
+static int32 GTrafficVehicleDiagnostics = 0;
+static FAutoConsoleVariableRef CVarTrafficVehicleDiagnostics(
+	TEXT("traffic.VehicleDiagnostics"),
+	GTrafficVehicleDiagnostics,
+	TEXT("Enable deep vehicle diagnostics logging: 0=off (default), 1=on. Keep off in production to avoid log spam and per-tick overhead."),
 	ECVF_Default);
 
 namespace
@@ -341,7 +350,34 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 
 			// Disable the 'Can Sleep' inner gate (prevents CE_CheckVehicleSleep from
 			// evaluating wake/sleep even if the Optimized gate is bypassed).
-			if (FBoolProperty* CanSleepProp = FindFProperty<FBoolProperty>(VehicleBPClass, TEXT("Can Sleep")))
+			// BP variable names with spaces use the space-free internal FName — search
+			// by both common internal names and DisplayName metadata for robustness.
+			FBoolProperty* CanSleepProp = FindFProperty<FBoolProperty>(VehicleBPClass, TEXT("CanSleep"));
+			if (!CanSleepProp)
+			{
+				CanSleepProp = FindFProperty<FBoolProperty>(VehicleBPClass, TEXT("bCanSleep"));
+			}
+			if (!CanSleepProp)
+			{
+				CanSleepProp = FindFProperty<FBoolProperty>(VehicleBPClass, TEXT("Can Sleep"));
+			}
+			if (!CanSleepProp)
+			{
+				// Last resort: iterate all bool properties and match by DisplayName metadata.
+				for (TFieldIterator<FBoolProperty> It(VehicleBPClass); It; ++It)
+				{
+					if (It->HasMetaData(TEXT("DisplayName")))
+					{
+						const FString& DisplayName = It->GetMetaData(TEXT("DisplayName"));
+						if (DisplayName.Equals(TEXT("Can Sleep"), ESearchCase::IgnoreCase))
+						{
+							CanSleepProp = *It;
+							break;
+						}
+					}
+				}
+			}
+			if (CanSleepProp)
 			{
 				CanSleepProp->SetPropertyValue_InContainer(InPawn, false);
 				++PropertiesNeutralized;
@@ -408,7 +444,7 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 	Super::Tick(DeltaSeconds);
 
 	// --- Delayed movement diagnostic: after 2 seconds, check if vehicle moved ---
-	if (!bDiagLoggedMovementCheck && GetPawn())
+	if (GTrafficVehicleDiagnostics > 0 && !bDiagLoggedMovementCheck && GetPawn())
 	{
 		if (DiagSpawnLocation.IsZero())
 		{
@@ -501,7 +537,8 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 	}
 
 	// --- Periodic diagnostic: comprehensive vehicle state every 2 seconds ---
-	if (GetPawn() && bLaneDataReady)
+	// Gated behind traffic.VehicleDiagnostics CVar to avoid log spam and per-tick overhead.
+	if (GTrafficVehicleDiagnostics > 0 && GetPawn() && bLaneDataReady)
 	{
 		DiagPeriodicTimer += DeltaSeconds;
 
@@ -757,15 +794,32 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		return;
 	}
 
-	// --- Safety net: force unpark + wake every tick ---
+	// --- Safety net: undo unexpected parking/sleep if detected ---
 	// PRIMARY FIX is in OnPossess: we set the parent BP's 'Optimized' variable
 	// to false via reflection, which disables the entire Physics optimization
 	// → Optimization Unpossessed → CE_StopCar → CE Set Parked(true) chain.
-	// These per-tick calls remain as a cheap safety net in case a future
+	// These conditional checks remain as a cheap safety net in case a future
 	// marketplace pack update re-introduces parking through a different path.
-	VehicleMovement->SetParked(false);
-	VehicleMovement->SetSleeping(false);   // calls WakeAllEnabledRigidBodies()
-	VehicleMovement->SetHandbrakeInput(false);
+	if (VehicleMovement->IsParked())
+	{
+		VehicleMovement->SetParked(false);
+	}
+	if (VehicleMovement->GetHandbrakeInput())
+	{
+		VehicleMovement->SetHandbrakeInput(false);
+	}
+	// SetSleeping(false) calls WakeAllEnabledRigidBodies — only invoke when actually sleeping.
+	{
+		UPrimitiveComponent* WakePrim = VehicleMovement->UpdatedPrimitive;
+		if (WakePrim)
+		{
+			FBodyInstance* WakeBI = WakePrim->GetBodyInstance();
+			if (WakeBI && !WakeBI->IsInstanceAwake())
+			{
+				VehicleMovement->SetSleeping(false);
+			}
+		}
+	}
 
 	const FVector VehicleLocation = ControlledPawn->GetActorLocation();
 	const FVector VehicleForward = ControlledPawn->GetActorForwardVector();
