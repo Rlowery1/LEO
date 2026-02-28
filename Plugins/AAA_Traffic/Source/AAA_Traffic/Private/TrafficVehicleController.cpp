@@ -9,6 +9,7 @@
 #include "Engine/World.h"
 #include "DrawDebugHelpers.h"
 #include "PhysicsEngine/BodyInstance.h"
+#include "Components/PrimitiveComponent.h"              // Full definition (forward-declared only in Game target)
 // Needed for FPhysicsActorHandle->GetGameThreadAPI().SetSleepType(Chaos::ESleepType::NeverSleep).
 // This header is engine-internal; Chaos is a private dependency to limit downstream coupling.
 #include "PhysicsProxy/SingleParticlePhysicsProxy.h"
@@ -361,9 +362,11 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 			{
 				CanSleepProp = FindFProperty<FBoolProperty>(VehicleBPClass, TEXT("Can Sleep"));
 			}
+#if WITH_EDITORONLY_DATA
 			if (!CanSleepProp)
 			{
 				// Last resort: iterate all bool properties and match by DisplayName metadata.
+				// HasMetaData/GetMetaData are editor-only APIs (metadata stripped in Game builds).
 				for (TFieldIterator<FBoolProperty> It(VehicleBPClass); It; ++It)
 				{
 					if (It->HasMetaData(TEXT("DisplayName")))
@@ -377,6 +380,7 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 					}
 				}
 			}
+#endif // WITH_EDITORONLY_DATA
 			if (CanSleepProp)
 			{
 				CanSleepProp->SetPropertyValue_InContainer(InPawn, false);
