@@ -252,6 +252,8 @@ protected:
 	float DefaultSpeedLimit;
 
 	// ── Speed Tiers ─────────────────────────────────────────
+	// @todo Wire speed tiers into per-road speed assignment when road
+	// classification metadata is available from the provider.
 
 	/** Residential speed tier (cm/s). ~25 mph / 40 km/h. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Speed Tiers", meta = (ClampMin = "0"))

@@ -3208,7 +3208,7 @@ int32 URoadBLDReflectionProvider::GetJunctionForLane(const FTrafficLaneHandle& L
 	// Check the handle directly first (works for both virtual and original).
 	if (const int32* JId = LaneToJunctionMap.Find(Lane.HandleId))
 	{
-		UE_LOG(LogAAATraffic, Log,
+		UE_LOG(LogAAATraffic, Verbose,
 			TEXT("JNCT GetJunctionForLane: Lane=%d → JunctionId=%d (direct map hit)"),
 			Lane.HandleId, *JId);
 		return *JId;
@@ -3218,15 +3218,15 @@ int32 URoadBLDReflectionProvider::GetJunctionForLane(const FTrafficLaneHandle& L
 	{
 		if (const int32* JId = LaneToJunctionMap.Find(VInfo->OriginalLaneHandle))
 		{
-			UE_LOG(LogAAATraffic, Log,
+			UE_LOG(LogAAATraffic, Verbose,
 				TEXT("JNCT GetJunctionForLane: Lane=%d (virtual, orig=%d) → JunctionId=%d (fallback hit)"),
 				Lane.HandleId, VInfo->OriginalLaneHandle, *JId);
 			return *JId;
 		}
 	}
 	// No junction for this lane — this fires very frequently for free-flow lanes,
-	// so we use Log severity (not Warning).
-	UE_LOG(LogAAATraffic, Log,
+	// so we use Verbose severity (not Log/Warning).
+	UE_LOG(LogAAATraffic, Verbose,
 		TEXT("JNCT GetJunctionForLane: Lane=%d → 0 (no junction found)"),
 		Lane.HandleId);
 	return 0;
@@ -3673,7 +3673,7 @@ void URoadBLDReflectionProvider::PrecomputeJunctionMap()
 
 		if (R && R->IsValid())
 		{
-			UE_LOG(LogAAATraffic, Log,
+			UE_LOG(LogAAATraffic, Verbose,
 				TEXT("  Lane=%d Length=%.0f IsJunction=%s Connections=%d => JunctionId=%d Dist=%.0f JnctLane=%d ApproachLane=%d"),
 				LaneId, Len,
 				bIsJunctionLane ? TEXT("YES") : TEXT("no"),
@@ -3682,14 +3682,14 @@ void URoadBLDReflectionProvider::PrecomputeJunctionMap()
 		}
 		else
 		{
-			UE_LOG(LogAAATraffic, Warning,
+			UE_LOG(LogAAATraffic, Verbose,
 				TEXT("  Lane=%d Length=%.0f IsJunction=%s Connections=%d => NO-JUNCTION-DOWNSTREAM (vehicles here are blind)"),
 				LaneId, Len,
 				bIsJunctionLane ? TEXT("YES") : TEXT("no"),
 				NumConnections);
 		}
 	}
-	UE_LOG(LogAAATraffic, Log, TEXT("PrecomputeJunctionMap — PER-LANE DUMP END"));
+	UE_LOG(LogAAATraffic, Verbose, TEXT("PrecomputeJunctionMap — PER-LANE DUMP END"));
 }
 
 // ---------------------------------------------------------------------------

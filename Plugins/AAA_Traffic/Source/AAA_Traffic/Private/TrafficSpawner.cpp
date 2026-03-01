@@ -33,7 +33,7 @@ ATrafficSpawner::ATrafficSpawner()
 	, UrbanSpeed(2012.0f)
 	, HighwaySpeed(2906.0f)
 {
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.bStartWithTickEnabled = true; // Tick in editor for debug lane draw
 #else
@@ -48,7 +48,7 @@ void ATrafficSpawner::BeginPlay()
 	// Defer to next tick so adapter subsystems have finished OnWorldBeginPlay registration.
 	GetWorldTimerManager().SetTimerForNextTick(this, &ATrafficSpawner::SpawnVehicles);
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	if (bDebugDrawLanes || bDebugDrawIntersections)
 	{
 		SetActorTickEnabled(true);
@@ -58,7 +58,7 @@ void ATrafficSpawner::BeginPlay()
 
 bool ATrafficSpawner::ShouldTickIfViewportsOnly() const
 {
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	return bDebugDrawLanes || bDebugDrawIntersections;
 #else
 	return false;
@@ -69,7 +69,7 @@ void ATrafficSpawner::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	if (!bDebugDrawLanes && !bDebugDrawIntersections)
 	{
 		return;
@@ -118,7 +118,7 @@ void ATrafficSpawner::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	Super::EndPlay(EndPlayReason);
 }
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 void ATrafficSpawner::CacheDebugLaneData()
 {
 	UWorld* World = GetWorld();
@@ -899,7 +899,7 @@ void ATrafficSpawner::OnProviderRegistered(ITrafficRoadProvider* Provider)
 {
 	if (bSpawnComplete) { return; }
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	// Reset debug cache so it picks up provider data on next tick.
 	bDebugCacheReady = false;
 	bDebugCacheAttempted = false;
@@ -1000,7 +1000,10 @@ void ATrafficSpawner::SpawnVehicles()
 		const int32 PreStubCount = AllLanes.Num();
 		AllLanes.RemoveAll([Provider, MinSpawnLaneLengthCm](const FTrafficLaneHandle& Lane)
 		{
-			return Provider->GetLaneLength(Lane) < MinSpawnLaneLengthCm;
+			const float LaneLengthCm = Provider->GetLaneLength(Lane);
+			// Treat length <= 0 as "unknown" (provider has no data) — keep the
+			// lane rather than wrongly filtering it as a stub.
+			return LaneLengthCm > 0.0f && LaneLengthCm < MinSpawnLaneLengthCm;
 		});
 		const int32 StubsRemoved = PreStubCount - AllLanes.Num();
 		if (StubsRemoved > 0)

@@ -177,40 +177,40 @@ private:
 	int32 JunctionTransitionIndex;
 
 	/** True when waiting at an intersection for right-of-way. */
-	bool bWaitingAtIntersection;
+	bool bWaitingAtIntersection = false;
 
 	/** Cooldown timer for intersection retry attempts (seconds). */
-	float IntersectionRetryTimer;
+	float IntersectionRetryTimer = 0.0f;
 
 	/** Junction ID of the intersection this vehicle is waiting/in. 0 = none. */
-	int32 IntersectionJunctionId;
+	int32 IntersectionJunctionId = 0;
 
 	/** Junction ID that was just released on the current lane.
 	 *  Prevents re-detection of the same junction after the vehicle releases
 	 *  occupancy mid-lane (e.g. curve-complete fires before lane-end).
 	 *  Reset in InitializeLaneFollowing when moving to a new lane. */
-	int32 LastReleasedJunctionId;
+	int32 LastReleasedJunctionId = 0;
 
 	/** The junction lane handle used for signal queries.
 	 *  When a junction is detected via look-ahead, this is the NEXT lane
 	 *  (the one inside the intersection) — the same handle that appears
 	 *  in the signal's PhaseGroup.GreenLanes. Using this instead of
 	 *  CurrentLane ensures IsLaneGreen matches correctly. */
-	FTrafficLaneHandle IntersectionJunctionLane;
+	FTrafficLaneHandle IntersectionJunctionLane = FTrafficLaneHandle();
 
 	/** The lane the vehicle approaches the junction from (for conflict detection). */
-	FTrafficLaneHandle IntersectionFromLane;
+	FTrafficLaneHandle IntersectionFromLane = FTrafficLaneHandle();
 
 	/** The lane the vehicle exits the junction to (for conflict detection). */
-	FTrafficLaneHandle IntersectionToLane;
+	FTrafficLaneHandle IntersectionToLane = FTrafficLaneHandle();
 
 	/** Exact 3D world position of the intersection entry boundary.
 	 *  Derived from intersection mask geometry (not quantized polyline).
 	 *  Used as the brake target when waiting at an intersection. */
-	FVector IntersectionEntryWorldPos;
+	FVector IntersectionEntryWorldPos = FVector::ZeroVector;
 
 	/** True if IntersectionEntryWorldPos is valid (entry point was resolved). */
-	bool bHasIntersectionEntryPos;
+	bool bHasIntersectionEntryPos = false;
 
 	// ── Junction Approach Scan State ─────────────────────────
 
@@ -218,32 +218,32 @@ private:
 	bool bApproachingIntersection;
 
 	/** Distance (cm) to the detected upcoming junction (from current position along lane graph). */
-	float ApproachJunctionDistanceCm;
+	float ApproachJunctionDistanceCm = 0.0f;
 
 	/** Computed approach speed limit (cm/s) based on stopping-distance envelope. */
-	float ApproachSpeedLimitCmPerSec;
+	float ApproachSpeedLimitCmPerSec = 0.0f;
 
 	/** Junction ID detected by the approach scan (0 = none). */
-	int32 ApproachJunctionId;
+	int32 ApproachJunctionId = 0;
 
 	/** The junction lane handle from the approach scan (for debug display). */
-	FTrafficLaneHandle ApproachJunctionLane;
+	FTrafficLaneHandle ApproachJunctionLane = FTrafficLaneHandle();
 
 	/** Cumulative distance traveled on the current lane (prevents short-lane transition loops). */
-	float DistanceTraveledOnLane;
+	float DistanceTraveledOnLane = 0.0f;
 
 	/** Elapsed time (seconds) spent waiting at the current intersection. */
-	float IntersectionWaitElapsed;
+	float IntersectionWaitElapsed = 0.0f;
 
 	/** Per-instance log throttle counter for waiting-state diagnostics.
 	 *  Replaces the old static int32 that was shared across all instances
 	 *  (determinism violation). */
-	int32 WaitLogThrottleCounter;
+	int32 WaitLogThrottleCounter = 0;
 
 	/** Accumulated DeltaTime from LOD-skipped frames.
 	 *  Passed to UpdateVehicleInput on the next active tick so behavior
 	 *  is frame-rate independent regardless of LOD gating. */
-	float LODAccumulatedDeltaTime;
+	float LODAccumulatedDeltaTime = 0.0f;
 
 	/** Timer for periodic junction diagnostic dumps (traffic.JunctionDiagnostics CVar). */
 	float DiagJunctionTimer;
@@ -272,19 +272,19 @@ private:
 	TArray<FVector> TargetLanePoints;
 
 	/** Width of the target lane (cm). */
-	float TargetLaneWidth;
+	float TargetLaneWidth = 0.0f;
 
 	/** Progress of the lane-change blend (0 = source, 1 = target). */
-	float LaneChangeProgress;
+	float LaneChangeProgress = 0.0f;
 
 	/** Time remaining in the Completing settling phase (seconds). */
-	float LaneChangeSettleTimer;
+	float LaneChangeSettleTimer = 0.0f;
 
 	/** Time remaining before another lane change can be considered (seconds). */
-	float LaneChangeCooldownRemaining;
+	float LaneChangeCooldownRemaining = 0.0f;
 
 	/** Base target speed before lane speed-limit adjustments. */
-	float BaseTargetSpeed;
+	float BaseTargetSpeed = 0.0f;
 
 	/** Single lane-decision trace record for forensic debugging. */
 	struct FLaneDecisionTrace
@@ -355,6 +355,7 @@ protected:
 	 * Global margin (cm) added between the vehicle's front bumper and the
 	 * intersection entry boundary. Purely cosmetic comfort distance.
 	 * Defaults to 0 (exact geometric stop). Not per-intersection.
+	 * @todo Wire into brake-targeting offset once stop-line snapping is implemented.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Intersection", meta = (ClampMin = "0"))
 	float StopLineMarginCm;
@@ -409,9 +410,9 @@ protected:
 
 	/** Cached forward extent of the vehicle mesh bounding box (cm from actor
 	 *  origin to front bumper). Computed once on possess from the pawn's
-	 *  component bounds. Used so the FRONT BUMPER stops at the line, not
-	 *  the actor center. */
-	float VehicleFrontExtent;
+	 *  component bounds. Currently used for diagnostics/logging and
+	 *  reserved for future stop-line alignment logic. */
+	float VehicleFrontExtent = 0.0f;
 
 	/**
 	 * Seed for deterministic random decisions.
@@ -425,7 +426,7 @@ protected:
 	bool bDebugDraw = false;
 
 	// --- Cached debug state (populated each tick in UpdateVehicleInput for debug draw) ---
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	FString DbgStateName = TEXT("INIT");
 	float DbgThrottle = 0.0f;
 	float DbgBrake = 0.0f;
@@ -443,7 +444,7 @@ protected:
 	float DbgApproachJunctionDist = -1.0f;  // -1 = no junction detected by scan
 	float DbgApproachSpeedLimit = 0.0f;
 	int32 DbgApproachJunctionId = 0;
-#endif
+#endif // ENABLE_DRAW_DEBUG
 
 	// --- One-shot diagnostic flags (prevent log spam, gated by traffic.VehicleDiagnostics CVar) ---
 	bool bDiagLoggedNoMovement = false;

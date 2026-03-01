@@ -33,7 +33,6 @@ ITrafficRoadProvider::FJunctionScanResult ITrafficRoadProvider::GetDistanceToNex
 	TSet<int32> Visited;
 	Visited.Add(StartLane.HandleId);
 
-	FTrafficLaneHandle PreviousLane = StartLane;
 	FTrafficLaneHandle CurrentLane = StartLane;
 
 	for (int32 Hop = 0; Hop < MaxHops; ++Hop)
@@ -45,9 +44,14 @@ ITrafficRoadProvider::FJunctionScanResult ITrafficRoadProvider::GetDistanceToNex
 			break; // Dead end — no junction ahead.
 		}
 
+		// Sort by HandleId for deterministic traversal regardless of provider
+		// container ordering.  O(N log N) on a typically tiny array (1-3 lanes).
+		NextLanes.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
+		{
+			return A.HandleId < B.HandleId;
+		});
+
 		// Follow the first unvisited successor.
-		// Deterministic: NextLanes order is determined by the provider
-		// (sorted by handle ID in RoadBLDReflectionProvider).
 		bool bFoundNext = false;
 		for (const FTrafficLaneHandle& NextLane : NextLanes)
 		{
@@ -78,7 +82,6 @@ ITrafficRoadProvider::FJunctionScanResult ITrafficRoadProvider::GetDistanceToNex
 				return Result; // Exceeded search range — no junction found.
 			}
 
-			PreviousLane = CurrentLane;
 			CurrentLane = NextLane;
 			bFoundNext = true;
 			break; // Follow only one path (avoid exponential branching).

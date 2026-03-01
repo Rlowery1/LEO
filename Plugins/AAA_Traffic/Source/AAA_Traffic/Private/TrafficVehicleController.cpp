@@ -65,7 +65,7 @@ static FAutoConsoleVariableRef CVarTrafficDebugDraw(
 	TEXT("Global toggle for in-world debug visualization: 0=off (default), 1=on for ALL vehicles. Overrides per-vehicle bDebugDraw."),
 	ECVF_Default);
 
-static int32 GTrafficJunctionDiagnostics = 0;
+int32 GTrafficJunctionDiagnostics = 0;
 static FAutoConsoleVariableRef CVarTrafficJunctionDiagnostics(
 	TEXT("traffic.JunctionDiagnostics"),
 	GTrafficJunctionDiagnostics,
@@ -892,7 +892,7 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 	LODAccumulatedDeltaTime = 0.0f;
 	UpdateVehicleInput(EffectiveDeltaSeconds);
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	if ((bDebugDraw || GTrafficDebugDraw != 0) && GetPawn())
 	{
 		const UWorld* DbgWorld = GetWorld();
@@ -1112,7 +1112,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	const FVector VehicleForward = ControlledPawn->GetActorForwardVector();
 	const float CurrentSpeed = VehicleMovement->GetForwardSpeed();
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	// Initialize debug cache each tick — will be overwritten by decision branches.
 	DbgCurrentSpeed = CurrentSpeed;
 	DbgStateName = TEXT("CRUISING");
@@ -1243,7 +1243,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 			bApproachingIntersection = (AbsSpeedNow > ApproachSpeedLimitCmPerSec + 50.0f) ||
 									   (ApproachJunctionDistanceCm < LookAheadDistance * 3.0f);
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 			DbgApproachJunctionDist = ApproachJunctionDistanceCm;
 			DbgApproachSpeedLimit = ApproachSpeedLimitCmPerSec;
 			DbgApproachJunctionId = ApproachJunctionId;
@@ -1265,7 +1265,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 			ApproachSpeedLimitCmPerSec = 0.0f;
 			ApproachJunctionId = 0;
 			ApproachJunctionLane = FTrafficLaneHandle();
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 			DbgApproachJunctionDist = -1.0f;
 			DbgApproachSpeedLimit = 0.0f;
 			DbgApproachJunctionId = 0;
@@ -1286,7 +1286,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 				IntersectionJunctionId,
 				bWaitingAtIntersection ? TEXT("YES") : TEXT("NO"));
 		}
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 		DbgApproachJunctionDist = -1.0f;
 		DbgApproachSpeedLimit = 0.0f;
 		DbgApproachJunctionId = 0;
@@ -1324,7 +1324,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		const float AbsSpeed = FMath::Abs(CurrentSpeed);
 		const float StoppingDist = (AbsSpeed * AbsSpeed) / (2.0f * ApproachDecelCmPerSec2);
 		const float TransitionThreshold = FMath::Max(LookAheadDistance, StoppingDist + ApproachSafetyMarginCm);
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 		DbgRemainingDist = RemainingDist;
 		DbgTransitionThreshold = TransitionThreshold;
 #endif
@@ -1376,12 +1376,15 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 				// the lane that appears in the signal's PhaseGroup.GreenLanes.
 				FTrafficLaneHandle DetectedJunctionLane = CurrentLane;
 
-				UE_LOG(LogAAATraffic, Warning,
-					TEXT("JNCT DETECT: Pawn='%s' CurrentLane=%d GetJunctionForLane(current)=%d "
-						 "RemainingDist=%.1f TransitionThreshold=%.1f Speed=%.1f"),
-					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
-					CurrentLane.HandleId, DetectedJunctionId,
-					RemainingDist, TransitionThreshold, CurrentSpeed);
+				if (GTrafficJunctionDiagnostics >= 1)
+				{
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("JNCT DETECT: Pawn='%s' CurrentLane=%d GetJunctionForLane(current)=%d "
+							 "RemainingDist=%.1f TransitionThreshold=%.1f Speed=%.1f"),
+						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+						CurrentLane.HandleId, DetectedJunctionId,
+						RemainingDist, TransitionThreshold, CurrentSpeed);
+				}
 
 				// --- Look-ahead: peek at next lanes for junction presence ---
 				if (DetectedJunctionId == 0)
@@ -1390,11 +1393,14 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 					for (const FTrafficLaneHandle& NextLane : NextLanes)
 					{
 						const int32 NextJId = CachedProvider->GetJunctionForLane(NextLane);
-						UE_LOG(LogAAATraffic, Warning,
-							TEXT("JNCT LOOKAHEAD: Pawn='%s' CurrentLane=%d NextLane=%d "
-								 "GetJunctionForLane(next)=%d"),
-							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
-							CurrentLane.HandleId, NextLane.HandleId, NextJId);
+						if (GTrafficJunctionDiagnostics >= 1)
+						{
+							UE_LOG(LogAAATraffic, Log,
+								TEXT("JNCT LOOKAHEAD: Pawn='%s' CurrentLane=%d NextLane=%d "
+									 "GetJunctionForLane(next)=%d"),
+								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+								CurrentLane.HandleId, NextLane.HandleId, NextJId);
+						}
 						if (NextJId != 0)
 						{
 							DetectedJunctionId = NextJId;
@@ -1417,14 +1423,17 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 				{
 					DetectedJunctionId = ApproachJunctionId;
 					DetectedJunctionLane = ApproachJunctionLane;
-					UE_LOG(LogAAATraffic, Warning,
-						TEXT("JNCT PRECOMPUTED-HIT: Pawn='%s' CurrentLane=%d — 1-hop LOOKAHEAD "
-							 "missed, using precomputed map: JunctionId=%d Dist=%.1f JnctLane=%d"),
-						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
-						CurrentLane.HandleId,
-						ApproachJunctionId,
-						ApproachJunctionDistanceCm,
-						ApproachJunctionLane.HandleId);
+					if (GTrafficJunctionDiagnostics >= 1)
+					{
+						UE_LOG(LogAAATraffic, Log,
+							TEXT("JNCT PRECOMPUTED-HIT: Pawn='%s' CurrentLane=%d — 1-hop LOOKAHEAD "
+								 "missed, using precomputed map: JunctionId=%d Dist=%.1f JnctLane=%d"),
+							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+							CurrentLane.HandleId,
+							ApproachJunctionId,
+							ApproachJunctionDistanceCm,
+							ApproachJunctionLane.HandleId);
+					}
 				}
 
 				// Skip re-acquisition when we already hold this junction's occupancy.
@@ -1432,32 +1441,41 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 				// transitions to a new lane still inside the same junction.
 				if (DetectedJunctionId != 0 && DetectedJunctionId == IntersectionJunctionId)
 				{
-					UE_LOG(LogAAATraffic, Warning,
-						TEXT("JNCT SKIP-REDETECT: Pawn='%s' JunctionId=%d — already holds "
-							 "occupancy, skipping signal check, proceeding to CheckLaneTransition"),
-						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
-						DetectedJunctionId);
+					if (GTrafficJunctionDiagnostics >= 1)
+					{
+						UE_LOG(LogAAATraffic, Log,
+							TEXT("JNCT SKIP-REDETECT: Pawn='%s' JunctionId=%d — already holds "
+								 "occupancy, skipping signal check, proceeding to CheckLaneTransition"),
+							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+							DetectedJunctionId);
+					}
 				}
 				else if (DetectedJunctionId != 0 && DetectedJunctionId == LastReleasedJunctionId)
 				{
 					// Junction was just released on this lane (curve-complete fired
 					// before lane-end). Don't re-acquire — the vehicle is exiting.
-					UE_LOG(LogAAATraffic, Warning,
-						TEXT("JNCT SKIP-RELEASED: Pawn='%s' JunctionId=%d — junction was "
-							 "just released on this lane, skipping re-acquisition"),
-						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
-						DetectedJunctionId);
+					if (GTrafficJunctionDiagnostics >= 1)
+					{
+						UE_LOG(LogAAATraffic, Log,
+							TEXT("JNCT SKIP-RELEASED: Pawn='%s' JunctionId=%d — junction was "
+								 "just released on this lane, skipping re-acquisition"),
+							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+							DetectedJunctionId);
+					}
 				}
 				else if (DetectedJunctionId != 0)
 				{
 					// Abort any active lane change — intersection takes priority.
 					if (LaneChangeState != ELaneChangeState::None)
 					{
-						UE_LOG(LogAAATraffic, Warning,
-							TEXT("JNCT LANE-CHANGE-ABORT: Pawn='%s' JunctionId=%d — "
-								 "aborting lane change (state=%d) to handle intersection"),
-							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
-							DetectedJunctionId, static_cast<int32>(LaneChangeState));
+						if (GTrafficJunctionDiagnostics >= 1)
+						{
+							UE_LOG(LogAAATraffic, Log,
+								TEXT("JNCT LANE-CHANGE-ABORT: Pawn='%s' JunctionId=%d — "
+									 "aborting lane change (state=%d) to handle intersection"),
+								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+								DetectedJunctionId, static_cast<int32>(LaneChangeState));
+						}
 						LaneChangeState = ELaneChangeState::None;
 						LaneChangeProgress = 0.0f;
 						LaneChangeSettleTimer = 0.0f;
@@ -1735,7 +1753,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 					VehicleMovement->SetBrakeInput(0.0f);
 				}
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 				DbgStateName = TEXT("WAITING");
 				DbgBrake = WaitBrake;
 				DbgThrottle = 0.0f;
@@ -1758,7 +1776,14 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 			{
 				if (LaneChangeState != ELaneChangeState::None)
 				{
-					return;
+					// Lane change was still in progress when we reached the
+					// transition threshold.  Abort the change so the vehicle
+					// can proceed to CheckLaneTransition on the current lane
+					// instead of being stuck in an incomplete merge.
+					LaneChangeState = ELaneChangeState::None;
+					LaneChangeProgress = 0.0f;
+					LaneChangeSettleTimer = 0.0f;
+					TargetLanePoints.Empty();
 				}
 
 				CheckLaneTransition();
@@ -1792,11 +1817,14 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 						}
 						else
 						{
-							UE_LOG(LogAAATraffic, Warning,
-								TEXT("JNCT HOLD: Pawn='%s' junction %d — new lane %d still in "
-									 "same junction, keeping occupancy"),
-								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
-								IntersectionJunctionId, CurrentLane.HandleId);
+							if (GTrafficJunctionDiagnostics >= 1)
+							{
+								UE_LOG(LogAAATraffic, Log,
+									TEXT("JNCT HOLD: Pawn='%s' junction %d — new lane %d still in "
+										 "same junction, keeping occupancy"),
+									GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+									IntersectionJunctionId, CurrentLane.HandleId);
+							}
 						}
 					}
 					return;
@@ -1938,7 +1966,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		{
 			float LeaderSpeed = 0.0f;
 			const float LeaderDist = GetLeaderDistance(LeaderSpeed);
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 			DbgLeaderDist = LeaderDist;
 			DbgLeaderSpeed = LeaderSpeed;
 #endif
@@ -2031,7 +2059,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		{
 			EffectiveTargetSpeed = ApproachCap;
 		}
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 		DbgStateName = TEXT("APPROACH");
 #endif
 	}
@@ -2141,7 +2169,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	VehicleMovement->SetSteeringInput(SteeringInput);
 	VehicleMovement->SetBrakeInput(BrakeInput);
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	DbgThrottle = ThrottleInput;
 	DbgBrake = BrakeInput;
 	DbgSteering = SteeringInput;
@@ -2487,17 +2515,21 @@ void ATrafficVehicleController::CheckLaneTransition()
 	const int32 SavedJunctionId = IntersectionJunctionId;
 	const FTrafficLaneHandle SavedJunctionLane = IntersectionJunctionLane;
 	const bool bSavedHasEntryPos = bHasIntersectionEntryPos;
+	const FVector SavedEntryWorldPos = IntersectionEntryWorldPos;
 
-	UE_LOG(LogAAATraffic, Warning,
-		TEXT("JNCT TRANSITION-PRE-INIT: Pawn='%s' OldLane=%d NextLane=%d "
-			 "IntersectionJunctionId=%d bWaiting=%s bHasEntryPos=%s JunctionTransPts=%d "
-			 "— about to call InitializeLaneFollowing (junction state saved)"),
-		GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
-		CurrentLane.HandleId, NextLane.HandleId,
-		SavedJunctionId,
-		bWaitingAtIntersection ? TEXT("YES") : TEXT("NO"),
-		bSavedHasEntryPos ? TEXT("YES") : TEXT("NO"),
-		JunctionTransitionPoints.Num());
+	if (GTrafficJunctionDiagnostics >= 1)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("JNCT TRANSITION-PRE-INIT: Pawn='%s' OldLane=%d NextLane=%d "
+				 "IntersectionJunctionId=%d bWaiting=%s bHasEntryPos=%s JunctionTransPts=%d "
+				 "— about to call InitializeLaneFollowing (junction state saved)"),
+			GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+			CurrentLane.HandleId, NextLane.HandleId,
+			SavedJunctionId,
+			bWaitingAtIntersection ? TEXT("YES") : TEXT("NO"),
+			bSavedHasEntryPos ? TEXT("YES") : TEXT("NO"),
+			JunctionTransitionPoints.Num());
+	}
 
 	InitializeLaneFollowing(NextLane);
 
@@ -2505,14 +2537,18 @@ void ATrafficVehicleController::CheckLaneTransition()
 	IntersectionJunctionId = SavedJunctionId;
 	IntersectionJunctionLane = SavedJunctionLane;
 	bHasIntersectionEntryPos = bSavedHasEntryPos;
+	IntersectionEntryWorldPos = SavedEntryWorldPos;
 
-	UE_LOG(LogAAATraffic, Warning,
-		TEXT("JNCT TRANSITION-POST-INIT: Pawn='%s' NewLane=%d "
-			 "IntersectionJunctionId=%d bWaiting=%s (junction ID restored)"),
-		GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
-		NextLane.HandleId,
-		IntersectionJunctionId,
-		bWaitingAtIntersection ? TEXT("YES") : TEXT("NO"));
+	if (GTrafficJunctionDiagnostics >= 1)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("JNCT TRANSITION-POST-INIT: Pawn='%s' NewLane=%d "
+				 "IntersectionJunctionId=%d bWaiting=%s (junction ID restored)"),
+			GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+			NextLane.HandleId,
+			IntersectionJunctionId,
+			bWaitingAtIntersection ? TEXT("YES") : TEXT("NO"));
+	}
 
 	// If lane following could not be initialized for the selected connected lane,
 	// treat this as a dead end so braking logic engages.
