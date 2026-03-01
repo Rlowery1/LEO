@@ -17,10 +17,11 @@ public class AAA_Traffic : ModuleRules
 				"InputCore",
 				"EnhancedInput",
 				"AIModule",
-				"ChaosVehicles"
+				"ChaosVehicles",
+				"Chaos"
 			}
 		);
 
-		PrivateDependencyModuleNames.AddRange(new string[] { "Chaos" });
+		PrivateDependencyModuleNames.AddRange(new string[] { });
 	}
 }

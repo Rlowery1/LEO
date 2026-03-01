@@ -34,6 +34,18 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FOnProviderRegistered, ITrafficRoadProvider*
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnVehicleDespawned, ATrafficVehicleController* /*Controller*/, const FTrafficLaneHandle& /*Lane*/);
 
 /**
+ * Record of a vehicle currently traversing a junction.
+ * Stores the approach and exit lanes so the conflict test can determine
+ * whether two simultaneous movements would geometrically cross.
+ */
+struct FJunctionOccupant
+{
+	TWeakObjectPtr<ATrafficVehicleController> Controller;
+	FTrafficLaneHandle FromLane;
+	FTrafficLaneHandle ToLane;
+};
+
+/**
  * World subsystem that holds a reference to the active road provider.
  * Road-kit adapters register themselves here; the traffic system queries through here.
  *
@@ -116,11 +128,24 @@ public:
 
 	// --- Junction Occupancy ---
 
-	/** Mark a junction as occupied by a vehicle (returns false if already occupied by another). */
-	bool TryOccupyJunction(int32 JunctionId, ATrafficVehicleController* Controller);
+	/**
+	 * Attempt to enter a junction. Checks for geometric path conflicts with
+	 * all current occupants via the provider's DoJunctionPathsConflict.
+	 * Returns false if any existing occupant's path conflicts.
+	 */
+	bool TryOccupyJunction(int32 JunctionId, ATrafficVehicleController* Controller,
+		const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane);
 
 	/** Release junction occupancy for the given vehicle. */
 	void ReleaseJunction(int32 JunctionId, ATrafficVehicleController* Controller);
+
+	// --- Road Speed Limits ---
+
+	/** Set a speed limit for a specific road (pushed by the spawner during setup). */
+	void SetRoadSpeedLimit(int32 RoadHandleId, float SpeedLimit);
+
+	/** Get the speed limit for a road. Returns -1 if no override exists. */
+	float GetRoadSpeedLimit(int32 RoadHandleId) const;
 
 	// --- Vehicle Pool ---
 
@@ -211,6 +236,11 @@ private:
 
 	// --- Junction occupancy ---
 
-	/** Junction ID → vehicle currently traversing it. */
-	TMap<int32, TWeakObjectPtr<ATrafficVehicleController>> JunctionOccupancy;
+	/** Junction ID → vehicles currently traversing it (multi-vehicle). */
+	TMap<int32, TArray<FJunctionOccupant>> JunctionOccupancy;
+
+	// --- Road speed limits ---
+
+	/** Road handle ID → speed limit (cm/s), pushed by the spawner. */
+	TMap<int32, float> RoadSpeedLimits;
 };

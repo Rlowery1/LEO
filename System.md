@@ -249,3 +249,49 @@ A task is considered DONE only when:
 - No packaging regressions introduced
 
 Otherwise status remains UNVERIFIED or FAILED.
+
+============================================================
+SECTION 10 — CODE HYGIENE & DUPLICATION PREVENTION
+============================================================
+
+10.1 Single Implementation Per Role
+
+There must be exactly ONE class registered for any given subsystem role.
+
+Examples:
+- One ITrafficRoadProvider implementation (currently URoadBLDReflectionProvider)
+- One UTrafficSubsystem
+- One vehicle controller class
+
+The assistant must not:
+- Create a second class that fills the same role as an existing one
+- Leave a superseded class in the codebase
+- Create "fallback" or "alternative" implementations without deleting the old one
+
+If a new approach replaces an old one, the old one must be removed
+in the same change.
+
+10.2 No Dead Code
+
+Superseded code must be deleted, not commented out or left "as backup."
+Source control history exists for recovery.
+
+The assistant must not:
+- Leave old implementations alongside new ones
+- Keep unused modules compiled into the plugin
+- Leave stub methods that always return false/0 and are never overridden
+
+10.3 Module Inventory (Enforced)
+
+The plugin contains exactly these runtime modules:
+
+- AAA_Traffic (core runtime — vehicles, spawner, signals, road provider)
+- AAA_TrafficEditor (editor-only — detail panel customization)
+
+Do not add new modules without explicit user approval and justification.
+
+10.4 No Duplicate Utility Code
+
+Shared utilities (math helpers, geometry functions, etc.) must live in
+a single location. Copy-pasting a function into a second file and
+renaming it to avoid linker collisions is prohibited.

@@ -251,6 +251,27 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
 	float DefaultSpeedLimit;
 
+	// ── Speed Tiers ─────────────────────────────────────────
+
+	/** Residential speed tier (cm/s). ~25 mph / 40 km/h. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Speed Tiers", meta = (ClampMin = "0"))
+	float ResidentialSpeed;
+
+	/** Urban/arterial speed tier (cm/s). ~45 mph / 72 km/h. Also used as the
+	 *  default when no per-road override is configured. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Speed Tiers", meta = (ClampMin = "0"))
+	float UrbanSpeed;
+
+	/** Highway/freeway speed tier (cm/s). ~65 mph / 105 km/h. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Speed Tiers", meta = (ClampMin = "0"))
+	float HighwaySpeed;
+
+	/** Per-road speed overrides (road handle ID → speed cm/s).
+	 *  Map specific roads to a speed limit. Use the road handle IDs shown
+	 *  in the debug draw overlay. Roads not in this map use DefaultSpeedLimit. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Speed Tiers")
+	TMap<int32, float> RoadSpeedOverrides;
+
 	/** Automatically spawn traffic signal controllers at discovered junctions. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	bool bAutoPlaceSignals = true;

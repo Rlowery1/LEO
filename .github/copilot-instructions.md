@@ -85,6 +85,12 @@ Rule:
 - Minimal diffs; no broad refactors unless explicitly requested.
 - If CI fails: fix the **first** compiler error with the smallest change; avoid rewrites.
 
+## Code Hygiene (Non-Negotiable)
+- **One implementation per role.** There must be exactly one class for each subsystem role (e.g., one `ITrafficRoadProvider`). Never create a second class that does the same job — extend or replace the existing one.
+- **No dead code.** If code is superseded, delete it in the same change. Source control has the history.
+- **Module inventory is locked.** The plugin has exactly two modules: `AAA_Traffic` (core runtime) and `AAA_TrafficEditor` (editor-only). Do not add new modules without explicit user approval.
+- **No copy-paste utilities.** Shared functions live in one place. Do not duplicate a function into a second file and rename it to avoid collisions.
+
 ## Completion Criteria
 A task is DONE only when:
 - Patch delivered

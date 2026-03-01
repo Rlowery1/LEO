@@ -58,6 +58,20 @@ static FAutoConsoleVariableRef CVarTrafficVehicleDiagnostics(
 	TEXT("Enable deep vehicle diagnostics logging: 0=off (default), 1=on. Keep off in production to avoid log spam and per-tick overhead."),
 	ECVF_Default);
 
+int32 GTrafficDebugDraw = 0;
+static FAutoConsoleVariableRef CVarTrafficDebugDraw(
+	TEXT("traffic.DebugDraw"),
+	GTrafficDebugDraw,
+	TEXT("Global toggle for in-world debug visualization: 0=off (default), 1=on for ALL vehicles. Overrides per-vehicle bDebugDraw."),
+	ECVF_Default);
+
+static int32 GTrafficJunctionDiagnostics = 0;
+static FAutoConsoleVariableRef CVarTrafficJunctionDiagnostics(
+	TEXT("traffic.JunctionDiagnostics"),
+	GTrafficJunctionDiagnostics,
+	TEXT("Junction diagnostic flood logging: 0=off, 1=per-tick approach scan + detection gate, 2=verbose every-branch trace. Use 1 to diagnose why vehicles ignore intersections."),
+	ECVF_Default);
+
 namespace
 {
 	static bool IsVehicleTraceEnabled(const int32 RequiredLevel)
@@ -73,8 +87,15 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, bAtDeadEnd(false)
 	, JunctionTransitionIndex(0)
 	, bWaitingAtIntersection(false)
+	, IntersectionRetryTimer(0.0f)
 	, IntersectionJunctionId(0)
+	, IntersectionEntryWorldPos(FVector::ZeroVector)
+	, bHasIntersectionEntryPos(false)
 	, DistanceTraveledOnLane(0.0f)
+	, IntersectionWaitElapsed(0.0f)
+	, WaitLogThrottleCounter(0)
+	, LODAccumulatedDeltaTime(0.0f)
+	, DiagJunctionTimer(0.0f)
 	, PreviousVehicleLocation(FVector::ZeroVector)
 	, DistanceThisTick(0.0f)
 	, LastClosestIndex(0)
@@ -94,6 +115,14 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, LaneChangeSpeedThreshold(0.6f)
 	, LaneChangeGapRequired(800.f)
 	, DefaultSpeedLimit(0.0f)
+	, StopLineMarginCm(0.0f)
+	, JunctionScanMaxDistanceCm(50000.0f)
+	, MaxJunctionScanHops(10)
+	, ApproachSafetyMarginCm(500.0f)
+	, ApproachDecelCmPerSec2(300.0f)
+	, IntersectionSpeedLimitCmPerSec(2000.0f)
+	, MaxIntersectionWaitTimeSec(90.0f)
+	, VehicleFrontExtent(0.0f)
 	, RandomSeed(0)
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -129,6 +158,19 @@ void ATrafficVehicleController::SetDefaultSpeedLimit(float InSpeedLimit)
 
 void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle& InLane)
 {
+	// ── JUNCTION DIAG: log the state BEFORE we reset it ──
+	if (IntersectionJunctionId != 0 || bWaitingAtIntersection || JunctionTransitionPoints.Num() > 0)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("JNCT INIT-RESET: Pawn='%s' BEFORE reset — IntersectionJunctionId=%d "
+				 "bWaiting=%s JunctionTransPts=%d NewLane=%d (these values are about to be ERASED)"),
+			GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+			IntersectionJunctionId,
+			bWaitingAtIntersection ? TEXT("YES") : TEXT("NO"),
+			JunctionTransitionPoints.Num(),
+			InLane.HandleId);
+	}
+
 	CurrentLane = InLane;
 	bLaneDataReady = false;
 	bAtDeadEnd = false;
@@ -139,6 +181,19 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 	JunctionTransitionIndex = 0;
 	bWaitingAtIntersection = false;
 	IntersectionJunctionId = 0;
+	LastReleasedJunctionId = 0;
+	IntersectionJunctionLane = FTrafficLaneHandle();
+	IntersectionEntryWorldPos = FVector::ZeroVector;
+	bHasIntersectionEntryPos = false;
+	IntersectionWaitElapsed = 0.0f;
+	WaitLogThrottleCounter = 0;
+
+	// Reset approach scan state.
+	bApproachingIntersection = false;
+	ApproachJunctionDistanceCm = 0.0f;
+	ApproachSpeedLimitCmPerSec = 0.0f;
+	ApproachJunctionId = 0;
+	ApproachJunctionLane = FTrafficLaneHandle();
 
 	// Reset lane-change state when entering a new lane.
 	LaneChangeState = ELaneChangeState::None;
@@ -166,6 +221,39 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 	if (Provider->GetLanePath(CurrentLane, LanePoints, LaneWidth) && LanePoints.Num() >= 2)
 	{
 		bLaneDataReady = true;
+
+		// --- JUNCTION DIAGNOSTIC: Immediately check what the precomputed map
+		// says about this lane so we know ON SPAWN whether this vehicle will
+		// ever detect junctions ---
+		{
+			const float TotalLen = Provider->GetLaneLength(CurrentLane);
+			const ITrafficRoadProvider::FJunctionScanResult InitScan =
+				Provider->GetDistanceToNextJunction(CurrentLane, TotalLen, 50000.0f, 10);
+			const int32 DirectJunction = Provider->GetJunctionForLane(CurrentLane);
+			TArray<FTrafficLaneHandle> InitConnected = Provider->GetConnectedLanes(CurrentLane);
+
+			FString ConnStr;
+			for (const FTrafficLaneHandle& C : InitConnected)
+			{
+				const int32 CJnct = Provider->GetJunctionForLane(C);
+				ConnStr += FString::Printf(TEXT(" %d(jnct=%d)"), C.HandleId, CJnct);
+			}
+
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JDIAG LANE-INIT: Pawn='%s' Lane=%d Length=%.0f DirectJunction=%d "
+					 "PrecomputedScan=%s ScanJnctId=%d ScanDist=%.0f ScanJnctLane=%d "
+					 "NumConnections=%d Connections=[%s]"),
+				GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+				CurrentLane.HandleId,
+				TotalLen,
+				DirectJunction,
+				InitScan.IsValid() ? TEXT("VALID") : TEXT("INVALID"),
+				InitScan.JunctionId,
+				InitScan.DistanceCm,
+				InitScan.JunctionLane.HandleId,
+				InitConnected.Num(),
+				*ConnStr);
+		}
 
 		// Compute total lane length for diagnostics.
 		float TotalLaneLength = 0.0f;
@@ -321,6 +409,36 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 				*InPawn->GetName(), NumWheels);
 		}
 
+		// --- Compute front-bumper extent from actor bounds ---
+		// The bounding box forward half-length tells us how far the front
+		// bumper is from the actor origin along the forward axis.
+		// This adapts to any vehicle mesh — sedans, trucks, buses.
+		{
+			const FBox ActorBounds = InPawn->GetComponentsBoundingBox(/*bNonColliding=*/ false);
+			if (ActorBounds.IsValid)
+			{
+				const FVector ActorOrigin = InPawn->GetActorLocation();
+				const FVector ActorForward = InPawn->GetActorForwardVector();
+				// Project bounding box extents onto the forward axis.
+				const FVector HalfExtents = ActorBounds.GetExtent();
+				// Use the box center-to-max projected onto forward direction.
+				// For a typical vehicle, the forward extent is roughly half the length.
+				const FVector BoxCenter = ActorBounds.GetCenter();
+				const FVector OriginToMax = ActorBounds.Max - ActorOrigin;
+				VehicleFrontExtent = FMath::Abs(FVector::DotProduct(OriginToMax, ActorForward));
+				// Clamp to reasonable range to handle edge cases.
+				VehicleFrontExtent = FMath::Clamp(VehicleFrontExtent, 50.0f, 1000.0f);
+			}
+			else
+			{
+				// Fallback: typical sedan half-length.
+				VehicleFrontExtent = 250.0f;
+			}
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("VehicleController::OnPossess: Vehicle '%s' front bumper extent = %.1f cm"),
+				*InPawn->GetName(), VehicleFrontExtent);
+		}
+
 		// --- Neutralize marketplace BP physics-optimization parking ---
 		// PROVEN ROOT CAUSE: The parent vehicle Blueprint (DD_Vehicles_Advanced)
 		// runs "Physics optimization" every tick via EventTick → Sequence Then 0.
@@ -434,8 +552,19 @@ void ATrafficVehicleController::OnUnPossess()
 			// Release any junction occupancy before unregistering.
 			if (IntersectionJunctionId != 0)
 			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JNCT RELEASE-UNPOSSESS: Pawn='%s' releasing junction %d on unpossess/destroy"),
+					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+					IntersectionJunctionId);
 				TrafficSub->ReleaseJunction(IntersectionJunctionId, this);
 				IntersectionJunctionId = 0;
+				bHasIntersectionEntryPos = false;
+			}
+			else
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JNCT RELEASE-UNPOSSESS: Pawn='%s' unpossess — IntersectionJunctionId=0, nothing to release"),
+					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"));
 			}
 			TrafficSub->UnregisterVehicle(this);
 		}
@@ -702,6 +831,12 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 
 	// --- LOD-based tick gating (Feature 7) ---
 	// Reduced: tick every 4 frames. Minimal: tick every 10 frames.
+	//
+	// FIX (was MAJOR): Previously skipped frames entirely with bare `return`,
+	// so DeltaTime was lost — vehicle behavior became frame-rate dependent.
+	// Now we accumulate DeltaTime across skipped frames and pass the total
+	// to UpdateVehicleInput on the tick that fires, making the update
+	// frame-rate independent.
 	UTrafficSubsystem* TrafficSub = nullptr;
 	ETrafficLOD CurrentLOD = ETrafficLOD::Full;
 	if (UWorld* World = GetWorld())
@@ -716,48 +851,196 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 
 	if (CurrentLOD == ETrafficLOD::Reduced && (LODFrameCounter % 4) != 0)
 	{
+		LODAccumulatedDeltaTime += DeltaSeconds;
 		return;
 	}
 	if (CurrentLOD == ETrafficLOD::Minimal && (LODFrameCounter % 10) != 0)
 	{
-		// Minimal LOD: teleport along polyline instead of physics input.
+		// Minimal LOD: teleport along polyline using accumulated time and
+		// speed to advance the correct number of points (frame-rate safe).
+		LODAccumulatedDeltaTime += DeltaSeconds;
 		if (LanePoints.Num() >= 2)
 		{
-			const int32 NextIdx = FMath::Min(LastClosestIndex + 1, LanePoints.Num() - 1);
-			if (NextIdx != LastClosestIndex)
+			const float TeleportDist = TargetSpeed * LODAccumulatedDeltaTime;
+			float DistRemaining = TeleportDist;
+			int32 Idx = LastClosestIndex;
+			while (Idx < LanePoints.Num() - 1 && DistRemaining > 0.0f)
 			{
-				GetPawn()->SetActorLocation(LanePoints[NextIdx], /*bSweep*/ false, /*OutSweepHitResult*/ nullptr, ETeleportType::TeleportPhysics);
-				LastClosestIndex = NextIdx;
+				const float SegLen = FVector::Dist(LanePoints[Idx], LanePoints[Idx + 1]);
+				if (SegLen <= DistRemaining)
+				{
+					DistRemaining -= SegLen;
+					++Idx;
+				}
+				else
+				{
+					break;
+				}
+			}
+			if (Idx != LastClosestIndex)
+			{
+				GetPawn()->SetActorLocation(LanePoints[Idx], /*bSweep*/ false, /*OutSweepHitResult*/ nullptr, ETeleportType::TeleportPhysics);
+				LastClosestIndex = Idx;
 			}
 		}
+		LODAccumulatedDeltaTime = 0.0f; // consumed by teleport
 		return;
 	}
 
-	UpdateVehicleInput(DeltaSeconds);
+	// Active tick: pass accumulated time from skipped frames + this frame's delta.
+	const float EffectiveDeltaSeconds = DeltaSeconds + LODAccumulatedDeltaTime;
+	LODAccumulatedDeltaTime = 0.0f;
+	UpdateVehicleInput(EffectiveDeltaSeconds);
 
 #if ENABLE_DRAW_DEBUG
-	if (bDebugDraw && GetPawn())
+	if ((bDebugDraw || GTrafficDebugDraw != 0) && GetPawn())
 	{
 		const UWorld* DbgWorld = GetWorld();
 		const FVector VehicleLoc = GetPawn()->GetActorLocation();
+		const FVector VehicleFwd = GetPawn()->GetActorForwardVector();
+		const FVector TextBase = VehicleLoc + FVector(0, 0, 180.0f); // Above the car roof
 
-		// Draw lane polyline (cyan).
+		// --- Color based on state ---
+		FColor StateColor = FColor::Green; // CRUISING
+		if (DbgStateName == TEXT("WAITING"))          { StateColor = FColor::Red; }
+		else if (DbgStateName == TEXT("BRAKING"))     { StateColor = FColor(255, 165, 0); } // Orange
+		else if (DbgStateName == TEXT("FOLLOWING"))   { StateColor = FColor::Yellow; }
+		else if (DbgStateName == TEXT("IN-JNCT"))     { StateColor = FColor(0, 200, 200); } // Teal
+		else if (DbgStateName == TEXT("APPROACH"))    { StateColor = FColor(255, 200, 0); } // Amber
+
+		// --- LINE 1: Vehicle name + state ---
+		const FString VehicleName = GetPawn()->GetName();
+		// Strip BP_Sedan_child_base_ prefix for readability.
+		FString ShortName = VehicleName;
+		ShortName.ReplaceInline(TEXT("BP_Sedan_child_base_"), TEXT(""));
+		const FString Line1 = FString::Printf(TEXT("%s [%s]"), *ShortName, *DbgStateName);
+		DrawDebugString(DbgWorld, TextBase, Line1, nullptr, StateColor, 0.0f, true, 1.2f);
+
+		// --- LINE 2: Speed (mph) + Brake% ---
+		const float SpeedMph = FMath::Abs(DbgCurrentSpeed) * 0.0223694f; // cm/s -> mph
+		const FString Line2 = FString::Printf(TEXT("%.0f mph  Brake:%.0f%%  Throttle:%.0f%%"),
+			SpeedMph, DbgBrake * 100.0f, DbgThrottle * 100.0f);
+		DrawDebugString(DbgWorld, TextBase + FVector(0, 0, -20), Line2, nullptr, FColor::White, 0.0f, true, 1.0f);
+
+		// --- LINE 3: Lane + RemainingDist + TransitionThreshold ---
+		const FString Line3 = FString::Printf(TEXT("Lane:%d  Rem:%.0f  Thresh:%.0f  StopDist:%.0f"),
+			CurrentLane.HandleId, DbgRemainingDist, DbgTransitionThreshold, DbgStoppingDist);
+		DrawDebugString(DbgWorld, TextBase + FVector(0, 0, -40), Line3, nullptr, FColor::White, 0.0f, true, 0.9f);
+
+		// --- LINE 4: Intersection-specific info (only when approaching/waiting) ---
+		if (DbgDistToEntry >= 0.0f || bWaitingAtIntersection)
+		{
+			const FString Line4 = FString::Printf(TEXT("DistToEntry:%.0f  DesiredStop:%.0f  Jnct:%d"),
+				DbgDistToEntry, DbgDesiredStopSpeed, IntersectionJunctionId);
+			DrawDebugString(DbgWorld, TextBase + FVector(0, 0, -58), Line4, nullptr,
+				FColor::Red, 0.0f, true, 0.9f);
+		}
+
+		// --- LINE 4b: Junction Approach Scan info (when scan detected a junction ahead) ---
+		if (DbgApproachJunctionDist >= 0.0f)
+		{
+			const float ApproachMph = DbgApproachSpeedLimit * 0.0223694f;
+			const FString Line4b = FString::Printf(TEXT("SCAN: Jnct:%d  Dist:%.0f  VLimit:%.0fmph  %s"),
+				DbgApproachJunctionId,
+				DbgApproachJunctionDist,
+				ApproachMph,
+				bApproachingIntersection ? TEXT("BRAKING") : TEXT("OK"));
+			const FColor ScanColor = bApproachingIntersection ? FColor(255, 165, 0) : FColor(0, 200, 100);
+			DrawDebugString(DbgWorld, TextBase + FVector(0, 0, -94), Line4b, nullptr,
+				ScanColor, 0.0f, true, 0.9f);
+		}
+
+		// --- LINE 5: Leader info (only when following) ---
+		if (DbgLeaderDist >= 0.0f)
+		{
+			const float LeaderMph = FMath::Abs(DbgLeaderSpeed) * 0.0223694f;
+			const FString Line5 = FString::Printf(TEXT("Leader:%.0fcm  LeaderSpeed:%.0fmph  FollowDist:%.0f"),
+				DbgLeaderDist, LeaderMph, FollowingDistance);
+			DrawDebugString(DbgWorld, TextBase + FVector(0, 0, -76), Line5, nullptr,
+				FColor::Yellow, 0.0f, true, 0.9f);
+
+			// Orange line from car to detected leader position.
+			const FVector LeaderPos = VehicleLoc + VehicleFwd * DbgLeaderDist;
+			DrawDebugLine(DbgWorld, VehicleLoc, LeaderPos, FColor::Orange, false, -1.0f, 0, 2.5f);
+			DrawDebugSphere(DbgWorld, LeaderPos, 40.0f, 6, FColor::Orange, false, -1.0f, 0, 2.0f);
+		}
+
+		// --- INTERSECTION ENTRY POINT: Red sphere where the car thinks it must stop ---
+		if (bHasIntersectionEntryPos)
+		{
+			DrawDebugSphere(DbgWorld, IntersectionEntryWorldPos, 60.0f, 8, FColor::Red, false, -1.0f, 0, 3.0f);
+			// Yellow line from car to entry point — shows actual stopping gap.
+			DrawDebugLine(DbgWorld, VehicleLoc, IntersectionEntryWorldPos, FColor::Yellow, false, -1.0f, 0, 2.5f);
+
+			// Blue sphere: where the decel curve predicts the car WILL stop
+			// (v^2 / (2*300) cm from current position along forward vector).
+			if (DbgStoppingDist > 10.0f)
+			{
+				const FVector PredictedStop = VehicleLoc + VehicleFwd * DbgStoppingDist;
+				DrawDebugSphere(DbgWorld, PredictedStop, 40.0f, 6, FColor::Blue, false, -1.0f, 0, 2.5f);
+				DrawDebugLine(DbgWorld, VehicleLoc, PredictedStop, FColor::Blue, false, -1.0f, 0, 1.5f);
+			}
+		}
+
+		// --- STOPPING DISTANCE vs REMAINING DISTANCE comparison bar ---
+		// Visualize whether the car CAN physically stop before lane end.
+		// Green bar = can stop. Red bar = cannot stop (will overshoot).
+		if (DbgRemainingDist > 0.0f && DbgStoppingDist > 0.0f)
+		{
+			const bool bCanStop = (DbgStoppingDist <= DbgRemainingDist);
+			const FColor BarColor = bCanStop ? FColor::Green : FColor::Red;
+			// Draw a line along forward vector showing stopping distance,
+			// with the length clamped to remaining distance for comparison.
+			const float BarLen = FMath::Min(DbgStoppingDist, DbgRemainingDist + 500.0f);
+			const FVector BarEnd = VehicleLoc + VehicleFwd * BarLen;
+			DrawDebugLine(DbgWorld, VehicleLoc + FVector(0,0,50), BarEnd + FVector(0,0,50),
+				BarColor, false, -1.0f, 0, 4.0f);
+		}
+
+		// --- LANE POLYLINE (cyan) ---
 		for (int32 i = 0; i < LanePoints.Num() - 1; ++i)
 		{
 			DrawDebugLine(DbgWorld, LanePoints[i], LanePoints[i + 1], FColor::Cyan, false, -1.0f, 0, 2.0f);
 		}
 
-		// Draw look-ahead target (green sphere).
-		const int32 DbgClosest = FindClosestPointIndex(VehicleLoc);
-		const FVector LookPt = GetLookAheadPoint(VehicleLoc, DbgClosest);
-		DrawDebugSphere(DbgWorld, LookPt, 30.0f, 6, FColor::Green, false, -1.0f, 0, 2.0f);
-		DrawDebugLine(DbgWorld, VehicleLoc, LookPt, FColor::Green, false, -1.0f, 0, 1.5f);
+		// --- LOOK-AHEAD TARGET (green sphere + line) ---
+		if (!DbgTargetPoint.IsZero())
+		{
+			DrawDebugSphere(DbgWorld, DbgTargetPoint, 30.0f, 6, FColor::Green, false, -1.0f, 0, 2.0f);
+			DrawDebugLine(DbgWorld, VehicleLoc, DbgTargetPoint, FColor::Green, false, -1.0f, 0, 1.5f);
+		}
 
-		// Draw detection range (orange line).
-		const FVector DetEnd = VehicleLoc + GetPawn()->GetActorForwardVector() * DetectionDistance;
-		DrawDebugLine(DbgWorld, VehicleLoc, DetEnd, FColor::Orange, false, -1.0f, 0, 1.0f);
+		// --- TRANSITION THRESHOLD RING (white circle at lane end minus threshold) ---
+		if (DbgTransitionThreshold > 0.0f && LanePoints.Num() >= 2)
+		{
+			// Walk backward from lane end to find the threshold position.
+			float DistFromEnd = 0.0f;
+			FVector ThreshPt = LanePoints.Last();
+			for (int32 i = LanePoints.Num() - 1; i > 0; --i)
+			{
+				const float Seg = FVector::Dist(LanePoints[i], LanePoints[i - 1]);
+				if (DistFromEnd + Seg >= DbgTransitionThreshold)
+				{
+					const float Alpha = (DbgTransitionThreshold - DistFromEnd) / FMath::Max(Seg, 1.0f);
+					ThreshPt = FMath::Lerp(LanePoints[i], LanePoints[i - 1], Alpha);
+					break;
+				}
+				DistFromEnd += Seg;
+			}
+			DrawDebugSphere(DbgWorld, ThreshPt, 50.0f, 8, FColor::White, false, -1.0f, 0, 2.0f);
+		}
 
-		// Draw lane-change target lane (magenta) if active.
+		// --- APPROACH SCAN: Junction marker (orange diamond at scan distance ahead) ---
+		if (DbgApproachJunctionDist > 0.0f)
+		{
+			const FVector ApproachPt = VehicleLoc + VehicleFwd * FMath::Min(DbgApproachJunctionDist, 10000.0f);
+			const FColor ApproachColor = bApproachingIntersection ? FColor(255, 100, 0) : FColor(100, 255, 100);
+			DrawDebugSphere(DbgWorld, ApproachPt, 70.0f, 4, ApproachColor, false, -1.0f, 0, 3.0f);
+			DrawDebugLine(DbgWorld, VehicleLoc + FVector(0, 0, 70), ApproachPt + FVector(0, 0, 70),
+				ApproachColor, false, -1.0f, 0, 2.5f);
+		}
+
+		// --- LANE-CHANGE TARGET LANE (magenta) ---
 		if (LaneChangeState != ELaneChangeState::None)
 		{
 			for (int32 i = 0; i < TargetLanePoints.Num() - 1; ++i)
@@ -829,6 +1112,22 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	const FVector VehicleForward = ControlledPawn->GetActorForwardVector();
 	const float CurrentSpeed = VehicleMovement->GetForwardSpeed();
 
+#if ENABLE_DRAW_DEBUG
+	// Initialize debug cache each tick — will be overwritten by decision branches.
+	DbgCurrentSpeed = CurrentSpeed;
+	DbgStateName = TEXT("CRUISING");
+	DbgThrottle = 0.0f;
+	DbgBrake = 0.0f;
+	DbgSteering = 0.0f;
+	DbgDistToEntry = -1.0f;
+	DbgDesiredStopSpeed = 0.0f;
+	DbgLeaderDist = -1.0f;
+	DbgLeaderSpeed = 0.0f;
+	DbgRemainingDist = 0.0f;
+	DbgTransitionThreshold = 0.0f;
+	DbgStoppingDist = (FMath::Abs(CurrentSpeed) * FMath::Abs(CurrentSpeed)) / (2.0f * ApproachDecelCmPerSec2);
+#endif
+
 	// Track cumulative distance traveled on this lane to prevent short-lane transition loops.
 	DistanceThisTick = 0.0f;
 	if (!PreviousVehicleLocation.IsZero())
@@ -853,106 +1152,655 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	// Find where we are on the lane and where to aim
 	const int32 ClosestIndex = FindClosestPointIndex(VehicleLocation);
 
+	// ── PERIODIC JUNCTION DIAGNOSTIC DUMP (every ~2s per vehicle) ──
+	// Provides a full status snapshot so you can see at a glance which vehicles
+	// are aware of junctions and which are "blind."
+	if (GTrafficJunctionDiagnostics >= 1)
+	{
+		DiagJunctionTimer += DeltaSeconds;
+		if (DiagJunctionTimer >= 2.0f)
+		{
+			DiagJunctionTimer = 0.0f;
+			const float RemDist = GetRemainingDistance(ClosestIndex);
+			const float AbsSp = FMath::Abs(CurrentSpeed);
+			const float StopD = (AbsSp * AbsSp) / (2.0f * FMath::Max(ApproachDecelCmPerSec2, 1.0f));
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JDIAG STATUS: Pawn='%s' Lane=%d LanePts=%d Speed=%.0f "
+					 "RemDist=%.0f StopDist=%.0f DistTraveled=%.0f "
+					 "bDeadEnd=%s Provider=%s "
+					 "bApproaching=%s ApproachDist=%.0f ApproachJnct=%d ApproachLimit=%.0f "
+					 "IntersectionId=%d bWaiting=%s WaitElapsed=%.1f "
+					 "JunctionTransPts=%d"),
+				GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+				CurrentLane.HandleId,
+				LanePoints.Num(),
+				CurrentSpeed,
+				RemDist,
+				StopD,
+				DistanceTraveledOnLane,
+				bAtDeadEnd ? TEXT("YES") : TEXT("NO"),
+				CachedProvider ? TEXT("OK") : TEXT("NULL!!!"),
+				bApproachingIntersection ? TEXT("YES") : TEXT("NO"),
+				ApproachJunctionDistanceCm,
+				ApproachJunctionId,
+				ApproachSpeedLimitCmPerSec,
+				IntersectionJunctionId,
+				bWaitingAtIntersection ? TEXT("YES") : TEXT("NO"),
+				IntersectionWaitElapsed,
+				JunctionTransitionPoints.Num());
+		}
+	}
+
+	// ────────────────────────────────────────────────────────────────
+	// JUNCTION APPROACH — Uses the full precomputed road/junction map.
+	// The provider pre-built distance-to-next-junction for EVERY lane
+	// at world startup, so this is an O(1) lookup — the vehicle has
+	// instant knowledge of the entire road network layout.
+	// ────────────────────────────────────────────────────────────────
+	if (!bAtDeadEnd && CachedProvider && !bWaitingAtIntersection && IntersectionJunctionId == 0)
+	{
+		const float RemainingOnCurrent = GetRemainingDistance(ClosestIndex);
+		const ITrafficRoadProvider::FJunctionScanResult ScanResult =
+			CachedProvider->GetDistanceToNextJunction(
+				CurrentLane,
+				RemainingOnCurrent,
+				JunctionScanMaxDistanceCm,
+				MaxJunctionScanHops);
+
+		if (GTrafficJunctionDiagnostics >= 2)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JDIAG SCAN: Pawn='%s' Lane=%d Remaining=%.1f ScanValid=%s "
+					 "JunctionId=%d Dist=%.1f JunctionLane=%d ApproachLane=%d"),
+				GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+				CurrentLane.HandleId,
+				RemainingOnCurrent,
+				ScanResult.IsValid() ? TEXT("YES") : TEXT("NO"),
+				ScanResult.JunctionId,
+				ScanResult.DistanceCm,
+				ScanResult.JunctionLane.HandleId,
+				ScanResult.ApproachLane.HandleId);
+		}
+
+		if (ScanResult.IsValid())
+		{
+			ApproachJunctionDistanceCm = ScanResult.DistanceCm;
+			ApproachJunctionId = ScanResult.JunctionId;
+			ApproachJunctionLane = ScanResult.JunctionLane;
+
+			// Compute the approach speed envelope:
+			//   v_approach = sqrt(2 * decel * distToJunction)
+			// This is the maximum speed at which the vehicle can still stop
+			// before the junction using comfort deceleration.
+			const float SafeDist = FMath::Max(ApproachJunctionDistanceCm - ApproachSafetyMarginCm, 0.0f);
+			ApproachSpeedLimitCmPerSec = FMath::Sqrt(
+				FMath::Max(2.0f * ApproachDecelCmPerSec2 * SafeDist, 0.0f));
+
+			// Only activate approach slowdown when the current speed would
+			// require braking — avoids unnecessary throttle limiting when
+			// the vehicle is already going slow enough.
+			const float AbsSpeedNow = FMath::Abs(CurrentSpeed);
+			bApproachingIntersection = (AbsSpeedNow > ApproachSpeedLimitCmPerSec + 50.0f) ||
+									   (ApproachJunctionDistanceCm < LookAheadDistance * 3.0f);
+
+#if ENABLE_DRAW_DEBUG
+			DbgApproachJunctionDist = ApproachJunctionDistanceCm;
+			DbgApproachSpeedLimit = ApproachSpeedLimitCmPerSec;
+			DbgApproachJunctionId = ApproachJunctionId;
+#endif
+		}
+		else
+		{
+			// Scan returned invalid — no junction downstream for this lane.
+			if (GTrafficJunctionDiagnostics >= 1)
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JDIAG SCAN-INVALID: Pawn='%s' Lane=%d — GetDistanceToNextJunction "
+						 "returned INVALID (no junction downstream). Vehicle will NOT slow for any intersection."),
+					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+					CurrentLane.HandleId);
+			}
+			bApproachingIntersection = false;
+			ApproachJunctionDistanceCm = 0.0f;
+			ApproachSpeedLimitCmPerSec = 0.0f;
+			ApproachJunctionId = 0;
+			ApproachJunctionLane = FTrafficLaneHandle();
+#if ENABLE_DRAW_DEBUG
+			DbgApproachJunctionDist = -1.0f;
+			DbgApproachSpeedLimit = 0.0f;
+			DbgApproachJunctionId = 0;
+#endif
+		}
+	}
+	else if (IntersectionJunctionId != 0 || bWaitingAtIntersection)
+	{
+		// Already handling an intersection — disable approach scan.
+		bApproachingIntersection = false;
+		if (GTrafficJunctionDiagnostics >= 2)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JDIAG SCAN-SKIP-HANDLING: Pawn='%s' Lane=%d — approach scan disabled "
+					 "(already handling intersection: JunctionId=%d bWaiting=%s)"),
+				GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+				CurrentLane.HandleId,
+				IntersectionJunctionId,
+				bWaitingAtIntersection ? TEXT("YES") : TEXT("NO"));
+		}
+#if ENABLE_DRAW_DEBUG
+		DbgApproachJunctionDist = -1.0f;
+		DbgApproachSpeedLimit = 0.0f;
+		DbgApproachJunctionId = 0;
+#endif
+	}
+	else
+	{
+		// Guard blocked approach scan for a reason OTHER than handling intersection.
+		if (GTrafficJunctionDiagnostics >= 1)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JDIAG SCAN-BLOCKED: Pawn='%s' Lane=%d — approach scan guard FAILED. "
+					 "bAtDeadEnd=%s CachedProvider=%s bWaiting=%s IntersectionJunctionId=%d. "
+					 "THIS VEHICLE CANNOT SEE JUNCTIONS."),
+				GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+				CurrentLane.HandleId,
+				bAtDeadEnd ? TEXT("YES") : TEXT("NO"),
+				CachedProvider ? TEXT("VALID") : TEXT("NULL!!!"),
+				bWaitingAtIntersection ? TEXT("YES") : TEXT("NO"),
+				IntersectionJunctionId);
+		}
+	}
+
 	// --- Lane-end detection + intersection right-of-way ---
-	if (!bAtDeadEnd && LaneChangeState == ELaneChangeState::None)
+	// Allow entry even during an active lane change: if we're approaching a
+	// lane end, the intersection check is more important than the lane change.
+	// The lane change will be aborted below if an intersection is detected.
+	if (!bAtDeadEnd)
 	{
 		const float RemainingDist = GetRemainingDistance(ClosestIndex);
-		// Use speed-based look-ahead so fast vehicles get more advance notice.
-		const float ReactionTime = 1.0f; // seconds
-		const float TransitionThreshold = FMath::Max(LookAheadDistance, FMath::Abs(CurrentSpeed) * ReactionTime);
-		if (RemainingDist < TransitionThreshold && DistanceTraveledOnLane > TransitionThreshold)
+		// Use physics-based stopping-distance threshold so fast vehicles get
+		// enough advance warning to actually stop before the intersection.
+		// Old formula: max(LookAhead, |Speed| * 1.0s) — only 1s of reaction time.
+		// New formula: max(LookAhead, v²/(2*decel) + margin) — matches actual braking physics.
+		const float AbsSpeed = FMath::Abs(CurrentSpeed);
+		const float StoppingDist = (AbsSpeed * AbsSpeed) / (2.0f * ApproachDecelCmPerSec2);
+		const float TransitionThreshold = FMath::Max(LookAheadDistance, StoppingDist + ApproachSafetyMarginCm);
+#if ENABLE_DRAW_DEBUG
+		DbgRemainingDist = RemainingDist;
+		DbgTransitionThreshold = TransitionThreshold;
+#endif
+		// MinTransitionGuard: small constant to prevent re-triggering on the
+		// same frame, but low enough that short virtual segments (created by
+		// through-road splitting) still trigger intersection detection.
+		constexpr float MinTransitionGuard = 50.0f; // cm — ~1 polyline sample
+
+		// DIAGNOSTIC: Log why the detection gate doesn't fire.
+		if (GTrafficJunctionDiagnostics >= 1 && !(RemainingDist < TransitionThreshold && DistanceTraveledOnLane > MinTransitionGuard))
 		{
-			// --- Intersection approach (Feature 1) ---
-			// Query junction ID at lane end. If non-zero, check occupancy first.
+			// Only log once per second per vehicle to avoid total log flood.
+			static TMap<uint32, double> LastGateLogTime;
+			const uint32 VehicleId = GetUniqueID();
+			const double Now = FPlatformTime::Seconds();
+			double& LastTime = LastGateLogTime.FindOrAdd(VehicleId, 0.0);
+			if (Now - LastTime > 1.0)
+			{
+				LastTime = Now;
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JDIAG GATE-NOT-FIRING: Pawn='%s' Lane=%d RemainingDist=%.1f "
+						 "TransitionThreshold=%.1f DistTraveled=%.1f MinGuard=%.1f "
+						 "Speed=%.1f bApproaching=%s ApproachDist=%.1f ApproachJnct=%d "
+						 "— Vehicle is NOT close enough to lane end for junction detection."),
+					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+					CurrentLane.HandleId,
+					RemainingDist,
+					TransitionThreshold,
+					DistanceTraveledOnLane,
+					MinTransitionGuard,
+					CurrentSpeed,
+					bApproachingIntersection ? TEXT("YES") : TEXT("NO"),
+					ApproachJunctionDistanceCm,
+					ApproachJunctionId);
+			}
+		}
+
+		if (RemainingDist < TransitionThreshold && DistanceTraveledOnLane > MinTransitionGuard)
+		{
+			// --- Intersection approach ---
+			// Detect junctions via two methods:
+			//   1. Current lane IS a junction lane (GetJunctionForLane(CurrentLane) != 0)
+			//   2. Look-ahead: current lane is free-flow but NEXT lane is a junction
+			//      (through-road split — free-flow segment preceding intersection)
 			if (!bWaitingAtIntersection && CachedProvider)
 			{
-				const int32 JunctionId = CachedProvider->GetJunctionForLane(CurrentLane);
-				if (JunctionId != 0)
+				int32 DetectedJunctionId = CachedProvider->GetJunctionForLane(CurrentLane);
+				// Track which lane handle to pass to IsLaneGreen — must be
+				// the lane that appears in the signal's PhaseGroup.GreenLanes.
+				FTrafficLaneHandle DetectedJunctionLane = CurrentLane;
+
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JNCT DETECT: Pawn='%s' CurrentLane=%d GetJunctionForLane(current)=%d "
+						 "RemainingDist=%.1f TransitionThreshold=%.1f Speed=%.1f"),
+					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+					CurrentLane.HandleId, DetectedJunctionId,
+					RemainingDist, TransitionThreshold, CurrentSpeed);
+
+				// --- Look-ahead: peek at next lanes for junction presence ---
+				if (DetectedJunctionId == 0)
 				{
-					IntersectionJunctionId = JunctionId;
+					TArray<FTrafficLaneHandle> NextLanes = CachedProvider->GetConnectedLanes(CurrentLane);
+					for (const FTrafficLaneHandle& NextLane : NextLanes)
+					{
+						const int32 NextJId = CachedProvider->GetJunctionForLane(NextLane);
+						UE_LOG(LogAAATraffic, Warning,
+							TEXT("JNCT LOOKAHEAD: Pawn='%s' CurrentLane=%d NextLane=%d "
+								 "GetJunctionForLane(next)=%d"),
+							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+							CurrentLane.HandleId, NextLane.HandleId, NextJId);
+						if (NextJId != 0)
+						{
+							DetectedJunctionId = NextJId;
+							DetectedJunctionLane = NextLane; // Use the junction lane for signal queries.
+							break; // Any matching junction suffices.
+						}
+					}
+				}
+
+				// --- Extended look-ahead (precomputed map fallback) ---
+				// The 1-hop LOOKAHEAD above only finds junctions on the immediately
+				// connected lane. For lanes that are 2+ hops from a junction lane
+				// (e.g., lane 20 → 21 → 22(J1)), it misses the junction entirely.
+				//
+				// The approach scan already walked the full precomputed graph and
+				// stored the result in ApproachJunctionId / ApproachJunctionLane.
+				// Use that data as a fallback so these vehicles still check
+				// signals and occupancy before entering the junction path.
+				if (DetectedJunctionId == 0 && ApproachJunctionId != 0)
+				{
+					DetectedJunctionId = ApproachJunctionId;
+					DetectedJunctionLane = ApproachJunctionLane;
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT PRECOMPUTED-HIT: Pawn='%s' CurrentLane=%d — 1-hop LOOKAHEAD "
+							 "missed, using precomputed map: JunctionId=%d Dist=%.1f JnctLane=%d"),
+						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+						CurrentLane.HandleId,
+						ApproachJunctionId,
+						ApproachJunctionDistanceCm,
+						ApproachJunctionLane.HandleId);
+				}
+
+				// Skip re-acquisition when we already hold this junction's occupancy.
+				// This prevents re-entering the signal/occupy flow when the vehicle
+				// transitions to a new lane still inside the same junction.
+				if (DetectedJunctionId != 0 && DetectedJunctionId == IntersectionJunctionId)
+				{
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT SKIP-REDETECT: Pawn='%s' JunctionId=%d — already holds "
+							 "occupancy, skipping signal check, proceeding to CheckLaneTransition"),
+						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+						DetectedJunctionId);
+				}
+				else if (DetectedJunctionId != 0 && DetectedJunctionId == LastReleasedJunctionId)
+				{
+					// Junction was just released on this lane (curve-complete fired
+					// before lane-end). Don't re-acquire — the vehicle is exiting.
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT SKIP-RELEASED: Pawn='%s' JunctionId=%d — junction was "
+							 "just released on this lane, skipping re-acquisition"),
+						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+						DetectedJunctionId);
+				}
+				else if (DetectedJunctionId != 0)
+				{
+					// Abort any active lane change — intersection takes priority.
+					if (LaneChangeState != ELaneChangeState::None)
+					{
+						UE_LOG(LogAAATraffic, Warning,
+							TEXT("JNCT LANE-CHANGE-ABORT: Pawn='%s' JunctionId=%d — "
+								 "aborting lane change (state=%d) to handle intersection"),
+							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+							DetectedJunctionId, static_cast<int32>(LaneChangeState));
+						LaneChangeState = ELaneChangeState::None;
+						LaneChangeProgress = 0.0f;
+						LaneChangeSettleTimer = 0.0f;
+						TargetLanePoints.Empty();
+					}
+
+					IntersectionJunctionId = DetectedJunctionId;
+					IntersectionJunctionLane = DetectedJunctionLane;
+
+					// Resolve exact intersection entry point for brake targeting.
+					if (!bHasIntersectionEntryPos)
+					{
+						FVector EntryPt;
+						if (CachedProvider->GetIntersectionEntryPoint(CurrentLane, EntryPt))
+						{
+							IntersectionEntryWorldPos = EntryPt;
+							bHasIntersectionEntryPos = true;
+							UE_LOG(LogAAATraffic, Warning,
+								TEXT("JNCT ENTRYPOINT: Pawn='%s' Lane=%d EntryPt=(%.1f,%.1f,%.1f) Source=ExactMask"),
+								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+								CurrentLane.HandleId, EntryPt.X, EntryPt.Y, EntryPt.Z);
+						}
+						else
+						{
+							// Fallback: use the last polyline point (non-split lanes
+							// or lanes without mask data). This is within ±50cm of the
+							// actual boundary for 100cm polyline spacing.
+							IntersectionEntryWorldPos = LanePoints.Last();
+							bHasIntersectionEntryPos = true;
+							UE_LOG(LogAAATraffic, Warning,
+								TEXT("JNCT ENTRYPOINT: Pawn='%s' Lane=%d EntryPt=(%.1f,%.1f,%.1f) Source=FallbackLast"),
+								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+								CurrentLane.HandleId, LanePoints.Last().X, LanePoints.Last().Y, LanePoints.Last().Z);
+						}
+					}
 
 					UWorld* World = GetWorld();
 					UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
 					if (TrafficSub)
 					{
-// Check for signal first — vehicles stop on Red/Yellow.
-					ATrafficSignalController* Signal = TrafficSub->GetSignalForJunction(JunctionId);
-					bool bSignalAllows = true;
-					if (Signal)
-					{
-						bSignalAllows = Signal->IsLaneGreen(CurrentLane);
+						// Check for signal first — vehicles stop on Red/Yellow.
+						// Check for signal first — vehicles stop on Red/Yellow.
+						// Use IntersectionJunctionLane (the lane inside the junction) for
+						// signal queries — that is the handle stored in GreenLanes.
+						ATrafficSignalController* Signal = TrafficSub->GetSignalForJunction(DetectedJunctionId);
+						bool bSignalAllows = true;
+						if (Signal)
+						{
+							bSignalAllows = Signal->IsLaneGreen(IntersectionJunctionLane);
 						}
 
-						if (bSignalAllows && TrafficSub->TryOccupyJunction(JunctionId, this))
+						// Compute exit lane for the 4-arg conflict-detection occupy call.
+						// From = current lane, To = first connected lane from junction lane.
+						IntersectionFromLane = CurrentLane;
+						IntersectionToLane = FTrafficLaneHandle();
 						{
-							// We have right-of-way — proceed with transition.
+							TArray<FTrafficLaneHandle> JunctionExits = CachedProvider->GetConnectedLanes(DetectedJunctionLane);
+							if (JunctionExits.Num() > 0)
+							{
+								// Sort for determinism, pick first (direction-weighted selection
+								// happens later in CheckLaneTransition, but for conflict detection
+								// any consistent exit suffices).
+								JunctionExits.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
+								{ return A.HandleId < B.HandleId; });
+								IntersectionToLane = JunctionExits[0];
+							}
+						}
+
+						UE_LOG(LogAAATraffic, Warning,
+							TEXT("JNCT OCCUPY-ATTEMPT: Pawn='%s' JunctionId=%d HasSignal=%s "
+								 "SignalAllowsGreen=%s DesiredNext=%d ExitLane=%d — about to TryOccupyJunction"),
+							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+							DetectedJunctionId,
+							Signal ? TEXT("YES") : TEXT("NO"),
+							bSignalAllows ? TEXT("YES") : TEXT("NO"),
+							DetectedJunctionLane.HandleId,
+							IntersectionToLane.HandleId);
+
+						if (bSignalAllows && TrafficSub->TryOccupyJunction(DetectedJunctionId, this, IntersectionFromLane, IntersectionToLane))
+						{
+							UE_LOG(LogAAATraffic, Warning,
+								TEXT("JNCT OCCUPY-GRANTED: Pawn='%s' JunctionId=%d — PROCEEDING through intersection"),
+								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+								DetectedJunctionId);
 						}
 						else
 						{
-							// Junction occupied — wait.
 							bWaitingAtIntersection = true;
+							UE_LOG(LogAAATraffic, Warning,
+								TEXT("JNCT OCCUPY-DENIED: Pawn='%s' JunctionId=%d SignalAllows=%s "
+									 "— WAITING at intersection"),
+								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+								DetectedJunctionId,
+								bSignalAllows ? TEXT("YES-occupied") : TEXT("NO-signal-red"));
 						}
 					}
 				}
-			}
-
-			// If waiting at intersection, brake proportionally to remaining distance.
-		if (bWaitingAtIntersection)
-			{
-				UWorld* World = GetWorld();
-				UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
-
-				// Retry signal + occupancy each tick.
-				if (TrafficSub && IntersectionJunctionId != 0)
+				else
 				{
-					// Re-check the traffic signal phase before attempting occupancy.
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT DETECT-NONE: Pawn='%s' CurrentLane=%d — no junction detected "
+							 "(current=0, all next=0). Proceeding directly to CheckLaneTransition."),
+						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+						CurrentLane.HandleId);
+				}
+			}
+		} // Close detection gate — junction detection only fires near lane end.
+
+		// --- Intersection waiting: fires UNCONDITIONALLY when bWaitingAtIntersection ---
+		// FIX: Moved outside the (RemainingDist < TransitionThreshold) gate.
+		// Previously, braking dropped out when the threshold shrank with speed,
+		// causing vehicles to coast through lane ends at ~470 cm/s.
+		if (bWaitingAtIntersection)
+		{
+			UWorld* World = GetWorld();
+			UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
+
+			// Check for stuck bug: waiting flag is true but junction ID was
+			// erased (e.g., by an external InitializeLaneFollowing call).
+			//
+			// FIX (was CRITICAL): Previously only logged the error and left the
+			// vehicle stuck FOREVER. Now auto-recovers by clearing the waiting
+			// flag so the vehicle resumes lane following on its current lane.
+			if (IntersectionJunctionId == 0)
+			{
+				UE_LOG(LogAAATraffic, Error,
+					TEXT("JNCT BUG-RECOVERED: Pawn='%s' bWaitingAtIntersection=YES but "
+						 "IntersectionJunctionId=0! Clearing waiting flag to resume driving. "
+						 "Root cause: InitializeLaneFollowing erased the ID while waiting."),
+					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"));
+				bWaitingAtIntersection = false;
+				bHasIntersectionEntryPos = false;
+				IntersectionRetryTimer = 0.0f;
+				// Fall through — vehicle will resume normal lane following.
+			}
+			else if (TrafficSub)
+			{
+				// Accumulate wait time for timeout detection.
+				IntersectionWaitElapsed += DeltaSeconds;
+
+				// Throttle retry attempts to ~4 per second to avoid log spam.
+				// Without this, TryOccupyJunction fires + logs DENIED every tick.
+				IntersectionRetryTimer -= DeltaSeconds;
+				if (IntersectionRetryTimer <= 0.0f)
+				{
+					IntersectionRetryTimer = 0.25f; // retry every 250ms
+
 					bool bSignalAllows = true;
 					ATrafficSignalController* Signal = TrafficSub->GetSignalForJunction(IntersectionJunctionId);
 					if (Signal)
 					{
-						bSignalAllows = Signal->IsLaneGreen(CurrentLane);
+						bSignalAllows = Signal->IsLaneGreen(IntersectionJunctionLane);
 					}
 
-					if (bSignalAllows && TrafficSub->TryOccupyJunction(IntersectionJunctionId, this))
+					if (bSignalAllows && TrafficSub->TryOccupyJunction(IntersectionJunctionId, this, IntersectionFromLane, IntersectionToLane))
 					{
 						bWaitingAtIntersection = false;
-						// Fall through to CheckLaneTransition below.
+						IntersectionWaitElapsed = 0.0f;
+
+						// Safety: if the vehicle overshot the entry point while waiting,
+						// teleport it back so FindClosestPointIndex maps correctly on the
+						// next lane.
+						if (bHasIntersectionEntryPos)
+						{
+							const float OvershootDist = FVector::Dist(VehicleLocation, IntersectionEntryWorldPos);
+							if (OvershootDist > 500.0f) // > 5m overshoot
+							{
+								ControlledPawn->SetActorLocation(
+									IntersectionEntryWorldPos + FVector(0.0f, 0.0f, 10.0f),
+									false, nullptr, ETeleportType::TeleportPhysics);
+								UE_LOG(LogAAATraffic, Warning,
+									TEXT("JNCT OVERSHOOT-TELEPORT: Pawn='%s' was %.1f cm from entry — "
+										 "teleported to entry point"),
+									GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+									OvershootDist);
+							}
+						}
+
+						bHasIntersectionEntryPos = false;
+						UE_LOG(LogAAATraffic, Warning,
+							TEXT("JNCT RETRY-GRANTED: Pawn='%s' JunctionId=%d — CLEARED to proceed (was waiting, elapsed %.1fs)"),
+							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+							IntersectionJunctionId,
+							IntersectionWaitElapsed);
+						// Fall through to lane transition gate below.
 					}
 				}
 
-				if (bWaitingAtIntersection)
+				// FIX (was MAJOR): Timeout — if the vehicle has been waiting
+				// longer than MaxIntersectionWaitTimeSec, force-proceed to
+				// prevent permanent deadlocks. The junction may be blocked by
+				// a stuck vehicle, broken signal, or mutual denial cycle.
+				if (bWaitingAtIntersection && IntersectionWaitElapsed >= MaxIntersectionWaitTimeSec)
 				{
-					// Gradually brake to a stop at the lane end.
-					const float BrakeFactor = FMath::Clamp(1.0f - (RemainingDist / FMath::Max(TransitionThreshold, 1.0f)), 0.0f, 1.0f);
-					VehicleMovement->SetThrottleInput(FMath::Max(0.0f, 0.3f - BrakeFactor * 0.3f));
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT TIMEOUT-FORCE-PROCEED: Pawn='%s' JunctionId=%d — "
+							 "waited %.1fs (max %.1fs). Force-occupying to break deadlock."),
+						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+						IntersectionJunctionId,
+						IntersectionWaitElapsed,
+						MaxIntersectionWaitTimeSec);
+
+					// Force-occupy: bypass TryOccupyJunction — just mark as
+					// proceeding. The junction system will still track us for
+					// release, but we won't wait for permission anymore.
+					bWaitingAtIntersection = false;
+					IntersectionWaitElapsed = 0.0f;
+					bHasIntersectionEntryPos = false;
+				}
+			}
+
+			if (bWaitingAtIntersection)
+			{
+				// Per-instance throttled logging: show stuck/waiting vehicles periodically.
+				// FIX (was MAJOR): Replaced static int32 shared across all instances
+				// with per-instance member to avoid determinism violations.
+				++WaitLogThrottleCounter;
+				if ((WaitLogThrottleCounter % 60) == 0)
+				{
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT RETRY-STILL-WAITING: Pawn='%s' JunctionId=%d "
+							 "bWaiting=YES DistToEntry=%.1f Speed=%.1f WaitTime=%.1fs (throttled log, every 60 ticks)"),
+						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+						IntersectionJunctionId,
+						bHasIntersectionEntryPos
+							? FVector::Dist(VehicleLocation, IntersectionEntryWorldPos)
+							: RemainingDist,
+						CurrentSpeed,
+						IntersectionWaitElapsed);
+				}
+
+				// Decel-curve brake toward intersection entry point.
+				// Compute distance to entry, checking for overshoot.
+				float DistToEntry = RemainingDist;
+				if (bHasIntersectionEntryPos)
+				{
+					const FVector ToEntry = IntersectionEntryWorldPos - VehicleLocation;
+					const float DotFwd = FVector::DotProduct(ToEntry, VehicleForward);
+					DistToEntry = (DotFwd > 0.0f)
+						? FVector::Dist(VehicleLocation, IntersectionEntryWorldPos)
+						: 0.0f; // Overshot — treat as zero.
+				}
+
+				// Desired speed from constant-decel stopping curve: v = sqrt(2*a*d)
+				// Uses the same tunable decel as the approach speed envelope
+				// so both systems agree on braking physics.
+				const float DesiredStopSpeed = FMath::Sqrt(
+					FMath::Max(2.0f * ApproachDecelCmPerSec2 * DistToEntry, 0.0f));
+
+				float WaitBrake = 0.0f;
+				if (DistToEntry < 50.0f || DesiredStopSpeed <= KINDA_SMALL_NUMBER)
+				{
+					// At or past entry — full stop.
+					WaitBrake = 1.0f;
+					VehicleMovement->SetThrottleInput(0.0f);
 					VehicleMovement->SetSteeringInput(0.0f);
-					VehicleMovement->SetBrakeInput(BrakeFactor);
+					VehicleMovement->SetBrakeInput(1.0f);
+				}
+				else if (FMath::Abs(CurrentSpeed) > DesiredStopSpeed)
+				{
+					// Over the decel envelope — brake proportionally.
+					WaitBrake = FMath::Clamp(
+						(FMath::Abs(CurrentSpeed) - DesiredStopSpeed) /
+						FMath::Max(DesiredStopSpeed, 100.0f),
+						0.0f, 1.0f);
+					VehicleMovement->SetThrottleInput(0.0f);
+					VehicleMovement->SetSteeringInput(0.0f);
+					VehicleMovement->SetBrakeInput(WaitBrake);
+				}
+				else
+				{
+					// Under envelope — coast (no acceleration toward intersection).
+					VehicleMovement->SetThrottleInput(0.0f);
+					VehicleMovement->SetSteeringInput(0.0f);
+					VehicleMovement->SetBrakeInput(0.0f);
+				}
+
+#if ENABLE_DRAW_DEBUG
+				DbgStateName = TEXT("WAITING");
+				DbgBrake = WaitBrake;
+				DbgThrottle = 0.0f;
+				DbgDistToEntry = DistToEntry;
+				DbgDesiredStopSpeed = DesiredStopSpeed;
+#endif
+				return;
+			}
+		}
+
+		// --- Lane transition gate ---
+		// Re-evaluated separately from detection so post-RETRY-GRANTED vehicles
+		// can proceed to CheckLaneTransition immediately.
+		// Bypass MinTransitionGuard for junction lanes to prevent vehicles from
+		// being stuck for 30+ seconds on short junction polylines.
+		{
+			const bool bJunctionBypass = (IntersectionJunctionId != 0);
+			if (RemainingDist < TransitionThreshold
+				&& (DistanceTraveledOnLane > MinTransitionGuard || bJunctionBypass))
+			{
+				if (LaneChangeState != ELaneChangeState::None)
+				{
 					return;
 				}
-			}
 
-			CheckLaneTransition();
-			if (!bLaneDataReady || !GetPawn())
-			{
-				// InitializeLaneFollowing may have failed — bail.
-				return;
-			}
-			if (!bAtDeadEnd)
-			{
-				// Successfully transitioned. Release junction immediately if no
-				// transition points were generated (junction span too small).
-				if (IntersectionJunctionId != 0 && JunctionTransitionPoints.Num() == 0)
+				CheckLaneTransition();
+				if (!bLaneDataReady || !GetPawn())
 				{
-					UWorld* World = GetWorld();
-					UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
-					if (TrafficSub)
-					{
-						TrafficSub->ReleaseJunction(IntersectionJunctionId, this);
-					}
-					IntersectionJunctionId = 0;
+					return;
 				}
-				// Recalculate on new lane data.
-				return;
+				if (!bAtDeadEnd)
+				{
+					if (IntersectionJunctionId != 0)
+					{
+						const int32 NewLaneJunction = CachedProvider
+							? CachedProvider->GetJunctionForLane(CurrentLane) : 0;
+
+						if (NewLaneJunction != IntersectionJunctionId)
+						{
+							UWorld* World = GetWorld();
+							UTrafficSubsystem* TrafficSub = World
+								? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
+							if (TrafficSub)
+							{
+								UE_LOG(LogAAATraffic, Warning,
+									TEXT("JNCT RELEASE: Pawn='%s' RELEASING junction %d — new lane %d "
+										 "is in junction %d (exited)"),
+									GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+									IntersectionJunctionId, CurrentLane.HandleId, NewLaneJunction);
+								TrafficSub->ReleaseJunction(IntersectionJunctionId, this);
+							}
+							IntersectionJunctionId = 0;
+							bHasIntersectionEntryPos = false;
+						}
+						else
+						{
+							UE_LOG(LogAAATraffic, Warning,
+								TEXT("JNCT HOLD: Pawn='%s' junction %d — new lane %d still in "
+									 "same junction, keeping occupancy"),
+								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+								IntersectionJunctionId, CurrentLane.HandleId);
+						}
+					}
+					return;
+				}
 			}
 		}
 	}
@@ -995,16 +1843,37 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 			JunctionTransitionPoints.Empty();
 			JunctionTransitionIndex = 0;
 
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JNCT RELEASE-PATH2-CHECK: Pawn='%s' IntersectionJunctionId=%d "
+					 "— junction curve complete, checking release"),
+				GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+				IntersectionJunctionId);
+
 			if (IntersectionJunctionId != 0)
 			{
 				if (UWorld* World = GetWorld())
 				{
 					if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
 					{
+						UE_LOG(LogAAATraffic, Warning,
+							TEXT("JNCT RELEASE-PATH2-FIRE: Pawn='%s' RELEASING junction %d (curve complete)"),
+							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+							IntersectionJunctionId);
 						TrafficSub->ReleaseJunction(IntersectionJunctionId, this);
 					}
 				}
+				// Record the released junction so the detection code won't
+				// re-acquire it on the remainder of this lane.
+				LastReleasedJunctionId = IntersectionJunctionId;
 				IntersectionJunctionId = 0;
+				bHasIntersectionEntryPos = false;
+			}
+			else
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JNCT RELEASE-PATH2-DEAD: Pawn='%s' IntersectionJunctionId=0 "
+						 "— CANNOT release (ID was erased by InitializeLaneFollowing)"),
+					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"));
 			}
 
 			TargetPoint = GetLookAheadPoint(VehicleLocation, ClosestIndex);
@@ -1069,6 +1938,10 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		{
 			float LeaderSpeed = 0.0f;
 			const float LeaderDist = GetLeaderDistance(LeaderSpeed);
+#if ENABLE_DRAW_DEBUG
+			DbgLeaderDist = LeaderDist;
+			DbgLeaderSpeed = LeaderSpeed;
+#endif
 			if (LeaderDist >= 0.0f)
 			{
 				// Proportional: full stop at FollowingDistance, full speed at 2x FollowingDistance.
@@ -1141,6 +2014,80 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		}
 	}
 
+	// Junction approach speed limit: progressively slow down as a junction
+	// enters the scan range. Uses the decel-envelope speed computed by the
+	// approach scan earlier this tick. This fires BEFORE the detection gate
+	// so the vehicle decelerates smoothly instead of slamming the brakes.
+	//
+	// FIX (was CRITICAL): The old code used:
+	//   EffectiveTargetSpeed = FMath::Max(ApproachSpeedLimitCmPerSec, 100.0f);
+	// This could RAISE speed above leader-following (e.g., leader = 80,
+	// approach = 50 → max(50,100) = 100 → override leader to 100 → rear-end
+	// collision). Now we only clamp DOWN, never up.
+	if (bApproachingIntersection)
+	{
+		const float ApproachCap = FMath::Max(ApproachSpeedLimitCmPerSec, 100.0f);
+		if (ApproachCap < EffectiveTargetSpeed)
+		{
+			EffectiveTargetSpeed = ApproachCap;
+		}
+#if ENABLE_DRAW_DEBUG
+		DbgStateName = TEXT("APPROACH");
+#endif
+	}
+
+	// Intersection speed limit: cap speed while traversing a junction.
+	// Uses the tunable IntersectionSpeedLimitCmPerSec as a baseline,
+	// then modulates based on the junction path's curvature.
+	//
+	// FIX (was MAJOR): Replaced hardcoded 500 cm/s (~11 mph) that applied
+	// uniformly to ALL intersections (highway merge, 4-way stop, etc.)
+	// with a tunable property + curvature-derived speed so straight-through
+	// traffic keeps moving and tight turns slow appropriately.
+	if (IntersectionJunctionId != 0)
+	{
+		float JunctionSpeedCap = IntersectionSpeedLimitCmPerSec;
+
+		// Derive speed from junction path curvature when available:
+		// walk the junction transition polyline, measure the tightest
+		// turning angle, convert to a centripetal-safe speed.
+		if (JunctionTransitionPoints.Num() >= 3)
+		{
+			// Compute total arc length and cumulative turn angle.
+			float TotalAngleDeg = 0.0f;
+			float TotalArcLength = 0.0f;
+			for (int32 i = 1; i < JunctionTransitionPoints.Num() - 1; ++i)
+			{
+				const FVector Seg0 = (JunctionTransitionPoints[i] - JunctionTransitionPoints[i - 1]);
+				const FVector Seg1 = (JunctionTransitionPoints[i + 1] - JunctionTransitionPoints[i]);
+				TotalArcLength += Seg0.Size();
+				const FVector Dir0 = Seg0.GetSafeNormal();
+				const FVector Dir1 = Seg1.GetSafeNormal();
+				if (!Dir0.IsNearlyZero() && !Dir1.IsNearlyZero())
+				{
+					const float Dot = FMath::Clamp(FVector::DotProduct(Dir0, Dir1), -1.0f, 1.0f);
+					TotalAngleDeg += FMath::RadiansToDegrees(FMath::Acos(Dot));
+				}
+			}
+			// Add last segment length.
+			TotalArcLength += (JunctionTransitionPoints.Last() - JunctionTransitionPoints[JunctionTransitionPoints.Num() - 2]).Size();
+
+			// Approximate turning radius: R = arcLength / totalAngle(radians).
+			// Then centripetal speed limit: v = sqrt(lateralAccel * R).
+			const float TotalAngleRad = FMath::DegreesToRadians(FMath::Max(TotalAngleDeg, 1.0f));
+			const float TurnRadius = FMath::Max(TotalArcLength / TotalAngleRad, 50.0f); // clamp to 0.5m min
+
+			// Lateral accel budget: ~0.3g comfortable, in cm/s².
+			constexpr float LateralAccelBudget = 294.0f; // 0.3 * 980 cm/s²
+			const float CurvatureSpeed = FMath::Sqrt(LateralAccelBudget * TurnRadius);
+
+			// Use the tighter of curvature-derived and baseline limit.
+			JunctionSpeedCap = FMath::Min(JunctionSpeedCap, CurvatureSpeed);
+		}
+
+		EffectiveTargetSpeed = FMath::Min(EffectiveTargetSpeed, JunctionSpeedCap);
+	}
+
 	// Guard against EffectiveTargetSpeed == 0 to prevent division by zero.
 	if (EffectiveTargetSpeed <= KINDA_SMALL_NUMBER)
 	{
@@ -1193,6 +2140,32 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	VehicleMovement->SetThrottleInput(ThrottleInput);
 	VehicleMovement->SetSteeringInput(SteeringInput);
 	VehicleMovement->SetBrakeInput(BrakeInput);
+
+#if ENABLE_DRAW_DEBUG
+	DbgThrottle = ThrottleInput;
+	DbgBrake = BrakeInput;
+	DbgSteering = SteeringInput;
+	DbgEffectiveTargetSpeed = EffectiveTargetSpeed;
+	DbgTargetPoint = TargetPoint;
+	// State priority: junction > following > braking > cruising.
+	if (IntersectionJunctionId != 0)
+	{
+		// Distinguish: "IN-JNCT" when on the actual junction lane,
+		// "INT" when holding occupancy but on an approach or exit lane.
+		const int32 CurrLaneJnct = CachedProvider
+			? CachedProvider->GetJunctionForLane(CurrentLane) : 0;
+		DbgStateName = (CurrLaneJnct == IntersectionJunctionId)
+			? TEXT("IN-JNCT") : TEXT("INT");
+	}
+	else if (DbgLeaderDist >= 0.0f && BrakeInput > 0.05f)
+	{
+		DbgStateName = TEXT("FOLLOWING");
+	}
+	else if (BrakeInput > 0.05f)
+	{
+		DbgStateName = TEXT("BRAKING");
+	}
+#endif
 
 	// --- Diagnostic: log first tick's driving values per vehicle ---
 	if (!bDiagLoggedFirstInput)
@@ -1507,7 +2480,39 @@ void ATrafficVehicleController::CheckLaneTransition()
 	TArray<FVector> ProviderJunctionPath;
 	const bool bHasProviderPath = CachedProvider && CachedProvider->GetJunctionPath(CurrentLane, NextLane, ProviderJunctionPath) && ProviderJunctionPath.Num() >= 2;
 
+	// ── FIX: Save junction state BEFORE InitializeLaneFollowing erases it ──
+	// InitializeLaneFollowing resets IntersectionJunctionId to 0, which
+	// prevents the caller's release paths from ever firing. Save the ID
+	// so we can restore it after the reset.
+	const int32 SavedJunctionId = IntersectionJunctionId;
+	const FTrafficLaneHandle SavedJunctionLane = IntersectionJunctionLane;
+	const bool bSavedHasEntryPos = bHasIntersectionEntryPos;
+
+	UE_LOG(LogAAATraffic, Warning,
+		TEXT("JNCT TRANSITION-PRE-INIT: Pawn='%s' OldLane=%d NextLane=%d "
+			 "IntersectionJunctionId=%d bWaiting=%s bHasEntryPos=%s JunctionTransPts=%d "
+			 "— about to call InitializeLaneFollowing (junction state saved)"),
+		GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+		CurrentLane.HandleId, NextLane.HandleId,
+		SavedJunctionId,
+		bWaitingAtIntersection ? TEXT("YES") : TEXT("NO"),
+		bSavedHasEntryPos ? TEXT("YES") : TEXT("NO"),
+		JunctionTransitionPoints.Num());
+
 	InitializeLaneFollowing(NextLane);
+
+	// Restore the junction ID and lane so the caller's release paths can fire.
+	IntersectionJunctionId = SavedJunctionId;
+	IntersectionJunctionLane = SavedJunctionLane;
+	bHasIntersectionEntryPos = bSavedHasEntryPos;
+
+	UE_LOG(LogAAATraffic, Warning,
+		TEXT("JNCT TRANSITION-POST-INIT: Pawn='%s' NewLane=%d "
+			 "IntersectionJunctionId=%d bWaiting=%s (junction ID restored)"),
+		GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+		NextLane.HandleId,
+		IntersectionJunctionId,
+		bWaitingAtIntersection ? TEXT("YES") : TEXT("NO"));
 
 	// If lane following could not be initialized for the selected connected lane,
 	// treat this as a dead end so braking logic engages.

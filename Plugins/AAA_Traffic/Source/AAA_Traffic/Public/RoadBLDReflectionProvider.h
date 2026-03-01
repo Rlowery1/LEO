@@ -11,18 +11,17 @@
  * Reflection-based RoadBLD adapter — implements ITrafficRoadProvider
  * entirely through UE's UFUNCTION / UPROPERTY reflection system.
  *
- * Unlike URoadBLDTrafficProvider (in AAA_TrafficRoadBLD module), this class
- * requires NO compile-time RoadBLD headers.  It discovers RoadBLD classes
- * at runtime via FindObject<UClass>("/Script/RoadBLDRuntime.ClassName") and
- * invokes all methods through ProcessEvent.
+ * This class requires NO compile-time RoadBLD headers.  It discovers
+ * RoadBLD classes at runtime via FindObject<UClass>("/Script/
+ * RoadBLDRuntime.ClassName") and invokes all methods through ProcessEvent.
+ * This makes it safe for Marketplace distribution without bundling
+ * third-party plugin sources.
  *
  * Lifecycle:
  *   1. ShouldCreateSubsystem — returns true only if the DynamicRoad UClass
  *      exists in any loaded module (i.e. RoadBLD plugin is present).
  *   2. OnWorldBeginPlay — runs API contract validation, caches road/lane data,
  *      builds lane connectivity, then registers with UTrafficSubsystem.
- *   3. Yields to any already-registered compiled provider so that
- *      URoadBLDTrafficProvider (WITH_ROADBLD=1) always wins when available.
  *
  * Determinism: all container iterations are sorted by name/handle, lane
  * selection is done through sorted arrays, never random map traversal.
@@ -53,6 +52,16 @@ public:
 	virtual bool GetJunctionCentroid(int32 JunctionId, FVector& OutCentroid) override;
 	virtual bool GetJunctionPath(const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane, TArray<FVector>& OutPath) override;
 	virtual bool IsLaneReversed(const FTrafficLaneHandle& Lane) override;
+	virtual bool GetIntersectionEntryPoint(const FTrafficLaneHandle& ApproachLane, FVector& OutPoint) override;
+	virtual bool DoJunctionPathsConflict(
+		const FTrafficLaneHandle& FromA, const FTrafficLaneHandle& ToA,
+		const FTrafficLaneHandle& FromB, const FTrafficLaneHandle& ToB) override;
+	virtual float GetLaneLength(const FTrafficLaneHandle& Lane) override;
+	virtual FJunctionScanResult GetDistanceToNextJunction(
+		const FTrafficLaneHandle& StartLane,
+		float RemainingDistOnCurrentLane,
+		float MaxSearchDistCm = 50000.0f,
+		int32 MaxHops = 10) override;
 
 private:
 	// ── Data caching ────────────────────────────────────────
@@ -60,8 +69,12 @@ private:
 	/** Discover roads, lanes, and cache handle maps via reflection. */
 	void CacheRoadData(UWorld* World);
 
-	/** Build lane connectivity from RoadNetworkCorners (corner-based fallback; proximity is handled in BuildProximityConnections). */
+	/** Build lane connectivity by edge-walking via GetNextCornerConnection.
+	 *  Falls back to BuildLaneConnectivityFromCornersArray if the function is unavailable. */
 	void BuildLaneConnectivity(UWorld* World);
+
+	/** Legacy fallback: reads the RoadNetworkCorners TArray (typically empty by design). */
+	void BuildLaneConnectivityFromCornersArray(UWorld* World, AActor* NetworkActor);
 
 	/** Cache start/end positions and directions for every lane. Called after CacheRoadData. */
 	void CacheLaneEndpoints();
@@ -75,6 +88,12 @@ private:
 
 	/** Group connected lane endpoints into junction clusters and assign junction IDs. */
 	void BuildJunctionGrouping();
+
+	/** Pre-compute the distance-to-next-junction for EVERY lane in the network.
+	 *  Called once at world startup after BuildJunctionGrouping. Populates
+	 *  PrecomputedJunctionMap and PrecomputedLaneLengths so vehicles get the
+	 *  entire road/junction layout via O(1) lookups — no per-tick graph walks. */
+	void PrecomputeJunctionMap();
 
 	/** Run connectivity invariants + summary diagnostics (gated by traffic.Diagnostics* CVars). */
 	void RunConnectivityDiagnostics(const TCHAR* PhaseTag) const;
@@ -178,6 +197,15 @@ private:
 		int32 OriginalLaneHandle = 0;
 		int32 StartPointIndex = 0;
 		int32 EndPointIndex = 0;
+
+		/** Exact 3D world position where the next intersection begins (derived from
+		 *  Mask.StartDistance via continuous curve evaluation, NOT the quantized
+		 *  polyline point). Only meaningful for free-flow segments that precede
+		 *  an intersection segment. Zero vector if N/A. */
+		FVector IntersectionEntryPoint = FVector::ZeroVector;
+
+		/** True if IntersectionEntryPoint was computed and is valid. */
+		bool bHasIntersectionEntryPoint = false;
 	};
 
 	/** Record of a proximity-based connection for junction grouping. */
@@ -249,6 +277,11 @@ private:
 	/** Virtual lane handle → info about what portion of the original lane it represents. */
 	TMap<int32, FVirtualLaneInfo> VirtualLaneMap;
 
+	/** Approach lane handle → exact 3D entry point of the next intersection.
+	 *  Populated during DetectAndSplitThroughRoads for free-flow segments
+	 *  that immediately precede an intersection segment. */
+	TMap<int32, FVector> IntersectionEntryPointMap;
+
 	/** Original lane handle → ordered list of virtual lane handles that replace it. */
 	TMap<int32, TArray<int32>> OriginalToVirtualMap;
 
@@ -269,6 +302,17 @@ private:
 
 	/** Road handle ID → total road width (sum of all lane widths on that road, in cm). */
 	TMap<int32, float> RoadTotalWidthMap;
+
+	// ── Precomputed full-network junction map (built once at startup) ──
+
+	/** Lane handle ID → precomputed junction scan result.
+	 *  Contains the distance from this lane's END to the nearest downstream
+	 *  junction, plus the junction ID and lane handles.
+	 *  Populated for EVERY lane in the entire network by PrecomputeJunctionMap(). */
+	TMap<int32, FJunctionScanResult> PrecomputedJunctionMap;
+
+	/** Lane handle ID → total polyline length (cm), computed once at startup. */
+	TMap<int32, float> PrecomputedLaneLengths;
 
 	// ── Cached reflection pointers (resolved once in CacheRoadData) ─
 

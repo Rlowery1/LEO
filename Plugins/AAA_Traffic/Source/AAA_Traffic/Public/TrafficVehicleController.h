@@ -179,11 +179,74 @@ private:
 	/** True when waiting at an intersection for right-of-way. */
 	bool bWaitingAtIntersection;
 
+	/** Cooldown timer for intersection retry attempts (seconds). */
+	float IntersectionRetryTimer;
+
 	/** Junction ID of the intersection this vehicle is waiting/in. 0 = none. */
 	int32 IntersectionJunctionId;
 
+	/** Junction ID that was just released on the current lane.
+	 *  Prevents re-detection of the same junction after the vehicle releases
+	 *  occupancy mid-lane (e.g. curve-complete fires before lane-end).
+	 *  Reset in InitializeLaneFollowing when moving to a new lane. */
+	int32 LastReleasedJunctionId;
+
+	/** The junction lane handle used for signal queries.
+	 *  When a junction is detected via look-ahead, this is the NEXT lane
+	 *  (the one inside the intersection) — the same handle that appears
+	 *  in the signal's PhaseGroup.GreenLanes. Using this instead of
+	 *  CurrentLane ensures IsLaneGreen matches correctly. */
+	FTrafficLaneHandle IntersectionJunctionLane;
+
+	/** The lane the vehicle approaches the junction from (for conflict detection). */
+	FTrafficLaneHandle IntersectionFromLane;
+
+	/** The lane the vehicle exits the junction to (for conflict detection). */
+	FTrafficLaneHandle IntersectionToLane;
+
+	/** Exact 3D world position of the intersection entry boundary.
+	 *  Derived from intersection mask geometry (not quantized polyline).
+	 *  Used as the brake target when waiting at an intersection. */
+	FVector IntersectionEntryWorldPos;
+
+	/** True if IntersectionEntryWorldPos is valid (entry point was resolved). */
+	bool bHasIntersectionEntryPos;
+
+	// ── Junction Approach Scan State ─────────────────────────
+
+	/** True when the multi-hop scan has detected a junction within braking range. */
+	bool bApproachingIntersection;
+
+	/** Distance (cm) to the detected upcoming junction (from current position along lane graph). */
+	float ApproachJunctionDistanceCm;
+
+	/** Computed approach speed limit (cm/s) based on stopping-distance envelope. */
+	float ApproachSpeedLimitCmPerSec;
+
+	/** Junction ID detected by the approach scan (0 = none). */
+	int32 ApproachJunctionId;
+
+	/** The junction lane handle from the approach scan (for debug display). */
+	FTrafficLaneHandle ApproachJunctionLane;
+
 	/** Cumulative distance traveled on the current lane (prevents short-lane transition loops). */
 	float DistanceTraveledOnLane;
+
+	/** Elapsed time (seconds) spent waiting at the current intersection. */
+	float IntersectionWaitElapsed;
+
+	/** Per-instance log throttle counter for waiting-state diagnostics.
+	 *  Replaces the old static int32 that was shared across all instances
+	 *  (determinism violation). */
+	int32 WaitLogThrottleCounter;
+
+	/** Accumulated DeltaTime from LOD-skipped frames.
+	 *  Passed to UpdateVehicleInput on the next active tick so behavior
+	 *  is frame-rate independent regardless of LOD gating. */
+	float LODAccumulatedDeltaTime;
+
+	/** Timer for periodic junction diagnostic dumps (traffic.JunctionDiagnostics CVar). */
+	float DiagJunctionTimer;
 
 	/** Previous vehicle location for distance tracking. */
 	FVector PreviousVehicleLocation;
@@ -289,15 +352,98 @@ protected:
 	float DefaultSpeedLimit;
 
 	/**
+	 * Global margin (cm) added between the vehicle's front bumper and the
+	 * intersection entry boundary. Purely cosmetic comfort distance.
+	 * Defaults to 0 (exact geometric stop). Not per-intersection.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Intersection", meta = (ClampMin = "0"))
+	float StopLineMarginCm;
+
+	// ── Junction Approach Scan Tuning ───────────────────────
+
+	/**
+	 * Maximum forward distance (cm) to scan for upcoming junctions.
+	 * Higher values give more warning at higher speeds.
+	 * Default 50000 = 500m (sufficient for highway stopping from 120 km/h).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Intersection", meta = (ClampMin = "5000"))
+	float JunctionScanMaxDistanceCm;
+
+	/**
+	 * Maximum lane-graph hops to follow when scanning for junctions.
+	 * Prevents runaway traversal on complex networks.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Intersection", meta = (ClampMin = "1", ClampMax = "20"))
+	int32 MaxJunctionScanHops;
+
+	/**
+	 * Safety margin (cm) added beyond the physics stopping distance.
+	 * Vehicles begin braking StopDist + this margin before the junction.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Intersection", meta = (ClampMin = "0"))
+	float ApproachSafetyMarginCm;
+
+	/**
+	 * Comfort deceleration (cm/s²) used for the approach speed envelope.
+	 * Must match or be close to StopDecel used in the actual braking logic.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Intersection", meta = (ClampMin = "100"))
+	float ApproachDecelCmPerSec2;
+
+	/**
+	 * Base speed limit (cm/s) while traversing a junction.
+	 * Actual cap may be lower if the junction path has tight curvature.
+	 * Default 2000 = ~45 mph (reasonable straight-through speed).
+	 * Set lower for stop-sign networks, higher for highway merges.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Intersection", meta = (ClampMin = "100"))
+	float IntersectionSpeedLimitCmPerSec;
+
+	/**
+	 * Maximum time (seconds) a vehicle will wait at an intersection before
+	 * force-proceeding to break potential deadlocks. 0 = wait forever (not
+	 * recommended). Default 30s.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Intersection", meta = (ClampMin = "0"))
+	float MaxIntersectionWaitTimeSec;
+
+	/** Cached forward extent of the vehicle mesh bounding box (cm from actor
+	 *  origin to front bumper). Computed once on possess from the pawn's
+	 *  component bounds. Used so the FRONT BUMPER stops at the line, not
+	 *  the actor center. */
+	float VehicleFrontExtent;
+
+	/**
 	 * Seed for deterministic random decisions.
 	 * Reserved for future use (e.g. lane choice at intersections).
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic")
 	int32 RandomSeed;
 
-	/** When true (non-Shipping builds), draws the lane polyline, look-ahead target, and leader detection in-game. Has no effect in Shipping. */
+	/** When true (non-Shipping builds), draws the lane polyline, look-ahead target, and leader detection in-game. Has no effect in Shipping. Can also be toggled globally via console: traffic.DebugDraw 1 */
 	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")
 	bool bDebugDraw = false;
+
+	// --- Cached debug state (populated each tick in UpdateVehicleInput for debug draw) ---
+#if ENABLE_DRAW_DEBUG
+	FString DbgStateName = TEXT("INIT");
+	float DbgThrottle = 0.0f;
+	float DbgBrake = 0.0f;
+	float DbgSteering = 0.0f;
+	float DbgEffectiveTargetSpeed = 0.0f;
+	float DbgCurrentSpeed = 0.0f;
+	float DbgDistToEntry = -1.0f; // -1 = not approaching intersection
+	float DbgDesiredStopSpeed = 0.0f;
+	float DbgLeaderDist = -1.0f;  // -1 = no leader detected
+	float DbgLeaderSpeed = 0.0f;
+	float DbgRemainingDist = 0.0f;
+	float DbgTransitionThreshold = 0.0f;
+	float DbgStoppingDist = 0.0f; // v^2 / (2*300)
+	FVector DbgTargetPoint = FVector::ZeroVector;
+	float DbgApproachJunctionDist = -1.0f;  // -1 = no junction detected by scan
+	float DbgApproachSpeedLimit = 0.0f;
+	int32 DbgApproachJunctionId = 0;
+#endif
 
 	// --- One-shot diagnostic flags (prevent log spam, gated by traffic.VehicleDiagnostics CVar) ---
 	bool bDiagLoggedNoMovement = false;
