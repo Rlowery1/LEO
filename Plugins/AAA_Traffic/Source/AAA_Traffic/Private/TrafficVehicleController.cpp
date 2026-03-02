@@ -1416,7 +1416,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		// enough advance warning to actually stop before the intersection.
 		// Old formula: max(LookAhead, |Speed| * 1.0s) — only 1s of reaction time.
 		// New formula: max(LookAhead, v²/(2*decel) + margin) — matches actual braking physics.
-		const float AbsSpeed = FMath::Abs(CurrentSpeed);
+		// AbsSpeed already computed at the top of UpdateVehicleInput.
 		const float StoppingDist = (AbsSpeed * AbsSpeed) / (2.0f * ApproachDecelCmPerSec2);
 		const float TransitionThreshold = FMath::Max(LookAheadDistance, StoppingDist + ApproachSafetyMarginCm);
 #if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
