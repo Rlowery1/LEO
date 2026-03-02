@@ -1785,9 +1785,29 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 						IntersectionWaitElapsed,
 						MaxIntersectionWaitTimeSec);
 
-					// Force-occupy: bypass TryOccupyJunction — just mark as
-					// proceeding. The junction system will still track us for
-					// release, but we won't wait for permission anymore.
+					// FIX (Phase 3): Properly register with junction occupancy
+					// so this vehicle is visible to conflict detection. The old
+					// code just set bWaitingAtIntersection=false, making it a
+					// ghost that other vehicles couldn't see — causing collisions.
+					{
+						UWorld* ForceWorld = GetWorld();
+						UTrafficSubsystem* ForceSub = ForceWorld ? ForceWorld->GetSubsystem<UTrafficSubsystem>() : nullptr;
+						if (ForceSub)
+						{
+							// Try normal occupancy first — the blocking vehicle may
+							// have left by now, making a clean entry possible.
+							if (!ForceSub->TryOccupyJunction(IntersectionJunctionId,
+								this, IntersectionFromLane, IntersectionToLane))
+							{
+								// Still blocked — force-occupy so we are at least
+								// visible in the occupant list. Other vehicles will
+								// see us and yield instead of driving through us.
+								ForceSub->ForceOccupyJunction(IntersectionJunctionId,
+									this, IntersectionFromLane, IntersectionToLane);
+							}
+						}
+					}
+
 					bWaitingAtIntersection = false;
 					IntersectionWaitElapsed = 0.0f;
 					bHasIntersectionEntryPos = false;
@@ -2826,6 +2846,7 @@ void ATrafficVehicleController::EvaluateLaneChange()
 		const FVector VehicleLocation = ControlledPawn->GetActorLocation();
 		bool bGapClear = true;
 
+		// Check vehicles currently registered on the candidate lane.
 		TArray<TWeakObjectPtr<ATrafficVehicleController>> Neighbors = TrafficSub->GetVehiclesOnLane(CandidateLane);
 		for (const TWeakObjectPtr<ATrafficVehicleController>& WeakNeighbor : Neighbors)
 		{
@@ -2844,6 +2865,35 @@ void ATrafficVehicleController::EvaluateLaneChange()
 					AddLaneDecisionTrace(TEXT("LaneChange.RejectGap"), CandidateLane.HandleId, DistToNeighbor, LaneChangeGapRequired, TEXT("Neighbor too close"));
 				}
 				break;
+			}
+		}
+
+		// FIX (Phase 3): Blind-spot check — also reject if any vehicle is
+		// currently mid-lane-change INTO the candidate lane. The per-lane
+		// registry only tracks a vehicle's source lane during a change, so
+		// without this check two vehicles can converge onto the same lane.
+		if (bGapClear)
+		{
+			for (const TWeakObjectPtr<ATrafficVehicleController>& WeakOther : TrafficSub->GetActiveVehicles())
+			{
+				ATrafficVehicleController* Other = WeakOther.Get();
+				if (!Other || Other == this) { continue; }
+				if (Other->LaneChangeState != ELaneChangeState::Executing) { continue; }
+				if (Other->TargetLaneHandle != CandidateLane) { continue; }
+
+				const APawn* OtherPawn = Other->GetPawn();
+				if (!OtherPawn) { continue; }
+
+				const float DistToOther = FVector::Dist(VehicleLocation, OtherPawn->GetActorLocation());
+				if (DistToOther < LaneChangeGapRequired)
+				{
+					bGapClear = false;
+					if (IsVehicleTraceEnabled(2))
+					{
+						AddLaneDecisionTrace(TEXT("LaneChange.RejectBlindSpot"), CandidateLane.HandleId, DistToOther, LaneChangeGapRequired, TEXT("Vehicle changing into target lane"));
+					}
+					break;
+				}
 			}
 		}
 
@@ -3108,6 +3158,20 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 	if (!HitPawn)
 	{
 		return -1.0f;
+	}
+
+	// FIX (Phase 3): Oncoming traffic filter — ignore vehicles traveling in the
+	// opposite direction. Without this, vehicles on opposing lanes of a 2-way
+	// road are detected as leaders, causing artificial braking and head-on
+	// collision cascades.
+	{
+		const FVector HitPawnForward = HitPawn->GetActorForwardVector();
+		const float DirectionDot = FVector::DotProduct(HitPawnForward, SweepDirection);
+		if (DirectionDot < -0.3f)
+		{
+			// Oncoming vehicle — not a leader, ignore.
+			return -1.0f;
+		}
 	}
 
 	// Extract leader's forward speed.

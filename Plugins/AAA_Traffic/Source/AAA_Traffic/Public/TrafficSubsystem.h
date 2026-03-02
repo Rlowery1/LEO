@@ -136,6 +136,14 @@ public:
 	bool TryOccupyJunction(int32 JunctionId, ATrafficVehicleController* Controller,
 		const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane);
 
+	/**
+	 * Force-add a vehicle to junction occupancy without checking conflicts.
+	 * Used only by the deadlock-break timeout to ensure the vehicle is visible
+	 * to other vehicles' conflict detection even when entering unconditionally.
+	 */
+	void ForceOccupyJunction(int32 JunctionId, ATrafficVehicleController* Controller,
+		const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane);
+
 	/** Release junction occupancy for the given vehicle. */
 	void ReleaseJunction(int32 JunctionId, ATrafficVehicleController* Controller);
 

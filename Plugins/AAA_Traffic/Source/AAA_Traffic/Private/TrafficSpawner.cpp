@@ -708,6 +708,35 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 	const FRotator SpawnRotation = SpawnDir.Rotation();
 	const FTransform SpawnTransform(SpawnRotation, SpawnLocation);
 
+	// FIX (Phase 3): Pre-spawn overlap check — skip this slot if an existing
+	// traffic vehicle is already within SpawnSpacing. Without this, the
+	// AdjustIfPossibleButAlwaysSpawn policy can stack vehicles on top of each
+	// other, causing immediate physics explosions on spawn.
+	{
+		UTrafficSubsystem* OverlapSub = World->GetSubsystem<UTrafficSubsystem>();
+		if (OverlapSub)
+		{
+			const float MinSeparationSq = SpawnSpacing * SpawnSpacing;
+			for (const TWeakObjectPtr<ATrafficVehicleController>& WeakVC : OverlapSub->GetActiveVehicles())
+			{
+				ATrafficVehicleController* VC = WeakVC.Get();
+				if (!VC) { continue; }
+				const APawn* ExistingPawn = VC->GetPawn();
+				if (!ExistingPawn) { continue; }
+
+				if (FVector::DistSquared(SpawnLocation, ExistingPawn->GetActorLocation()) < MinSeparationSq)
+				{
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("TrafficSpawner: Skipping vehicle %d on lane %d — "
+							 "existing vehicle '%s' too close (within %.0f cm)."),
+						VehicleIndex, Lane.HandleId,
+						*ExistingPawn->GetName(), SpawnSpacing);
+					return;
+				}
+			}
+		}
+	}
+
 	// Select vehicle class via weighted random (C1: vehicle variety).
 	const TSubclassOf<APawn> ChosenClass = SelectVehicleClass(VehicleIndex);
 	if (!ChosenClass)
