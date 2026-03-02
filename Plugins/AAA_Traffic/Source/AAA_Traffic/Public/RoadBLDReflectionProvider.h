@@ -303,6 +303,12 @@ private:
 	/** Road handle ID → total road width (sum of all lane widths on that road, in cm). */
 	TMap<int32, float> RoadTotalWidthMap;
 
+	/** Road handle ID → classified speed limit (cm/s), computed from lane count.
+	 *  1-2 lanes = residential (1118 cm/s ≈ 25 mph)
+	 *  3-4 lanes = urban (2012 cm/s ≈ 45 mph)
+	 *  5+ lanes  = highway (2906 cm/s ≈ 65 mph) */
+	TMap<int32, float> RoadClassifiedSpeedLimits;
+
 	// ── Precomputed full-network junction map (built once at startup) ──
 
 	/** Lane handle ID → precomputed junction scan result.

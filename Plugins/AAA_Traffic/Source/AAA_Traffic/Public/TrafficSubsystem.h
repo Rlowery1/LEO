@@ -136,6 +136,14 @@ public:
 	bool TryOccupyJunction(int32 JunctionId, ATrafficVehicleController* Controller,
 		const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane);
 
+	/**
+	 * Force-add a vehicle to junction occupancy without checking conflicts.
+	 * Used only by the deadlock-break timeout to ensure the vehicle is visible
+	 * to other vehicles' conflict detection even when entering unconditionally.
+	 */
+	void ForceOccupyJunction(int32 JunctionId, ATrafficVehicleController* Controller,
+		const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane);
+
 	/** Release junction occupancy for the given vehicle. */
 	void ReleaseJunction(int32 JunctionId, ATrafficVehicleController* Controller);
 
@@ -151,6 +159,15 @@ public:
 
 	/** Get the vehicle object pool (used by spawner and despawn sweep). */
 	UTrafficVehiclePool* GetVehiclePool() const { return VehiclePool; }
+
+	// --- Safety Despawn ---
+
+	/**
+	 * Request immediate despawn of a vehicle for safety reasons (flipped,
+	 * stuck, runaway speed). The actual destruction is deferred to next tick
+	 * to avoid invalidating iterators or destroying objects mid-Tick.
+	 */
+	void RequestDespawn(ATrafficVehicleController* Controller, const FString& Reason);
 
 	// --- Despawn configuration ---
 

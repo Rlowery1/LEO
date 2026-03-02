@@ -23,6 +23,26 @@ enum class ELaneChangeState : uint8
 };
 
 /**
+ * Turn signal indicator state — exposed to Blueprint for visual binding
+ * (e.g. activating brake-light / turn-signal meshes or materials).
+ */
+UENUM(BlueprintType)
+enum class ETurnSignalState : uint8
+{
+	/** No signal active. */
+	Off,
+	/** Left turn signal. */
+	Left,
+	/** Right turn signal. */
+	Right,
+	/** Hazard lights (both sides). */
+	Hazard
+};
+
+/** Delegate broadcast when the vehicle's turn signal state changes. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTurnSignalChanged, ETurnSignalState, NewState);
+
+/**
  * AI controller that drives a Chaos vehicle along a lane
  * obtained from an ITrafficRoadProvider adapter.
  *
@@ -71,6 +91,15 @@ public:
 	/** Set the base (default) speed limit used when the provider has no lane speed data. */
 	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	void SetDefaultSpeedLimit(float InSpeedLimit);
+
+	/** Get the current turn signal state (Off, Left, Right, Hazard). */
+	UFUNCTION(BlueprintPure, Category = "Traffic")
+	ETurnSignalState GetTurnSignalState() const { return CurrentTurnSignal; }
+
+	/** Fired whenever the turn signal state changes. Bind in Blueprint to
+	 *  activate turn signal lights on the vehicle mesh. */
+	UPROPERTY(BlueprintAssignable, Category = "Traffic")
+	FOnTurnSignalChanged OnTurnSignalChanged;
 
 protected:
 	virtual void OnPossess(APawn* InPawn) override;
@@ -236,6 +265,41 @@ private:
 	/** Elapsed time (seconds) spent waiting at the current intersection. */
 	float IntersectionWaitElapsed = 0.0f;
 
+	/** Elapsed time (seconds) spent at a full stop at a stop-sign junction.
+	 *  Once this reaches the signal controller's StopSignWaitTimeSec, the
+	 *  vehicle is allowed to proceed (if occupancy is clear). */
+	float StopSignStopElapsed = 0.0f;
+
+	/** True when the vehicle has completed the mandatory stop-sign wait
+	 *  and is now waiting only for junction occupancy clearance. */
+	bool bStopSignWaitComplete = false;
+
+	// ── Turn signal state ───────────────────────────────────
+
+	/** Current turn signal state. */
+	ETurnSignalState CurrentTurnSignal = ETurnSignalState::Off;
+
+	/** Set the turn signal and broadcast delegate (no-op if state unchanged). */
+	void SetTurnSignal(ETurnSignalState NewState);
+
+	/**
+	 * Compute the turn direction for a junction transition.
+	 * Uses cross product of approach direction × exit direction.
+	 * Returns Left, Right, or Off (straight-through).
+	 */
+	ETurnSignalState ComputeTurnDirection(const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane) const;
+
+	// ── Lane pre-positioning state ──────────────────────────
+
+	/** Target lane handle for navigational lane change (pre-positioning before junction). */
+	FTrafficLaneHandle NavigationalTargetLane;
+
+	/** True when a navigational (junction pre-positioning) lane change is pending or active. */
+	bool bNavigationalLaneChange = false;
+
+	/** Minimum distance (cm) before junction to attempt pre-positioning lane change. */
+	static constexpr float MinPrePositionDistanceCm = 15000.0f; // 150m
+
 	/** Per-instance log throttle counter for waiting-state diagnostics.
 	 *  Replaces the old static int32 that was shared across all instances
 	 *  (determinism violation). */
@@ -254,6 +318,23 @@ private:
 
 	/** Distance traveled by the vehicle this tick (computed once, consumed by blend). */
 	float DistanceThisTick;
+
+	/** Previous-tick cross-track error (CrossZ) for the steering derivative term. */
+	float PreviousCrossTrackError = 0.0f;
+
+	// ── Computed adaptive distances (set each tick in UpdateVehicleInput) ─
+	// These are derived from the time-based tuning properties × current speed.
+	// Internal code (GetLookAheadPoint, GetLeaderDistance, etc.) reads these
+	// instead of the old fixed-distance UPROPERTYs.
+
+	/** Computed look-ahead distance (cm) for this tick. */
+	float LookAheadDistance = 300.0f;
+
+	/** Computed following distance (cm) for this tick. */
+	float FollowingDistance = 200.0f;
+
+	/** Computed detection distance (cm) for this tick. */
+	float DetectionDistance = 1500.0f;
 
 	/** Cached index from last FindClosestPointIndex call (for O(1) amortized search). */
 	int32 LastClosestIndex;
@@ -312,17 +393,54 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
 	float TargetSpeed;
 
-	/** Distance ahead on the lane path (cm) used as the steering target. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "100"))
-	float LookAheadDistance;
+	// ── Adaptive Driving Parameters (time-based) ───────────
+	// These replace the old fixed-distance properties. At runtime the
+	// controller computes: EffectiveDistance = Speed * TimeSec, clamped
+	// to a minimum. This means distances grow with speed automatically.
 
-	/** Minimum safe following distance behind a leader (cm). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "100"))
-	float FollowingDistance;
+	/**
+	 * Time (seconds) of look-ahead along the lane centerline for the
+	 * steering target. Effective distance = CurrentSpeed * this value,
+	 * clamped to MinLookAheadDistanceCm. Default 0.6s.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Steering", meta = (ClampMin = "0.1"))
+	float LookAheadTimeSec;
 
-	/** Maximum forward detection range for vehicles ahead (cm). */
+	/** Floor for look-ahead distance (cm) at very low speeds. Default 300. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Steering", meta = (ClampMin = "50"))
+	float MinLookAheadDistanceCm;
+
+	/**
+	 * Derivative (damping) gain for the PD steering controller.
+	 * Larger values reduce steering oscillation on straights.
+	 * 0 = pure P controller (old behavior). Default 0.5.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Steering", meta = (ClampMin = "0", ClampMax = "2"))
+	float SteeringDampingFactor;
+
+	/**
+	 * Time (seconds) of safe following gap behind a leader vehicle.
+	 * Effective distance = CurrentSpeed * this value, clamped to
+	 * MinFollowingDistanceCm. Default 1.5s (standard 1.5-second rule).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "0.3"))
+	float FollowingTimeSec;
+
+	/** Floor for following distance (cm) at very low speeds. Default 200. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "50"))
+	float MinFollowingDistanceCm;
+
+	/**
+	 * Time (seconds) of forward detection range for leader vehicles.
+	 * Effective distance = CurrentSpeed * this value, clamped to
+	 * MinDetectionDistanceCm. Default 4.0s.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "1.0"))
+	float DetectionTimeSec;
+
+	/** Floor for detection distance (cm) at very low speeds. Default 1500. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "500"))
-	float DetectionDistance;
+	float MinDetectionDistanceCm;
 
 	// ── Lane Change Tuning ──────────────────────────────────
 
@@ -403,8 +521,8 @@ protected:
 
 	/**
 	 * Maximum time (seconds) a vehicle will wait at an intersection before
-	 * force-proceeding to break potential deadlocks. 0 = wait forever (not
-	 * recommended). Default 30s.
+	 * force-proceeding to break potential deadlocks. 0 = wait forever (no
+	 * timeout). Default 90s.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Intersection", meta = (ClampMin = "0"))
 	float MaxIntersectionWaitTimeSec;
@@ -414,6 +532,40 @@ protected:
 	 *  component bounds. Currently used for diagnostics/logging and
 	 *  reserved for future stop-line alignment logic. */
 	float VehicleFrontExtent = 0.0f;
+
+	// ── Physics Safety Net State ────────────────────────────
+
+	/** Accumulated seconds the vehicle has been continuously flipped / airborne.
+	 *  After FlipDespawnTimeSec, the vehicle is safety-despawned. */
+	float FlipTimeAccumulator = 0.0f;
+
+	/** Accumulated seconds the vehicle has been continuously stuck.
+	 *  After StuckDespawnTimeSec, the vehicle is safety-despawned. */
+	float StuckTimeAccumulator = 0.0f;
+
+	/** Throttle timer for the wake guard so it fires at most once per second
+	 *  instead of every single tick (avoids energy injection). */
+	float WakeGuardCheckTimer = 0.0f;
+
+	/** True once a safety despawn has been requested. Prevents driving input
+	 *  and further despawn requests while the deferred destroy is pending. */
+	bool bPendingRecoveryDespawn = false;
+
+	/**
+	 * Maximum allowed vehicle speed (cm/s). If the physics body's linear
+	 * velocity exceeds this, the velocity is zeroed as an emergency brake.
+	 * Default 8000 cm/s ≈ 180 mph — well above any realistic traffic speed.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Safety", meta = (ClampMin = "1000"))
+	float MaxAllowedSpeedCmPerSec;
+
+	/** Seconds a vehicle must be continuously flipped / airborne before despawn.
+	 *  1.5 s is enough to filter brief bumps from terrain. */
+	static constexpr float FlipDespawnTimeSec = 1.5f;
+
+	/** Seconds a vehicle must be continuously stuck before despawn.
+	 *  5.0 s is a generous grace period for temporary stops. */
+	static constexpr float StuckDespawnTimeSec = 5.0f;
 
 	/**
 	 * Seed for deterministic random decisions.

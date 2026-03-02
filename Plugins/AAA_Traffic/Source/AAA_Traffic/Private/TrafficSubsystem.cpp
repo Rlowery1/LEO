@@ -305,6 +305,52 @@ void UTrafficSubsystem::PerformDespawnSweep()
 }
 
 // ---------------------------------------------------------------------------
+// Safety Despawn
+// ---------------------------------------------------------------------------
+
+void UTrafficSubsystem::RequestDespawn(ATrafficVehicleController* Controller, const FString& Reason)
+{
+	if (!Controller) return;
+
+	// Capture everything we need before deferring. The controller may be
+	// garbage-collected between now and next tick, so use a weak pointer.
+	TWeakObjectPtr<ATrafficVehicleController> WeakController(Controller);
+	const FString CapturedReason = Reason;
+
+	// Defer actual destruction to next tick to avoid invalidating iterators
+	// or destroying objects during another object's Tick.
+	GetWorld()->GetTimerManager().SetTimerForNextTick(
+		FTimerDelegate::CreateWeakLambda(this, [this, WeakController, CapturedReason]()
+		{
+			ATrafficVehicleController* Ctrl = WeakController.Get();
+			if (!Ctrl) return;
+
+			APawn* VehiclePawn = Ctrl->GetPawn();
+			const FString VehicleName = VehiclePawn
+				? VehiclePawn->GetName() : TEXT("unknown");
+
+			// Broadcast before destroy so listeners (e.g. spawner) can react.
+			OnVehicleDespawned.Broadcast(Ctrl, Ctrl->GetCurrentLane());
+
+			Ctrl->UnPossess();
+
+			if (VehiclePawn && VehiclePool)
+			{
+				VehiclePool->ReleaseVehicle(VehiclePawn);
+			}
+			else if (VehiclePawn)
+			{
+				VehiclePawn->Destroy();
+			}
+			Ctrl->Destroy();
+
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("TrafficSubsystem: SAFETY despawned '%s' — %s"),
+				*VehicleName, *CapturedReason);
+		}));
+}
+
+// ---------------------------------------------------------------------------
 // Spatial Grid
 // ---------------------------------------------------------------------------
 
@@ -545,6 +591,38 @@ bool UTrafficSubsystem::TryOccupyJunction(int32 JunctionId,
 		TEXT("JNCT TryOccupy: JunctionId=%d Caller='%s' From=%d To=%d — GRANTED (%d occupants now)"),
 		JunctionId, *CallerName, FromLane.HandleId, ToLane.HandleId, Occupants.Num());
 	return true;
+}
+
+void UTrafficSubsystem::ForceOccupyJunction(int32 JunctionId,
+	ATrafficVehicleController* Controller,
+	const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane)
+{
+	if (JunctionId == 0 || !Controller) { return; }
+
+	const FString CallerName = (Controller && Controller->GetPawn())
+		? Controller->GetPawn()->GetName() : TEXT("NULL");
+
+	TArray<FJunctionOccupant>& Occupants = JunctionOccupancy.FindOrAdd(JunctionId);
+
+	// Purge stale entries.
+	Occupants.RemoveAll([](const FJunctionOccupant& O) { return !O.Controller.IsValid(); });
+
+	// Self-reentry check — already present, nothing to do.
+	for (const FJunctionOccupant& Occ : Occupants)
+	{
+		if (Occ.Controller.Get() == Controller) { return; }
+	}
+
+	FJunctionOccupant NewOccupant;
+	NewOccupant.Controller = Controller;
+	NewOccupant.FromLane = FromLane;
+	NewOccupant.ToLane = ToLane;
+	Occupants.Add(NewOccupant);
+
+	UE_LOG(LogAAATraffic, Warning,
+		TEXT("JNCT ForceOccupy: JunctionId=%d Caller='%s' From=%d To=%d — "
+			 "FORCED entry (deadlock break, %d occupants now)"),
+		JunctionId, *CallerName, FromLane.HandleId, ToLane.HandleId, Occupants.Num());
 }
 
 void UTrafficSubsystem::ReleaseJunction(int32 JunctionId, ATrafficVehicleController* Controller)
