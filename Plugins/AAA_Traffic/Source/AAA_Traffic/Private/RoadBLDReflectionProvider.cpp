@@ -1946,6 +1946,15 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 			};
 			TArray<FSplitPoint> SplitPoints;
 
+			// FIX: Detect if this lane's polyline is reversed relative to
+			// the reference line. GetLanePath() reverses polylines for
+			// opposite-direction lanes so vehicles drive correctly, but
+			// mask distances are always in reference-line order. Without
+			// mirroring, split indices land at the wrong polyline position
+			// — placing the intersection segment on the wrong portion of
+			// the road for reversed lanes.
+			const bool bIsReversedLane = ReversedLaneSet.Contains(LaneHandle);
+
 			for (const int32 MaskIdx : MaskIndices)
 			{
 				const FIntersectionMaskInfo& Mask = CachedIntersectionMasks[MaskIdx];
@@ -1956,18 +1965,46 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 				const float StartNorm = static_cast<float>(Mask.StartDistance / RoadLength);
 				const float EndNorm = static_cast<float>(Mask.EndDistance / RoadLength);
 
-				int32 StartIdx = FMath::RoundToInt32(StartNorm * static_cast<float>(TotalPoints - 1));
-				int32 EndIdx = FMath::RoundToInt32(EndNorm * static_cast<float>(TotalPoints - 1));
+				int32 StartIdx, EndIdx;
+				double SplitMaskDistStart, SplitMaskDistEnd;
+
+				if (bIsReversedLane)
+				{
+					// Reversed lane: Poly[0] = ref-END, Poly[N-1] = ref-START.
+					// Mirror the mapping: refDist D → idx = (N-1) - round(D/L*(N-1)).
+					// StartDistance (lower ref-line value) maps to a HIGHER poly index,
+					// EndDistance (higher ref-line value) maps to a LOWER poly index.
+					const int32 MaxIdx = TotalPoints - 1;
+					const int32 RawStart = FMath::RoundToInt32(StartNorm * static_cast<float>(MaxIdx));
+					const int32 RawEnd = FMath::RoundToInt32(EndNorm * static_cast<float>(MaxIdx));
+					StartIdx = MaxIdx - RawEnd;     // EndDist → lower poly index (earlier in travel)
+					EndIdx   = MaxIdx - RawStart;   // StartDist → higher poly index (later in travel)
+
+					// Boundary distances: for the reversed vehicle approaching from
+					// ref-END, the first intersection boundary it encounters is at
+					// Mask.EndDistance on the reference line (StartIdx position).
+					// The far boundary (where intersection ends) is at Mask.StartDistance.
+					SplitMaskDistStart = Mask.EndDistance;
+					SplitMaskDistEnd = Mask.StartDistance;
+				}
+				else
+				{
+					// Non-reversed: polyline matches reference-line order.
+					StartIdx = FMath::RoundToInt32(StartNorm * static_cast<float>(TotalPoints - 1));
+					EndIdx = FMath::RoundToInt32(EndNorm * static_cast<float>(TotalPoints - 1));
+					SplitMaskDistStart = Mask.StartDistance;
+					SplitMaskDistEnd = Mask.EndDistance;
+				}
 
 				// Clamp to valid range (never at very first or last point).
 				StartIdx = FMath::Clamp(StartIdx, 1, TotalPoints - 2);
 				EndIdx = FMath::Clamp(EndIdx, StartIdx + 1, TotalPoints - 1);
 
 				// Mark start of intersection segment and start of free segment after it.
-				SplitPoints.Add({ StartIdx, Mask.GroupId, Mask.StartDistance });
+				SplitPoints.Add({ StartIdx, Mask.GroupId, SplitMaskDistStart });
 				if (EndIdx < TotalPoints - 1)
 				{
-					SplitPoints.Add({ EndIdx, 0, Mask.EndDistance }); // Free segment starts after intersection
+					SplitPoints.Add({ EndIdx, 0, SplitMaskDistEnd }); // Free segment starts after intersection
 				}
 				// If EndIdx == TotalPoints - 1, the mask extends to the very end
 				// of the road. No free segment split is added because there is no
@@ -1976,8 +2013,9 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 				// correct behavior — the road ends inside the intersection.
 
 				UE_LOG(LogAAATraffic, Log,
-					TEXT("    Lane %d: Mask group=%d → StartDist=%.1f (idx=%d), EndDist=%.1f (idx=%d)"),
-					LaneHandle, Mask.GroupId, Mask.StartDistance, StartIdx, Mask.EndDistance, EndIdx);
+					TEXT("    Lane %d: Mask group=%d StartDist=%.1f EndDist=%.1f → idx=[%d..%d] reversed=%s"),
+					LaneHandle, Mask.GroupId, Mask.StartDistance, Mask.EndDistance,
+					StartIdx, EndIdx, bIsReversedLane ? TEXT("YES") : TEXT("NO"));
 			}
 
 			// Sort split points by poly index, then by GroupId descending
@@ -2155,10 +2193,12 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 	// BuildLaneConnectivity ran BEFORE splitting and wrote turn connections
 	// keyed by original lane handles. Those originals are now in
 	// ReplacedLaneHandles — no vehicle will ever drive on them. We must
-	// transfer outgoing connections to the LAST virtual segment (the one
-	// whose end-point matches where the original lane ended) and rewrite
-	// incoming connections (where the original appears as a destination)
-	// to point to the FIRST virtual segment instead.
+	// FIX: Use positional proximity instead of blind first/last assignment.
+	// Corner connections are at specific physical locations — a corner at
+	// the ref-line END should route to the virtual segment nearest that
+	// position, not always to the last/first virtual. This matters for
+	// reversed lanes where polyline order is opposite to ref-line order,
+	// and for roads with junctions at both ends.
 	int32 RemappedOutgoing = 0;
 	int32 RemappedIncoming = 0;
 
@@ -2170,24 +2210,46 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 		const int32 FirstVirtual = (*Virtuals)[0];
 		const int32 LastVirtual  = (*Virtuals).Last();
 
-		// --- Outgoing: move connections FROM the original to the last virtual ---
+		// --- Outgoing: assign each connection to the virtual whose EndPos
+		//     is physically closest to the destination lane's StartPos. ---
 		if (const TArray<FTrafficLaneHandle>* OldConns = LaneConnectionMap.Find(OrigHandle))
 		{
-			TArray<FTrafficLaneHandle>& NewConns = LaneConnectionMap.FindOrAdd(LastVirtual);
-			for (const FTrafficLaneHandle& Dst : *OldConns)
+			// Copy because we remove the key below.
+			TArray<FTrafficLaneHandle> OldConnsCopy = *OldConns;
+			LaneConnectionMap.Remove(OrigHandle);
+
+			for (const FTrafficLaneHandle& Dst : OldConnsCopy)
 			{
 				// Skip connections to other virtuals of the same original
 				// (internal chain is already set up above).
 				if (Virtuals->Contains(Dst.HandleId)) { continue; }
 
-				NewConns.AddUnique(Dst);
+				// Find which virtual's EndPos is closest to the destination's StartPos.
+				const FLaneEndpointCache* DstCache = LaneEndpointMap.Find(Dst.HandleId);
+				int32 BestVirtual = LastVirtual; // fallback
+				if (DstCache)
+				{
+					float BestDistSq = MAX_FLT;
+					for (const int32 VH : *Virtuals)
+					{
+						const FLaneEndpointCache* VCache = LaneEndpointMap.Find(VH);
+						if (!VCache) { continue; }
+						const float DSq = FVector::DistSquared(VCache->EndPos, DstCache->StartPos);
+						if (DSq < BestDistSq)
+						{
+							BestDistSq = DSq;
+							BestVirtual = VH;
+						}
+					}
+				}
+
+				LaneConnectionMap.FindOrAdd(BestVirtual).AddUnique(Dst);
 				++RemappedOutgoing;
 			}
-			LaneConnectionMap.Remove(OrigHandle);
 		}
 
 		// --- Incoming: rewrite any connection that targets the original ---
-		// Scan all connection lists and replace OrigHandle → FirstVirtual.
+		// Find which virtual's StartPos is closest to the source lane's EndPos.
 		for (auto& ConnPair : LaneConnectionMap)
 		{
 			TArray<FTrafficLaneHandle>& DstList = ConnPair.Value;
@@ -2195,7 +2257,24 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 			{
 				if (Dst.HandleId == OrigHandle)
 				{
-					Dst = FTrafficLaneHandle(FirstVirtual);
+					const FLaneEndpointCache* SrcCache = LaneEndpointMap.Find(ConnPair.Key);
+					int32 BestVirtual = FirstVirtual; // fallback
+					if (SrcCache)
+					{
+						float BestDistSq = MAX_FLT;
+						for (const int32 VH : *Virtuals)
+						{
+							const FLaneEndpointCache* VCache = LaneEndpointMap.Find(VH);
+							if (!VCache) { continue; }
+							const float DSq = FVector::DistSquared(VCache->StartPos, SrcCache->EndPos);
+							if (DSq < BestDistSq)
+							{
+								BestDistSq = DSq;
+								BestVirtual = VH;
+							}
+						}
+					}
+					Dst = FTrafficLaneHandle(BestVirtual);
 					++RemappedIncoming;
 				}
 			}
@@ -3473,7 +3552,14 @@ FTrafficLaneHandle URoadBLDReflectionProvider::GetAdjacentLane(
 		}
 	}
 
-	const TMap<int32, int32>& Map = (Side == ETrafficLaneSide::Left) ? LeftNeighborMap : RightNeighborMap;
+	// FIX: For reversed lanes, the driver faces opposite to the reference
+	// line. Reference-line "left" is the driver's physical "right" and
+	// vice versa. Swap the lookup so callers get driver-relative adjacency.
+	const bool bIsReversedAdj = ReversedLaneSet.Contains(EffectiveId);
+	const ETrafficLaneSide EffectiveSide = bIsReversedAdj
+		? (Side == ETrafficLaneSide::Left ? ETrafficLaneSide::Right : ETrafficLaneSide::Left)
+		: Side;
+	const TMap<int32, int32>& Map = (EffectiveSide == ETrafficLaneSide::Left) ? LeftNeighborMap : RightNeighborMap;
 	if (const int32* NeighborId = Map.Find(EffectiveId))
 	{
 		// If the neighbor was also split, return the same-indexed virtual segment.
