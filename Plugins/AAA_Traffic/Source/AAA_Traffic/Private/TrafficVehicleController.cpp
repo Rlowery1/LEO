@@ -1448,7 +1448,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 					{
 						FTrafficLaneHandle Walk = CachedProvider->GetAdjacentLane(CurrentLane, ETrafficLaneSide::Right);
 						if (Walk.IsValid()) { TargetSideLane = Walk; }
-						while (Walk.IsValid())
+						for (int32 Safety = 0; Safety < 8 && Walk.IsValid(); ++Safety)
 						{
 							TargetSideLane = Walk;
 							Walk = CachedProvider->GetAdjacentLane(Walk, ETrafficLaneSide::Right);
@@ -1458,7 +1458,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 					{
 						FTrafficLaneHandle Walk = CachedProvider->GetAdjacentLane(CurrentLane, ETrafficLaneSide::Left);
 						if (Walk.IsValid()) { TargetSideLane = Walk; }
-						while (Walk.IsValid())
+						for (int32 Safety = 0; Safety < 8 && Walk.IsValid(); ++Safety)
 						{
 							TargetSideLane = Walk;
 							Walk = CachedProvider->GetAdjacentLane(Walk, ETrafficLaneSide::Left);
