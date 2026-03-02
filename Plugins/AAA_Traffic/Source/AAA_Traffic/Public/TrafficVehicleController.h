@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "AIController.h"
+#include "DrawDebugHelpers.h"
 #include "TrafficRoadProvider.h"
 #include "TrafficVehicleController.generated.h"
 
