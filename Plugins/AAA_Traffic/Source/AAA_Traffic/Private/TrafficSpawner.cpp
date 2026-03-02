@@ -7,15 +7,19 @@
 #include "TrafficSignalController.h"
 #include "TrafficVehiclePool.h"
 #include "TrafficLog.h"
+#include "ChaosWheeledVehicleMovementComponent.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
 #include "EngineUtils.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
 
+// Global debug draw CVar — declared in TrafficVehicleController.cpp.
+extern int32 GTrafficDebugDraw;
+
 ATrafficSpawner::ATrafficSpawner()
 	: VehicleCount(1)
-	, VehicleSpeed(1500.f)
+	, VehicleSpeed(2012.f)
 	, SpawnSeed(42)
 	, SpawnZOffset(50.f)
 	, SpawnSpacing(1500.f)
@@ -24,9 +28,12 @@ ATrafficSpawner::ATrafficSpawner()
 	, bEnableRespawn(true)
 	, RespawnCheckInterval(2.0f)
 	, MinRespawnDistance(10000.f)
-	, DefaultSpeedLimit(0.0f)
+	, DefaultSpeedLimit(2012.0f)
+	, ResidentialSpeed(1118.0f)
+	, UrbanSpeed(2012.0f)
+	, HighwaySpeed(2906.0f)
 {
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.bStartWithTickEnabled = true; // Tick in editor for debug lane draw
 #else
@@ -41,7 +48,7 @@ void ATrafficSpawner::BeginPlay()
 	// Defer to next tick so adapter subsystems have finished OnWorldBeginPlay registration.
 	GetWorldTimerManager().SetTimerForNextTick(this, &ATrafficSpawner::SpawnVehicles);
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	if (bDebugDrawLanes || bDebugDrawIntersections)
 	{
 		SetActorTickEnabled(true);
@@ -51,7 +58,7 @@ void ATrafficSpawner::BeginPlay()
 
 bool ATrafficSpawner::ShouldTickIfViewportsOnly() const
 {
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	return bDebugDrawLanes || bDebugDrawIntersections;
 #else
 	return false;
@@ -62,28 +69,31 @@ void ATrafficSpawner::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	if (!bDebugDrawLanes && !bDebugDrawIntersections)
 	{
 		return;
 	}
 
-	if (bDebugDrawLanes && !bDebugCacheReady && !bDebugCacheAttempted)
+	const bool bDrawLanes = bDebugDrawLanes || (GTrafficDebugDraw != 0);
+	const bool bDrawIntersections = bDebugDrawIntersections || (GTrafficDebugDraw != 0);
+
+	if (bDrawLanes && !bDebugCacheReady && !bDebugCacheAttempted)
 	{
 		CacheDebugLaneData();
 	}
 
-	if (bDebugDrawIntersections && !bIntersectionCacheReady && !bIntersectionCacheAttempted)
+	if (bDrawIntersections && !bIntersectionCacheReady && !bIntersectionCacheAttempted)
 	{
 		CacheDebugIntersectionData();
 	}
 
-	if (bDebugDrawLanes && bDebugCacheReady)
+	if (bDrawLanes && bDebugCacheReady)
 	{
 		DrawDebugLanes();
 	}
 
-	if (bDebugDrawIntersections && bIntersectionCacheReady)
+	if (bDrawIntersections && bIntersectionCacheReady)
 	{
 		DrawDebugIntersections();
 	}
@@ -108,7 +118,7 @@ void ATrafficSpawner::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	Super::EndPlay(EndPlayReason);
 }
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 void ATrafficSpawner::CacheDebugLaneData()
 {
 	UWorld* World = GetWorld();
@@ -749,16 +759,44 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 		}
 		Controller->SetTargetSpeed(FinalSpeed);
 		Controller->SetLaneChangeAggression(LaneChangeAggression);
-		Controller->SetDefaultSpeedLimit(DefaultSpeedLimit);
+
+		// Per-road speed limit: check the override map via the subsystem,
+		// falling back to the spawner's DefaultSpeedLimit (UrbanSpeed by default).
+		float EffectiveSpeedLimit = DefaultSpeedLimit;
+		{
+			UTrafficSubsystem* SpawnSub = World->GetSubsystem<UTrafficSubsystem>();
+			ITrafficRoadProvider* SpawnProv = SpawnSub ? SpawnSub->GetProvider() : nullptr;
+			if (SpawnProv && SpawnSub)
+			{
+				const FTrafficRoadHandle Road = SpawnProv->GetRoadForLane(Lane);
+				const float RoadLimit = SpawnSub->GetRoadSpeedLimit(Road.HandleId);
+				if (RoadLimit > 0.0f)
+				{
+					EffectiveSpeedLimit = RoadLimit;
+				}
+			}
+		}
+		Controller->SetDefaultSpeedLimit(EffectiveSpeedLimit);
 
 		Controller->Possess(Vehicle);
 		Controller->InitializeLaneFollowing(Lane);
 
 		OwnedVehicles.Add(Controller);
 
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("TrafficSpawner: Vehicle %d spawned on lane %d."),
-			VehicleIndex, Lane.HandleId);
+		// --- Spawner diagnostic: confirm possession and movement readiness ---
+		{
+			UPawnMovementComponent* MC = Vehicle->GetMovementComponent();
+			UChaosWheeledVehicleMovementComponent* ChaosMC =
+				Cast<UChaosWheeledVehicleMovementComponent>(MC);
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("TrafficSpawner: Vehicle %d spawned on lane %d. "
+					 "Class='%s' MovementComp='%s' ChaosWheeledCast=%s Possessed=%s"),
+				VehicleIndex, Lane.HandleId,
+				*Vehicle->GetClass()->GetName(),
+				MC ? *MC->GetClass()->GetName() : TEXT("NULL"),
+				ChaosMC ? TEXT("OK") : TEXT("FAILED"),
+				Controller->GetPawn() ? TEXT("Yes") : TEXT("No"));
+		}
 	}
 }
 
@@ -861,7 +899,7 @@ void ATrafficSpawner::OnProviderRegistered(ITrafficRoadProvider* Provider)
 {
 	if (bSpawnComplete) { return; }
 
-#if ENABLE_DRAW_DEBUG
+#if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	// Reset debug cache so it picks up provider data on next tick.
 	bDebugCacheReady = false;
 	bDebugCacheAttempted = false;
@@ -917,6 +955,13 @@ void ATrafficSpawner::SpawnVehicles()
 		return;
 	}
 
+	// Push per-road speed overrides into the subsystem so controllers can
+	// query the correct speed limit when transitioning between roads.
+	for (const auto& OverrideEntry : RoadSpeedOverrides)
+	{
+		TrafficSub->SetRoadSpeedLimit(OverrideEntry.Key, OverrideEntry.Value);
+	}
+
 	TArray<FTrafficLaneHandle> AllLanes;
 	for (const FTrafficRoadHandle& Road : Roads)
 	{
@@ -929,18 +974,61 @@ void ATrafficSpawner::SpawnVehicles()
 		return;
 	}
 
-	// Cache for respawn use.
-	CachedAllLanes = AllLanes;
-
 	// Auto-place traffic signals at discovered junctions (C2).
+	// Must happen before filtering so PlaceAutoSignals sees all lanes.
 	PlaceAutoSignals(World, Provider, AllLanes);
+
+	// Filter out junction lanes — vehicles must not spawn inside intersections.
+	// Junction lanes are short virtual segments (12-14m) and spawning on them
+	// causes vehicles to immediately enter junction logic on their first tick.
+	{
+		const int32 PreFilterCount = AllLanes.Num();
+		AllLanes.RemoveAll([Provider](const FTrafficLaneHandle& Lane)
+		{
+			return Provider->GetJunctionForLane(Lane) != 0;
+		});
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("TrafficSpawner: Filtered %d junction lanes from spawn pool (%d -> %d)."),
+			PreFilterCount - AllLanes.Num(), PreFilterCount, AllLanes.Num());
+	}
+
+	// Filter out stub lanes that are too short for a vehicle to spawn on.
+	// These occur when a road's intersection mask starts at (or very near)
+	// the road endpoint, producing a pre-mask segment of only a few cm.
+	{
+		constexpr float MinSpawnLaneLengthCm = 500.0f;
+		const int32 PreStubCount = AllLanes.Num();
+		AllLanes.RemoveAll([Provider, MinSpawnLaneLengthCm](const FTrafficLaneHandle& Lane)
+		{
+			const float LaneLengthCm = Provider->GetLaneLength(Lane);
+			// Treat length <= 0 as "unknown" (provider has no data) — keep the
+			// lane rather than wrongly filtering it as a stub.
+			return LaneLengthCm > 0.0f && LaneLengthCm < MinSpawnLaneLengthCm;
+		});
+		const int32 StubsRemoved = PreStubCount - AllLanes.Num();
+		if (StubsRemoved > 0)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("TrafficSpawner: Filtered %d stub lanes (< %.0f cm) from spawn pool (%d -> %d)."),
+				StubsRemoved, MinSpawnLaneLengthCm, PreStubCount, AllLanes.Num());
+		}
+	}
+
+	if (AllLanes.IsEmpty())
+	{
+		UE_LOG(LogAAATraffic, Warning, TEXT("TrafficSpawner: All lanes are junction lanes — no spawn candidates!"));
+		return;
+	}
+
+	// Cache filtered lanes for respawn use.
+	CachedAllLanes = AllLanes;
 
 	// Allow VehicleCount to exceed lane count — vehicles share lanes with
 	// staggered positioning via SpawnSpacing.
 	const int32 SpawnCount = VehicleCount;
 
 	UE_LOG(LogAAATraffic, Log,
-		TEXT("TrafficSpawner: Spawning %d vehicles across %d available lanes."),
+		TEXT("TrafficSpawner: Spawning %d vehicles across %d available lanes (junction lanes excluded)."),
 		SpawnCount, AllLanes.Num());
 
 	// Track how many vehicles have been placed on each lane for staggered positioning.
@@ -1096,6 +1184,11 @@ void ATrafficSpawner::PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Prov
 			Group.GreenLanes = LanesByRoad[RoadId];
 			Signal->PhaseGroups.Add(MoveTemp(Group));
 		}
+
+		// Stagger signal phases so adjacent junctions don't all start green
+		// simultaneously. Each junction offsets by one full phase period.
+		Signal->PhaseOffset = static_cast<float>(SignalsPlaced)
+			* (Signal->GreenDuration + Signal->YellowDuration);
 
 		// Finish spawning — now BeginPlay sees the correct JunctionId and registers.
 		Signal->FinishSpawning(SignalTransform);

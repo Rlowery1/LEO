@@ -168,14 +168,7 @@ void URoadBLDReflectionProvider::OnWorldBeginPlay(UWorld& InWorld)
 		}
 	};
 
-	// Yield to an already-registered compiled provider (URoadBLDTrafficProvider).
 	UTrafficSubsystem* TrafficSub = InWorld.GetSubsystem<UTrafficSubsystem>();
-	if (TrafficSub && TrafficSub->GetProvider() != nullptr)
-	{
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("RoadBLDReflectionProvider: A compiled provider is already registered — yielding."));
-		return;
-	}
 
 	// ── API Contract Validation ──────────────────────────────────
 	FRoadBLDAPIContractResult ContractResult = FRoadBLDAPIContract::Validate();
@@ -229,6 +222,10 @@ void URoadBLDReflectionProvider::OnWorldBeginPlay(UWorld& InWorld)
 
 	// ── Group connections into junctions ────────────────────────
 	RunDiagPhase(TEXT("BuildJunctionGrouping"), [&]() { BuildJunctionGrouping(); });
+
+	// ── Precompute full junction map for every lane in the network ──
+	// Gives every vehicle O(1) knowledge of the entire road layout.
+	RunDiagPhase(TEXT("PrecomputeJunctionMap"), [&]() { PrecomputeJunctionMap(); });
 
 	if (GTrafficDiagnosticsValidateGraph || ShouldLogDiagnostics(2))
 	{
@@ -405,6 +402,30 @@ TArray<FTrafficLaneHandle> URoadBLDReflectionProvider::GetConnectedLanes(const F
 	{
 		return *Connected;
 	}
+
+	// Virtual-lane fallback: if this is a virtual segment and it has no
+	// connections of its own, check whether the original (pre-split) lane
+	// still has connections that were not remapped. This is a safety net
+	// for edge cases missed by the post-split remapping pass.
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
+	{
+		// Only fall back for the LAST virtual segment of the original lane,
+		// since that is the one whose endpoint corresponds to the original
+		// lane's endpoint (where cross-road connections originate).
+		const TArray<int32>* Siblings = OriginalToVirtualMap.Find(VInfo->OriginalLaneHandle);
+		if (Siblings && Siblings->Num() > 0 && (*Siblings).Last() == Lane.HandleId)
+		{
+			if (const TArray<FTrafficLaneHandle>* OrigConns = LaneConnectionMap.Find(VInfo->OriginalLaneHandle))
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("GetConnectedLanes: Virtual lane %d falling back to original %d connections (%d entries). "
+						 "This indicates the post-split remapping missed this lane."),
+					Lane.HandleId, VInfo->OriginalLaneHandle, OrigConns->Num());
+				return *OrigConns;
+			}
+		}
+	}
+
 	return TArray<FTrafficLaneHandle>();
 }
 
@@ -955,8 +976,12 @@ void URoadBLDReflectionProvider::TriggerRoadBLDRebuildAndDiagnostics(UWorld* Wor
 }
 
 // ---------------------------------------------------------------------------
-// BuildLaneConnectivity — corner-based fallback from RoadNetworkCorners
+// BuildLaneConnectivity — edge-walking corner discovery
 // ---------------------------------------------------------------------------
+// RoadNetworkCorners TArray is empty by design — RoadBLD stores corners
+// in an internal model, not in the reflected property. Instead, walk each
+// road's edge curves using GetNextCornerConnection() to discover all
+// intersection corners and build cross-road lane connections.
 
 void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 {
@@ -998,13 +1023,345 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 	// to keep this function focused on corner-based connectivity logic.
 	TriggerRoadBLDRebuildAndDiagnostics(World, NetworkActor);
 
-	// Access RoadNetworkCorners TArray via reflection.
+	// ── Resolve GetNextCornerConnection UFunction on the network class ──
+	UFunction* GetNextCornerFunc = DynNetworkClass->FindFunctionByName(TEXT("GetNextCornerConnection"));
+	if (!GetNextCornerFunc)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("RoadBLDReflectionProvider: GetNextCornerConnection not found on DynamicRoadNetwork — "
+				 "falling back to RoadNetworkCorners TArray (may be empty)."));
+		BuildLaneConnectivityFromCornersArray(World, NetworkActor);
+		return;
+	}
+
+	// ── Resolve function parameter properties by name ──
+	FObjectPropertyBase* ParamEdgeObjProp = nullptr;
+	FProperty* ParamDistProp = nullptr;  // May be FDoubleProperty or FFloatProperty
+	FBoolProperty*       ParamFoundBoolProp = nullptr;
+	FStructProperty*     ReturnProp = nullptr;
+
+	for (TFieldIterator<FProperty> It(GetNextCornerFunc); It; ++It)
+	{
+		FProperty* Prop = *It;
+		const FName PropName = Prop->GetFName();
+
+		if (PropName == TEXT("Edge"))
+		{
+			ParamEdgeObjProp = CastField<FObjectPropertyBase>(Prop);
+		}
+		else if (PropName == TEXT("CurrentDistance"))
+		{
+			ParamDistProp = Prop;
+		}
+		else if (PropName == TEXT("bFound"))
+		{
+			ParamFoundBoolProp = CastField<FBoolProperty>(Prop);
+		}
+		else if (Prop->HasAnyPropertyFlags(CPF_ReturnParm))
+		{
+			ReturnProp = CastField<FStructProperty>(Prop);
+		}
+	}
+
+	if (!ParamEdgeObjProp || !ParamDistProp || !ParamFoundBoolProp || !ReturnProp)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("RoadBLDReflectionProvider: GetNextCornerConnection has unexpected parameter layout — "
+				 "Edge=%s Dist=%s Found=%s Return=%s. Falling back to TArray."),
+			ParamEdgeObjProp ? TEXT("OK") : TEXT("MISSING"),
+			ParamDistProp ? TEXT("OK") : TEXT("MISSING"),
+			ParamFoundBoolProp ? TEXT("OK") : TEXT("MISSING"),
+			ReturnProp ? TEXT("OK") : TEXT("MISSING"));
+		BuildLaneConnectivityFromCornersArray(World, NetworkActor);
+		return;
+	}
+
+	// ── Resolve FRoadNetworkCorner sub-properties from the return struct ──
+	UScriptStruct* CornerStruct = ReturnProp->Struct;
+	if (!CornerStruct)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("RoadBLDReflectionProvider: Return value struct is null — cannot parse corner data."));
+		BuildLaneConnectivityFromCornersArray(World, NetworkActor);
+		return;
+	}
+
+	FObjectPropertyBase* CornerStartEdgeObj = CastField<FObjectPropertyBase>(
+		CornerStruct->FindPropertyByName(TEXT("StartEdge")));
+	FObjectPropertyBase* CornerEndEdgeObj = CastField<FObjectPropertyBase>(
+		CornerStruct->FindPropertyByName(TEXT("EndEdge")));
+	FProperty* CornerStartDistProp = CornerStruct->FindPropertyByName(TEXT("StartDistance"));
+	FProperty* CornerEndDistProp = CornerStruct->FindPropertyByName(TEXT("EndDistance"));
+	FBoolProperty* CornerStaleBool = CastField<FBoolProperty>(
+		CornerStruct->FindPropertyByName(TEXT("bStale")));
+	FStructProperty* CornerIDStructProp = CastField<FStructProperty>(
+		CornerStruct->FindPropertyByName(TEXT("CornerID")));
+	FProperty* CornerIntersectionPtProp = CornerStruct->FindPropertyByName(TEXT("IntersectionPoint"));
+
+	if (!CornerStartEdgeObj || !CornerEndEdgeObj)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("RoadBLDReflectionProvider: FRoadNetworkCorner missing StartEdge/EndEdge — "
+				 "cannot build connections. Falling back to TArray."));
+		BuildLaneConnectivityFromCornersArray(World, NetworkActor);
+		return;
+	}
+
+	// Cache IntersectionPointProp for later use by other phases.
+	if (CornerIntersectionPtProp)
+	{
+		IntersectionPointProp = CornerIntersectionPtProp;
+	}
+
+	// ── Resolve edge-curve LeftLane/RightLane properties ──
+	FObjectPropertyBase* EdgeLeftLaneObj = nullptr;
+	FObjectPropertyBase* EdgeRightLaneObj = nullptr;
+
+	for (auto& Pair : RoadHandleMap)
+	{
+		UObject* RoadObj = Pair.Value.Get();
+		if (!RoadObj) { continue; }
+
+		FArrayProperty* EdgeCurvesProp = CastField<FArrayProperty>(
+			RoadObj->GetClass()->FindPropertyByName(TEXT("EdgeCurves")));
+		if (!EdgeCurvesProp) { continue; }
+
+		FScriptArrayHelper EdgesHelper(EdgeCurvesProp,
+			EdgeCurvesProp->ContainerPtrToValuePtr<void>(RoadObj));
+		FObjectPropertyBase* InnerObjProp = CastField<FObjectPropertyBase>(EdgeCurvesProp->Inner);
+		if (!InnerObjProp) { continue; }
+
+		for (int32 e = 0; e < EdgesHelper.Num(); ++e)
+		{
+			UObject* EdgeObj = InnerObjProp->GetObjectPropertyValue(EdgesHelper.GetRawPtr(e));
+			if (!EdgeObj) { continue; }
+
+			FProperty* LeftP = EdgeObj->GetClass()->FindPropertyByName(TEXT("LeftLane"));
+			FProperty* RightP = EdgeObj->GetClass()->FindPropertyByName(TEXT("RightLane"));
+			EdgeLeftLaneObj = CastField<FObjectPropertyBase>(LeftP);
+			EdgeRightLaneObj = CastField<FObjectPropertyBase>(RightP);
+			if (EdgeLeftLaneObj && EdgeRightLaneObj) { break; }
+		}
+		if (EdgeLeftLaneObj && EdgeRightLaneObj) { break; }
+	}
+
+	if (!EdgeLeftLaneObj || !EdgeRightLaneObj)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("RoadBLDReflectionProvider: Could not resolve LeftLane/RightLane on edge curves — "
+				 "no corner-based connections."));
+		return;
+	}
+
+	// ── Lambda: collect lane handles from an edge object ──
+	auto CollectLaneHandles = [&](UObject* Edge, TArray<int32>& OutHandles)
+	{
+		if (!Edge) { return; }
+		UObject* LeftLane = EdgeLeftLaneObj->GetObjectPropertyValue_InContainer(Edge);
+		UObject* RightLane = EdgeRightLaneObj->GetObjectPropertyValue_InContainer(Edge);
+		if (LeftLane)
+		{
+			if (const int32* H = LaneToHandleMap.Find(LeftLane)) { OutHandles.AddUnique(*H); }
+		}
+		if (RightLane)
+		{
+			if (const int32* H = LaneToHandleMap.Find(RightLane)) { OutHandles.AddUnique(*H); }
+		}
+	};
+
+	// ── Helper: read a double value from a property that may be double or float ──
+	auto ReadDistanceValue = [](FProperty* Prop, const void* Container) -> double
+	{
+		if (FDoubleProperty* DblProp = CastField<FDoubleProperty>(Prop))
+		{
+			return DblProp->GetPropertyValue_InContainer(Container);
+		}
+		if (FFloatProperty* FltProp = CastField<FFloatProperty>(Prop))
+		{
+			return static_cast<double>(FltProp->GetPropertyValue_InContainer(Container));
+		}
+		return 0.0;
+	};
+
+	auto WriteDistanceValue = [](FProperty* Prop, void* Container, double Value)
+	{
+		if (FDoubleProperty* DblProp = CastField<FDoubleProperty>(Prop))
+		{
+			DblProp->SetPropertyValue_InContainer(Container, Value);
+		}
+		else if (FFloatProperty* FltProp = CastField<FFloatProperty>(Prop))
+		{
+			FltProp->SetPropertyValue_InContainer(Container, static_cast<float>(Value));
+		}
+	};
+
+	// ── Walk all edge curves to discover corners ──────────────────
+	TSet<FGuid> SeenCornerIDs;
+	int32 CornerConnections = 0;
+	int32 TotalCornersFound = 0;
+
+	// Sort road handles for deterministic iteration.
+	TArray<int32> SortedRoadHandles;
+	RoadHandleMap.GetKeys(SortedRoadHandles);
+	SortedRoadHandles.Sort();
+
+	for (const int32 RoadHandle : SortedRoadHandles)
+	{
+		UObject* RoadObj = RoadHandleMap[RoadHandle].Get();
+		if (!RoadObj) { continue; }
+
+		// Access EdgeCurves TArray property on this road.
+		FArrayProperty* EdgeCurvesProp = CastField<FArrayProperty>(
+			RoadObj->GetClass()->FindPropertyByName(TEXT("EdgeCurves")));
+		if (!EdgeCurvesProp) { continue; }
+
+		FScriptArrayHelper EdgesHelper(EdgeCurvesProp,
+			EdgeCurvesProp->ContainerPtrToValuePtr<void>(RoadObj));
+		FObjectPropertyBase* InnerObjProp = CastField<FObjectPropertyBase>(EdgeCurvesProp->Inner);
+		if (!InnerObjProp) { continue; }
+
+		for (int32 e = 0; e < EdgesHelper.Num(); ++e)
+		{
+			UObject* EdgeObj = InnerObjProp->GetObjectPropertyValue(EdgesHelper.GetRawPtr(e));
+			if (!EdgeObj) { continue; }
+
+			// Walk corners along this edge using GetNextCornerConnection.
+			// Start at distance -1.0 to catch any corner at distance 0.0.
+			double WalkDistance = -1.0;
+			constexpr int32 MaxCornersPerEdge = 100; // safety limit
+
+			for (int32 Step = 0; Step < MaxCornersPerEdge; ++Step)
+			{
+				// Allocate params buffer on the stack.
+				TArray<uint8> ParamsStorage;
+				ParamsStorage.AddZeroed(GetNextCornerFunc->ParmsSize);
+				uint8* ParamsBuffer = ParamsStorage.GetData();
+
+				// Set input parameters.
+				ParamEdgeObjProp->SetObjectPropertyValue_InContainer(ParamsBuffer, EdgeObj);
+				WriteDistanceValue(ParamDistProp, ParamsBuffer, WalkDistance);
+
+				// Call GetNextCornerConnection on the network actor.
+				NetworkActor->ProcessEvent(GetNextCornerFunc, ParamsBuffer);
+
+				// Read bFound output.
+				const bool bFound = ParamFoundBoolProp->GetPropertyValue_InContainer(ParamsBuffer);
+				if (!bFound) { break; } // No more corners on this edge.
+
+				// Read the returned FRoadNetworkCorner from the return value.
+				const uint8* CornerPtr = ReturnProp->ContainerPtrToValuePtr<uint8>(ParamsBuffer);
+
+				// ── Advance walk position past this corner ──
+				UObject* CornerStartEdge = CornerStartEdgeObj->GetObjectPropertyValue_InContainer(CornerPtr);
+				UObject* CornerEndEdge = CornerEndEdgeObj->GetObjectPropertyValue_InContainer(CornerPtr);
+
+				double CornerDistOnThisEdge = WalkDistance + 100.0; // fallback
+				if (CornerStartEdge == EdgeObj && CornerStartDistProp)
+				{
+					CornerDistOnThisEdge = ReadDistanceValue(CornerStartDistProp, CornerPtr);
+				}
+				else if (CornerEndEdge == EdgeObj && CornerEndDistProp)
+				{
+					CornerDistOnThisEdge = ReadDistanceValue(CornerEndDistProp, CornerPtr);
+				}
+				WalkDistance = CornerDistOnThisEdge + 0.1;
+
+				// ── Skip stale corners ──
+				if (CornerStaleBool && CornerStaleBool->GetPropertyValue_InContainer(CornerPtr))
+				{
+					continue;
+				}
+
+				// ── Deduplicate by CornerID (FGuid) ──
+				// Each corner is seen from both participating edges; only process once.
+				if (CornerIDStructProp)
+				{
+					FGuid ThisCornerID;
+					const void* IDPtr = CornerIDStructProp->ContainerPtrToValuePtr<void>(CornerPtr);
+					FMemory::Memcpy(&ThisCornerID, IDPtr, sizeof(FGuid));
+
+					if (ThisCornerID.IsValid())
+					{
+						bool bAlreadySeen = false;
+						SeenCornerIDs.Add(ThisCornerID, &bAlreadySeen);
+						if (bAlreadySeen) { continue; }
+					}
+				}
+
+				++TotalCornersFound;
+
+				// ── Build cross-road connections from this corner ──
+				if (!CornerStartEdge || !CornerEndEdge) { continue; }
+
+				TArray<int32> StartHandles, EndHandles;
+				CollectLaneHandles(CornerStartEdge, StartHandles);
+				CollectLaneHandles(CornerEndEdge, EndHandles);
+
+				// Connect StartEdge lanes ↔ EndEdge lanes (bidirectional).
+				for (const int32 Src : StartHandles)
+				{
+					TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(Src);
+					for (const int32 Dst : EndHandles)
+					{
+						if (Src != Dst)
+						{
+							Conns.AddUnique(FTrafficLaneHandle(Dst));
+							++CornerConnections;
+						}
+					}
+				}
+				for (const int32 Src : EndHandles)
+				{
+					TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(Src);
+					for (const int32 Dst : StartHandles)
+					{
+						if (Src != Dst)
+						{
+							Conns.AddUnique(FTrafficLaneHandle(Dst));
+							++CornerConnections;
+						}
+					}
+				}
+
+				if (ShouldLogDiagnostics(2))
+				{
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("  Corner: StartEdge=%s EndEdge=%s StartLanes=[%s] EndLanes=[%s] Dist=%.1f"),
+						CornerStartEdge ? *CornerStartEdge->GetName() : TEXT("null"),
+						CornerEndEdge ? *CornerEndEdge->GetName() : TEXT("null"),
+						*FString::JoinBy(StartHandles, TEXT(","),
+							[](int32 H) { return FString::FromInt(H); }),
+						*FString::JoinBy(EndHandles, TEXT(","),
+							[](int32 H) { return FString::FromInt(H); }),
+						CornerDistOnThisEdge);
+				}
+			}
+		}
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDReflectionProvider: Edge-walking corner discovery — "
+			 "found %d unique corners, added %d cross-road connections."),
+		TotalCornersFound, CornerConnections);
+}
+
+// ---------------------------------------------------------------------------
+// BuildLaneConnectivityFromCornersArray — legacy fallback (reads TArray)
+// ---------------------------------------------------------------------------
+// Kept as a fallback in case GetNextCornerConnection is unavailable.
+// This path reads RoadNetworkCorners which is typically empty by design.
+
+void URoadBLDReflectionProvider::BuildLaneConnectivityFromCornersArray(
+	UWorld* World, AActor* NetworkActor)
+{
+	if (!NetworkActor || !DynNetworkClass) { return; }
+
 	FProperty* CornersProp = DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkCorners"));
 	FArrayProperty* CornerArrayProp = CornersProp ? CastField<FArrayProperty>(CornersProp) : nullptr;
 	if (!CornerArrayProp)
 	{
 		UE_LOG(LogAAATraffic, Log,
-			TEXT("RoadBLDReflectionProvider: RoadNetworkCorners property not found or not array — skipping."));
+			TEXT("RoadBLDReflectionProvider: RoadNetworkCorners property not found — skipping."));
 		return;
 	}
 
@@ -1014,44 +1371,40 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 	if (NumCorners == 0)
 	{
 		UE_LOG(LogAAATraffic, Log,
-			TEXT("RoadBLDReflectionProvider: RoadNetworkCorners is empty — no corner-based connectivity."));
+			TEXT("RoadBLDReflectionProvider: RoadNetworkCorners is empty — no corner-based connectivity (legacy path)."));
 		return;
 	}
 
-	// Resolve FRoadNetworkCorner struct properties.
 	FStructProperty* StructProp = CastField<FStructProperty>(CornerArrayProp->Inner);
 	if (!StructProp) { return; }
 
 	UScriptStruct* CornerStruct = StructProp->Struct;
-	FProperty* StartEdgeProp = CornerStruct->FindPropertyByName(TEXT("StartEdge"));
-	FProperty* EndEdgeProp   = CornerStruct->FindPropertyByName(TEXT("EndEdge"));
-	FProperty* bStaleProp    = CornerStruct->FindPropertyByName(TEXT("bStale"));
-	IntersectionPointProp    = CornerStruct->FindPropertyByName(TEXT("IntersectionPoint"));
-
-	FObjectPropertyBase* StartEdgeObjProp = CastField<FObjectPropertyBase>(StartEdgeProp);
-	FObjectPropertyBase* EndEdgeObjProp   = CastField<FObjectPropertyBase>(EndEdgeProp);
-	FBoolProperty*       bStaleNative     = CastField<FBoolProperty>(bStaleProp);
+	FObjectPropertyBase* StartEdgeObjProp = CastField<FObjectPropertyBase>(
+		CornerStruct->FindPropertyByName(TEXT("StartEdge")));
+	FObjectPropertyBase* EndEdgeObjProp = CastField<FObjectPropertyBase>(
+		CornerStruct->FindPropertyByName(TEXT("EndEdge")));
+	FBoolProperty* bStaleNative = CastField<FBoolProperty>(
+		CornerStruct->FindPropertyByName(TEXT("bStale")));
+	FProperty* IntPtProp = CornerStruct->FindPropertyByName(TEXT("IntersectionPoint"));
+	if (IntPtProp) { IntersectionPointProp = IntPtProp; }
 
 	if (!StartEdgeObjProp || !EndEdgeObjProp) { return; }
 
-	// Resolve edge-curve lane properties.
-	FProperty* EdgeLeftLaneProp  = nullptr;
-	FProperty* EdgeRightLaneProp = nullptr;
+	// Resolve edge-curve lane properties from first valid edge.
+	FObjectPropertyBase* EdgeLeftLaneObj = nullptr;
+	FObjectPropertyBase* EdgeRightLaneObj = nullptr;
 	for (int32 i = 0; i < NumCorners; ++i)
 	{
-		const uint8* ElemPtr = ArrayHelper.GetRawPtr(i);
-		UObject* Edge = StartEdgeObjProp->GetObjectPropertyValue_InContainer(ElemPtr);
+		UObject* Edge = StartEdgeObjProp->GetObjectPropertyValue_InContainer(ArrayHelper.GetRawPtr(i));
 		if (Edge)
 		{
-			EdgeLeftLaneProp  = Edge->GetClass()->FindPropertyByName(TEXT("LeftLane"));
-			EdgeRightLaneProp = Edge->GetClass()->FindPropertyByName(TEXT("RightLane"));
+			EdgeLeftLaneObj = CastField<FObjectPropertyBase>(
+				Edge->GetClass()->FindPropertyByName(TEXT("LeftLane")));
+			EdgeRightLaneObj = CastField<FObjectPropertyBase>(
+				Edge->GetClass()->FindPropertyByName(TEXT("RightLane")));
 			break;
 		}
 	}
-	if (!EdgeLeftLaneProp || !EdgeRightLaneProp) { return; }
-
-	FObjectPropertyBase* EdgeLeftLaneObj  = CastField<FObjectPropertyBase>(EdgeLeftLaneProp);
-	FObjectPropertyBase* EdgeRightLaneObj = CastField<FObjectPropertyBase>(EdgeRightLaneProp);
 	if (!EdgeLeftLaneObj || !EdgeRightLaneObj) { return; }
 
 	auto CollectLaneHandles = [&](UObject* Edge, TArray<int32>& OutHandles)
@@ -1092,7 +1445,7 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 	}
 
 	UE_LOG(LogAAATraffic, Log,
-		TEXT("RoadBLDReflectionProvider: Corner-based connectivity added %d links from %d corners."),
+		TEXT("RoadBLDReflectionProvider: Legacy TArray corner connectivity added %d links from %d corners."),
 		CornerConnections, NumCorners);
 }
 
@@ -1362,6 +1715,7 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 	OriginalToVirtualMap.Empty();
 	ReplacedLaneHandles.Empty();
 	VirtualLaneToGroupId.Empty();
+	IntersectionEntryPointMap.Empty();
 
 	if (CachedIntersectionMasks.Num() == 0)
 	{
@@ -1391,7 +1745,12 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 		});
 	}
 
-	// ── Step 2: Identify through-roads (roads with 2+ masks) ────
+	// ── Step 2: Identify roads that need splitting (1+ masks) ────
+	// Any road with at least one intersection mask must be split into
+	// virtual segments so that only the mask-covered portion is tagged
+	// as a junction lane. Without splitting, BuildJunctionGrouping maps
+	// ALL lanes on the road to the junction, preventing vehicle spawning
+	// on the free-flow portions.
 	// Also need: road handle for each road actor (reverse lookup).
 	TMap<UObject*, int32> RoadActorToHandle;
 	for (const auto& Pair : RoadHandleMap)
@@ -1411,8 +1770,8 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 		UObject* RoadActor = RMPair.Key;
 		const TArray<int32>& MaskIndices = RMPair.Value;
 
-		// Only roads with 2+ masks need splitting.
-		if (MaskIndices.Num() < 2) { continue; }
+		// Split any road that has at least one intersection mask.
+		if (MaskIndices.IsEmpty()) { continue; }
 
 		const int32* RoadHandlePtr = RoadActorToHandle.Find(RoadActor);
 		if (!RoadHandlePtr) { continue; }
@@ -1427,7 +1786,7 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 		++ThroughRoadCount;
 
 		UE_LOG(LogAAATraffic, Log,
-			TEXT("  Through-road %s (handle=%d, length=%.1f): %d masks"),
+			TEXT("  Splitting road %s (handle=%d, length=%.1f): %d mask(s)"),
 			*RoadActor->GetName(), RoadHandle, RoadLength, MaskIndices.Num());
 
 		// ── Step 3: For each lane on this road, compute split indices ──
@@ -1447,6 +1806,7 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 			{
 				int32 PolyIndex;
 				int32 GroupId; // >0 = start of intersection segment, 0 = start of free segment
+				double MaskDistance; // exact reference-line distance for this boundary (cm)
 			};
 			TArray<FSplitPoint> SplitPoints;
 
@@ -1468,10 +1828,10 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 				EndIdx = FMath::Clamp(EndIdx, StartIdx + 1, TotalPoints - 1);
 
 				// Mark start of intersection segment and start of free segment after it.
-				SplitPoints.Add({ StartIdx, Mask.GroupId });
+				SplitPoints.Add({ StartIdx, Mask.GroupId, Mask.StartDistance });
 				if (EndIdx < TotalPoints - 1)
 				{
-					SplitPoints.Add({ EndIdx, 0 }); // Free segment starts after intersection
+					SplitPoints.Add({ EndIdx, 0, Mask.EndDistance }); // Free segment starts after intersection
 				}
 				// If EndIdx == TotalPoints - 1, the mask extends to the very end
 				// of the road. No free segment split is added because there is no
@@ -1508,7 +1868,18 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 			if (SplitPoints.Num() == 0) { continue; }
 
 			// ── Step 4: Create virtual segments ──────────────
+			// Resolve lane edge curves + refline for exact entry-point computation.
+			const FReflectionLaneData* LData = LaneHandleMap.Find(LaneHandle);
+			UObject* LaneRoadActor = LData ? LData->RoadActor.Get() : nullptr;
+			UObject* LaneRefLine = LaneRoadActor ? GetReferenceLine(LaneRoadActor) : nullptr;
+			UObject* LaneLeftEdge = LData ? LData->LeftEdge.Get() : nullptr;
+			UObject* LaneRightEdge = LData ? LData->RightEdge.Get() : nullptr;
+			const bool bCanComputeEntryPoint = LaneLeftEdge && LaneRightEdge && LaneRefLine
+				&& LaneRoadActor && Get3DPosFunc && ConvertDistFunc;
+
 			TArray<int32> VirtualHandles;
+			TArray<int32> VirtualGroupIds; // parallel array: group ID per virtual segment
+			TArray<double> VirtualBoundaryDistances; // parallel: mask distance at end of each segment (0 if N/A)
 			int32 PrevStart = 0;
 			int32 PrevGroupId = 0; // First segment before any intersection = free
 
@@ -1527,6 +1898,14 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 				VInfo.EndPointIndex = SegEnd;
 				VirtualLaneMap.Add(VirtualId, VInfo);
 				VirtualHandles.Add(VirtualId);
+				VirtualGroupIds.Add(PrevGroupId);
+
+				// Store the exact mask distance at this segment's end boundary.
+				// For segments ending at a split point, this is the split point's MaskDistance.
+				// For the final segment, there's no boundary.
+				const double BoundaryDist = (s < SplitPoints.Num())
+					? SplitPoints[s].MaskDistance : 0.0;
+				VirtualBoundaryDistances.Add(BoundaryDist);
 
 				// Tag this virtual lane with its group (0 = free, >0 = intersection).
 				VirtualLaneToGroupId.Add(VirtualId, PrevGroupId);
@@ -1555,6 +1934,54 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 				PrevStart = SegEnd;
 				// Next segment's group: if this was the split point, use its GroupId.
 				PrevGroupId = (s < SplitPoints.Num()) ? SplitPoints[s].GroupId : 0;
+			}
+
+			// ── Step 5: Compute exact intersection entry points ──
+			// For each free-flow virtual segment whose next segment is an
+			// intersection, derive the precise 3D boundary position from
+			// MaskDistance via continuous edge-curve evaluation (no polyline
+			// quantization error).
+			for (int32 v = 0; v < VirtualHandles.Num() - 1; ++v)
+			{
+				const int32 ThisGroup = VirtualGroupIds[v];
+				const int32 NextGroup = VirtualGroupIds[v + 1];
+
+				if (ThisGroup == 0 && NextGroup > 0 && bCanComputeEntryPoint)
+				{
+					// This free-flow segment precedes an intersection.
+					// The boundary distance is stored in VirtualBoundaryDistances[v].
+					const double BoundaryDist = VirtualBoundaryDistances[v];
+					if (BoundaryDist > 0.0)
+					{
+						// Convert reference-line distance to edge-curve distances.
+						const double LeftDist = ConvertDistanceBetweenCurves(
+							LaneRoadActor, LaneRefLine, LaneLeftEdge, BoundaryDist);
+						const double RightDist = ConvertDistanceBetweenCurves(
+							LaneRoadActor, LaneRefLine, LaneRightEdge, BoundaryDist);
+
+						// Sample exact 3D positions on both lane edges.
+						const FVector LeftPos = Get3DPositionAtDistance(LaneLeftEdge, LaneRefLine, LeftDist);
+						const FVector RightPos = Get3DPositionAtDistance(LaneRightEdge, LaneRefLine, RightDist);
+
+						// Lane centerline at the intersection boundary.
+						const FVector EntryPoint = (LeftPos + RightPos) * 0.5f;
+
+						// Store on the VirtualLaneInfo.
+						FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(VirtualHandles[v]);
+						if (VInfo)
+						{
+							VInfo->IntersectionEntryPoint = EntryPoint;
+							VInfo->bHasIntersectionEntryPoint = true;
+						}
+
+						// Store in the lookup map for the provider interface.
+						IntersectionEntryPointMap.Add(VirtualHandles[v], EntryPoint);
+
+						UE_LOG(LogAAATraffic, Log,
+							TEXT("      Virtual %d: intersection entry point computed at MaskDist=%.1f → (%.1f, %.1f, %.1f)"),
+							VirtualHandles[v], BoundaryDist, EntryPoint.X, EntryPoint.Y, EntryPoint.Z);
+					}
+				}
 			}
 
 			if (VirtualHandles.Num() > 1)
@@ -1588,9 +2015,71 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 		}
 	}
 
+	// ── Remap pre-existing corner-based connections to virtual handles ──
+	// BuildLaneConnectivity ran BEFORE splitting and wrote turn connections
+	// keyed by original lane handles. Those originals are now in
+	// ReplacedLaneHandles — no vehicle will ever drive on them. We must
+	// transfer outgoing connections to the LAST virtual segment (the one
+	// whose end-point matches where the original lane ended) and rewrite
+	// incoming connections (where the original appears as a destination)
+	// to point to the FIRST virtual segment instead.
+	int32 RemappedOutgoing = 0;
+	int32 RemappedIncoming = 0;
+
+	for (const int32 OrigHandle : ReplacedLaneHandles)
+	{
+		const TArray<int32>* Virtuals = OriginalToVirtualMap.Find(OrigHandle);
+		if (!Virtuals || Virtuals->Num() == 0) { continue; }
+
+		const int32 FirstVirtual = (*Virtuals)[0];
+		const int32 LastVirtual  = (*Virtuals).Last();
+
+		// --- Outgoing: move connections FROM the original to the last virtual ---
+		if (const TArray<FTrafficLaneHandle>* OldConns = LaneConnectionMap.Find(OrigHandle))
+		{
+			TArray<FTrafficLaneHandle>& NewConns = LaneConnectionMap.FindOrAdd(LastVirtual);
+			for (const FTrafficLaneHandle& Dst : *OldConns)
+			{
+				// Skip connections to other virtuals of the same original
+				// (internal chain is already set up above).
+				if (Virtuals->Contains(Dst.HandleId)) { continue; }
+
+				NewConns.AddUnique(Dst);
+				++RemappedOutgoing;
+			}
+			LaneConnectionMap.Remove(OrigHandle);
+		}
+
+		// --- Incoming: rewrite any connection that targets the original ---
+		// Scan all connection lists and replace OrigHandle → FirstVirtual.
+		for (auto& ConnPair : LaneConnectionMap)
+		{
+			TArray<FTrafficLaneHandle>& DstList = ConnPair.Value;
+			for (FTrafficLaneHandle& Dst : DstList)
+			{
+				if (Dst.HandleId == OrigHandle)
+				{
+					Dst = FTrafficLaneHandle(FirstVirtual);
+					++RemappedIncoming;
+				}
+			}
+		}
+	}
+
+	// Sort all connection lists for determinism after remapping.
+	for (auto& Pair : LaneConnectionMap)
+	{
+		Pair.Value.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
+		{
+			return A.HandleId < B.HandleId;
+		});
+	}
+
 	UE_LOG(LogAAATraffic, Log,
-		TEXT("RoadBLDReflectionProvider: Through-road splitting — %d through-roads, %d virtual segments from %d source lanes."),
-		ThroughRoadCount, TotalVirtuals, ReplacedLaneHandles.Num());
+		TEXT("RoadBLDReflectionProvider: Road splitting — %d roads split, %d virtual segments from %d source lanes. "
+			 "Remapped %d outgoing + %d incoming corner connections to virtual handles."),
+		ThroughRoadCount, TotalVirtuals, ReplacedLaneHandles.Num(),
+		RemappedOutgoing, RemappedIncoming);
 }
 
 // ---------------------------------------------------------------------------
@@ -2114,19 +2603,19 @@ void URoadBLDReflectionProvider::BuildProximityConnections()
 				{
 					++ProximityLinks;
 					++ForwardAccepted;
+				}
 
-					FProximityConnection PC;
-					PC.FromLane = HandleA;
-					PC.ToLane = HandleB;
-					PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
-					ProximityConnectionList.Add(MoveTemp(PC));
+				FProximityConnection PC;
+				PC.FromLane = HandleA;
+				PC.ToLane = HandleB;
+				PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
+				ProximityConnectionList.Add(MoveTemp(PC));
 
-					if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
-					{
-						SampledAccepts.Add(FString::Printf(
-							TEXT("AcceptForward A=%d B=%d Dist=%.2f Dot=%.3f RoadA=%d RoadB=%d"),
-							HandleA, HandleB, FMath::Sqrt(DistSq), Dot, RoadA, RoadB));
-					}
+				if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
+				{
+					SampledAccepts.Add(FString::Printf(
+						TEXT("AcceptForward A=%d B=%d Dist=%.2f Dot=%.3f RoadA=%d RoadB=%d"),
+						HandleA, HandleB, FMath::Sqrt(DistSq), Dot, RoadA, RoadB));
 				}
 			}
 			else
@@ -2152,19 +2641,19 @@ void URoadBLDReflectionProvider::BuildProximityConnections()
 					{
 						++ProximityLinks;
 						++UTurnAccepted;
+					}
 
-						FProximityConnection PC;
-						PC.FromLane = HandleA;
-						PC.ToLane = HandleB;
-						PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
-						ProximityConnectionList.Add(MoveTemp(PC));
+					FProximityConnection PC;
+					PC.FromLane = HandleA;
+					PC.ToLane = HandleB;
+					PC.Midpoint = (CacheA->EndPos + CacheB->StartPos) * 0.5f;
+					ProximityConnectionList.Add(MoveTemp(PC));
 
-						if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
-						{
-							SampledAccepts.Add(FString::Printf(
-								TEXT("AcceptUTurn A=%d B=%d Dist=%.2f Dot=%.3f WidthA=%.1f WidthB=%.1f"),
-								HandleA, HandleB, FMath::Sqrt(DistSq), Dot, WidthA, WidthB));
-						}
+					if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
+					{
+						SampledAccepts.Add(FString::Printf(
+							TEXT("AcceptUTurn A=%d B=%d Dist=%.2f Dot=%.3f WidthA=%.1f WidthB=%.1f"),
+							HandleA, HandleB, FMath::Sqrt(DistSq), Dot, WidthA, WidthB));
 					}
 				}
 				else
@@ -2536,9 +3025,18 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 					PC.FromLane, PC.ToLane, GroupId);
 			}
 
-			// Map these lanes to the junction.
-			LaneToJunctionMap.FindOrAdd(PC.FromLane) = GroupId;
-			LaneToJunctionMap.FindOrAdd(PC.ToLane) = GroupId;
+			// DO NOT tag FromLane/ToLane as junction here.
+			// Mask-based splitting (Step 3) already set the correct IDs:
+			// intersection (mask) segments have GroupId > 0, free-flow
+			// (pre/post-mask) segments are deliberately JunctionId=0.
+			// Tagging proximity-connection participants would pollute
+			// pre-mask approach lanes and post-mask departure lanes with
+			// junction status, causing vehicles to:
+			//   - be filtered from spawn pool (too few spawn candidates)
+			//   - re-detect the junction after exiting (stuck mid-intersection)
+			//   - get assigned to wrong signal groups
+			// The connectivity (which lane leads where) is already stored
+			// in LaneConnectionMap by BuildProximityConnections.
 		}
 
 		UE_LOG(LogAAATraffic, Log,
@@ -2691,6 +3189,16 @@ bool URoadBLDReflectionProvider::IsLaneReversed(const FTrafficLaneHandle& Lane)
 	return ReversedLaneSet.Contains(EffectiveId);
 }
 
+bool URoadBLDReflectionProvider::GetIntersectionEntryPoint(const FTrafficLaneHandle& ApproachLane, FVector& OutPoint)
+{
+	if (const FVector* Pt = IntersectionEntryPointMap.Find(ApproachLane.HandleId))
+	{
+		OutPoint = *Pt;
+		return true;
+	}
+	return false;
+}
+
 // ---------------------------------------------------------------------------
 // ITrafficRoadProvider — junction queries
 // ---------------------------------------------------------------------------
@@ -2700,6 +3208,9 @@ int32 URoadBLDReflectionProvider::GetJunctionForLane(const FTrafficLaneHandle& L
 	// Check the handle directly first (works for both virtual and original).
 	if (const int32* JId = LaneToJunctionMap.Find(Lane.HandleId))
 	{
+		UE_LOG(LogAAATraffic, Verbose,
+			TEXT("JNCT GetJunctionForLane: Lane=%d → JunctionId=%d (direct map hit)"),
+			Lane.HandleId, *JId);
 		return *JId;
 	}
 	// Virtual lane — also check via original handle.
@@ -2707,9 +3218,17 @@ int32 URoadBLDReflectionProvider::GetJunctionForLane(const FTrafficLaneHandle& L
 	{
 		if (const int32* JId = LaneToJunctionMap.Find(VInfo->OriginalLaneHandle))
 		{
+			UE_LOG(LogAAATraffic, Verbose,
+				TEXT("JNCT GetJunctionForLane: Lane=%d (virtual, orig=%d) → JunctionId=%d (fallback hit)"),
+				Lane.HandleId, VInfo->OriginalLaneHandle, *JId);
 			return *JId;
 		}
 	}
+	// No junction for this lane — this fires very frequently for free-flow lanes,
+	// so we use Verbose severity (not Log/Warning).
+	UE_LOG(LogAAATraffic, Verbose,
+		TEXT("JNCT GetJunctionForLane: Lane=%d → 0 (no junction found)"),
+		Lane.HandleId);
 	return 0;
 }
 
@@ -2769,6 +3288,62 @@ bool URoadBLDReflectionProvider::GetJunctionPath(
 	OutPath.Add(*Centroid);
 	OutPath.Add(ToPoints[0]);
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// ITrafficRoadProvider — junction path conflict detection
+// ---------------------------------------------------------------------------
+
+// 2D line-segment intersection test (ignores Z). Returns true if AB crosses CD.
+static bool Segments2DIntersect(const FVector& A, const FVector& B,
+	const FVector& C, const FVector& D)
+{
+	// Parametric intersection of AB and CD in XY plane.
+	const float Ax = B.X - A.X, Ay = B.Y - A.Y;
+	const float Bx = D.X - C.X, By = D.Y - C.Y;
+	const float Denom = Ax * By - Ay * Bx;
+
+	if (FMath::Abs(Denom) < KINDA_SMALL_NUMBER)
+	{
+		return false; // Parallel or degenerate.
+	}
+
+	const float Cx = C.X - A.X, Cy = C.Y - A.Y;
+	const float T = (Cx * By - Cy * Bx) / Denom;
+	const float U = (Cx * Ay - Cy * Ax) / Denom;
+
+	// Strict interior intersection (excluding shared endpoints).
+	constexpr float Eps = 0.01f;
+	return (T > Eps && T < (1.0f - Eps)) && (U > Eps && U < (1.0f - Eps));
+}
+
+bool URoadBLDReflectionProvider::DoJunctionPathsConflict(
+	const FTrafficLaneHandle& FromA, const FTrafficLaneHandle& ToA,
+	const FTrafficLaneHandle& FromB, const FTrafficLaneHandle& ToB)
+{
+	// Same approach or same exit → conflict (vehicles would merge).
+	if (FromA == FromB || ToA == ToB) { return true; }
+
+	// Resolve endpoints: approach lane's last point → exit lane's first point.
+	TArray<FVector> PtsA, PtsB;
+	float WA, WB;
+
+	if (!GetLanePath(FromA, PtsA, WA) || PtsA.Num() == 0) { return true; }
+	const FVector EnterA = PtsA.Last();
+	PtsA.Reset();
+
+	if (!GetLanePath(ToA, PtsA, WA) || PtsA.Num() == 0) { return true; }
+	const FVector ExitA = PtsA[0];
+
+	if (!GetLanePath(FromB, PtsB, WB) || PtsB.Num() == 0) { return true; }
+	const FVector EnterB = PtsB.Last();
+	PtsB.Reset();
+
+	if (!GetLanePath(ToB, PtsB, WB) || PtsB.Num() == 0) { return true; }
+	const FVector ExitB = PtsB[0];
+
+	// Test if the two junction arcs (enter→exit) cross in 2D.
+	return Segments2DIntersect(EnterA, ExitA, EnterB, ExitB);
 }
 
 // ---------------------------------------------------------------------------
@@ -2938,4 +3513,262 @@ FVector2D URoadBLDReflectionProvider::GetWorldPositionAtDistance(
 	Params.ReturnValue = FVector2D::ZeroVector;
 	RoadActor->ProcessEvent(GetWorldPosFunc, &Params);
 	return Params.ReturnValue;
+}
+
+// ---------------------------------------------------------------------------
+// PrecomputeJunctionMap — ONE-TIME pass over the entire lane graph at world
+// startup. For every lane in the network, computes:
+//   1. Total polyline length (stored in PrecomputedLaneLengths)
+//   2. Distance to the nearest downstream junction via graph walk
+//      (stored in PrecomputedJunctionMap)
+//
+// After this runs, GetLaneLength and GetDistanceToNextJunction are O(1)
+// lookups. Every vehicle has instant access to the ENTIRE road/junction
+// layout — no per-tick scanning needed.
+// ---------------------------------------------------------------------------
+void URoadBLDReflectionProvider::PrecomputeJunctionMap()
+{
+	PrecomputedLaneLengths.Empty();
+	PrecomputedJunctionMap.Empty();
+
+	// ── Phase 1: Compute and cache every lane's polyline length ──
+	for (const auto& Pair : LaneEndpointMap)
+	{
+		const int32 LaneId = Pair.Key;
+		const FLaneEndpointCache& Cache = Pair.Value;
+
+		float Length = 0.0f;
+		for (int32 i = 0; i < Cache.Polyline.Num() - 1; ++i)
+		{
+			Length += FVector::Dist(Cache.Polyline[i], Cache.Polyline[i + 1]);
+		}
+		PrecomputedLaneLengths.Add(LaneId, Length);
+	}
+
+	// ── Phase 2: For every lane, walk forward to find the next junction ──
+	// We iterate ALL lanes (including virtual segments) and for each one,
+	// walk the LaneConnectionMap graph until we hit a junction lane or
+	// exhaust the search (no junction downstream).
+	//
+	// The result is keyed by each lane's handle ID and stores the cumulative
+	// distance from that lane's END to the junction's START.
+
+	constexpr int32 MaxWalkHops = 50; // generous — real networks are unlikely to exceed this
+
+	// Collect all lane IDs to iterate deterministically.
+	TArray<int32> AllLaneIds;
+	LaneEndpointMap.GetKeys(AllLaneIds);
+	AllLaneIds.Sort(); // deterministic order
+
+	int32 JunctionLaneCount = 0;
+	int32 FreeFlowWithJunctionAhead = 0;
+	int32 DeadEndLanes = 0;
+
+	for (const int32 StartLaneId : AllLaneIds)
+	{
+		// If this lane IS a junction lane, distance = 0.
+		const int32* StartJunction = LaneToJunctionMap.Find(StartLaneId);
+		if (StartJunction && *StartJunction != 0)
+		{
+			FJunctionScanResult Result;
+			Result.JunctionId = *StartJunction;
+			Result.DistanceCm = 0.0f;
+			Result.JunctionLane = FTrafficLaneHandle(StartLaneId);
+			Result.ApproachLane = FTrafficLaneHandle(StartLaneId);
+			PrecomputedJunctionMap.Add(StartLaneId, Result);
+			++JunctionLaneCount;
+			continue;
+		}
+
+		// Walk forward from this lane through successors.
+		float AccDist = 0.0f;
+		TSet<int32> Visited;
+		Visited.Add(StartLaneId);
+
+		int32 CurrentId = StartLaneId;
+		FTrafficLaneHandle PreviousLane(StartLaneId);
+		bool bFound = false;
+
+		for (int32 Hop = 0; Hop < MaxWalkHops; ++Hop)
+		{
+			const TArray<FTrafficLaneHandle>* NextLanes = LaneConnectionMap.Find(CurrentId);
+			if (!NextLanes || NextLanes->Num() == 0)
+			{
+				break; // dead end
+			}
+
+			bool bAdvanced = false;
+			for (const FTrafficLaneHandle& NextLane : *NextLanes)
+			{
+				if (Visited.Contains(NextLane.HandleId))
+				{
+					continue;
+				}
+				Visited.Add(NextLane.HandleId);
+
+				// Check if this successor is a junction lane.
+				const int32* NextJunction = LaneToJunctionMap.Find(NextLane.HandleId);
+				if (NextJunction && *NextJunction != 0)
+				{
+					FJunctionScanResult Result;
+					Result.JunctionId = *NextJunction;
+					Result.DistanceCm = AccDist;
+					Result.JunctionLane = NextLane;
+					Result.ApproachLane = FTrafficLaneHandle(CurrentId);
+					PrecomputedJunctionMap.Add(StartLaneId, Result);
+					bFound = true;
+					++FreeFlowWithJunctionAhead;
+					break;
+				}
+
+				// Not a junction — accumulate its length and continue.
+				const float* NextLen = PrecomputedLaneLengths.Find(NextLane.HandleId);
+				if (NextLen)
+				{
+					AccDist += *NextLen;
+				}
+
+				PreviousLane = FTrafficLaneHandle(CurrentId);
+				CurrentId = NextLane.HandleId;
+				bAdvanced = true;
+				break; // follow first unvisited path
+			}
+
+			if (bFound || !bAdvanced)
+			{
+				break;
+			}
+		}
+
+		if (!bFound)
+		{
+			++DeadEndLanes;
+			// No junction downstream — store an invalid result so lookup
+			// still returns instantly (no junction = JunctionId 0).
+			FJunctionScanResult NoJunction;
+			PrecomputedJunctionMap.Add(StartLaneId, NoJunction);
+		}
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("PrecomputeJunctionMap: %d total lanes mapped. "
+			 "%d junction lanes, %d free-flow with junction ahead, %d dead-end/no-junction."),
+		AllLaneIds.Num(), JunctionLaneCount, FreeFlowWithJunctionAhead, DeadEndLanes);
+
+	// ── DETAILED PER-LANE DUMP ──
+	// Log every lane's junction map result so we can see exactly which lanes
+	// "see" junctions and which are blind. This is the DEFINITIVE record
+	// of the precomputed map. If a lane shows "NO-JUNCTION" here, vehicles
+	// on that lane will NEVER detect an intersection via the approach scan.
+	UE_LOG(LogAAATraffic, Log, TEXT("PrecomputeJunctionMap — PER-LANE DUMP START (%d lanes):"), AllLaneIds.Num());
+	for (const int32 LaneId : AllLaneIds)
+	{
+		const FJunctionScanResult* R = PrecomputedJunctionMap.Find(LaneId);
+		const float* LLen = PrecomputedLaneLengths.Find(LaneId);
+		const float Len = LLen ? *LLen : 0.0f;
+		const int32* JID = LaneToJunctionMap.Find(LaneId);
+		const bool bIsJunctionLane = JID && *JID != 0;
+		const TArray<FTrafficLaneHandle>* Connections = LaneConnectionMap.Find(LaneId);
+		const int32 NumConnections = Connections ? Connections->Num() : 0;
+
+		if (R && R->IsValid())
+		{
+			UE_LOG(LogAAATraffic, Verbose,
+				TEXT("  Lane=%d Length=%.0f IsJunction=%s Connections=%d => JunctionId=%d Dist=%.0f JnctLane=%d ApproachLane=%d"),
+				LaneId, Len,
+				bIsJunctionLane ? TEXT("YES") : TEXT("no"),
+				NumConnections,
+				R->JunctionId, R->DistanceCm, R->JunctionLane.HandleId, R->ApproachLane.HandleId);
+		}
+		else
+		{
+			UE_LOG(LogAAATraffic, Verbose,
+				TEXT("  Lane=%d Length=%.0f IsJunction=%s Connections=%d => NO-JUNCTION-DOWNSTREAM (vehicles here are blind)"),
+				LaneId, Len,
+				bIsJunctionLane ? TEXT("YES") : TEXT("no"),
+				NumConnections);
+		}
+	}
+	UE_LOG(LogAAATraffic, Verbose, TEXT("PrecomputeJunctionMap — PER-LANE DUMP END"));
+}
+
+// ---------------------------------------------------------------------------
+// GetLaneLength — O(1) lookup from precomputed table.
+// ---------------------------------------------------------------------------
+float URoadBLDReflectionProvider::GetLaneLength(const FTrafficLaneHandle& Lane)
+{
+	const float* Len = PrecomputedLaneLengths.Find(Lane.HandleId);
+	if (Len)
+	{
+		return *Len;
+	}
+
+	// Fallback: compute from polyline (shouldn't happen after init).
+	const FLaneEndpointCache* Cache = LaneEndpointMap.Find(Lane.HandleId);
+	if (!Cache || Cache->Polyline.Num() < 2)
+	{
+		return 0.0f;
+	}
+	float Length = 0.0f;
+	for (int32 i = 0; i < Cache->Polyline.Num() - 1; ++i)
+	{
+		Length += FVector::Dist(Cache->Polyline[i], Cache->Polyline[i + 1]);
+	}
+	return Length;
+}
+
+// ---------------------------------------------------------------------------
+// GetDistanceToNextJunction — O(1) lookup from precomputed full-network map.
+// Vehicles have instant access to the entire road/junction layout.
+//
+// The precomputed map stores the distance from each lane's END to the next
+// junction. The caller passes RemainingDistOnCurrentLane, which is added
+// as an offset to give the distance from the vehicle's current position.
+//
+// MaxSearchDistCm and MaxHops are ignored — the map is already computed
+// for the entire network. They remain as parameters for interface compat.
+// ---------------------------------------------------------------------------
+ITrafficRoadProvider::FJunctionScanResult URoadBLDReflectionProvider::GetDistanceToNextJunction(
+	const FTrafficLaneHandle& StartLane,
+	float RemainingDistOnCurrentLane,
+	float MaxSearchDistCm,
+	int32 MaxHops)
+{
+	if (!StartLane.IsValid())
+	{
+		return FJunctionScanResult();
+	}
+
+	const FJunctionScanResult* Precomputed = PrecomputedJunctionMap.Find(StartLane.HandleId);
+	if (!Precomputed)
+	{
+		return FJunctionScanResult();
+	}
+
+	if (!Precomputed->IsValid())
+	{
+		return *Precomputed; // No junction downstream — returns JunctionId=0
+	}
+
+	// The precomputed distance is from the lane's END. The vehicle is at
+	// RemainingDistOnCurrentLane from the end, so we need to check:
+	// - If the current lane IS the junction (distance = 0), return 0.
+	// - Otherwise, the distance from the vehicle = RemainingDist + precomputed.
+	FJunctionScanResult Result = *Precomputed;
+
+	if (Result.DistanceCm == 0.0f && Result.JunctionLane == StartLane)
+	{
+		// Vehicle is ON a junction lane — distance is 0.
+		return Result;
+	}
+
+	// Precomputed distance is from lane END to junction.
+	// Vehicle is RemainingDistOnCurrentLane from lane END.
+	// Total distance from vehicle to junction:
+	//   = remaining on this lane + accumulated distance through successor lanes
+	// BUT: the precomputed AccDist already counts from lane END (0 for the
+	// current lane), so we just add the remaining distance.
+	Result.DistanceCm = RemainingDistOnCurrentLane + Result.DistanceCm;
+
+	return Result;
 }

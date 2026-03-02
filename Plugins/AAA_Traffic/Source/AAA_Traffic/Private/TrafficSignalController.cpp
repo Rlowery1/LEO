@@ -6,6 +6,12 @@
 #include "Engine/World.h"
 #include "DrawDebugHelpers.h"
 
+// Global debug draw CVar — declared in TrafficVehicleController.cpp.
+extern int32 GTrafficDebugDraw;
+
+// Junction diagnostics CVar — declared in TrafficVehicleController.cpp.
+extern int32 GTrafficJunctionDiagnostics;
+
 ATrafficSignalController::ATrafficSignalController()
 	: JunctionId(0)
 	, GreenDuration(15.0f)
@@ -99,7 +105,7 @@ void ATrafficSignalController::Tick(float DeltaSeconds)
 	}
 
 #if ENABLE_DRAW_DEBUG
-	if (bDebugDrawSignal)
+	if (bDebugDrawSignal || GTrafficDebugDraw != 0)
 	{
 		FColor PhaseColor = FColor::Red;
 		if (CurrentPhase == ETrafficSignalPhase::Green) { PhaseColor = FColor::Green; }
@@ -136,7 +142,12 @@ void ATrafficSignalController::AdvancePhase()
 
 	case ETrafficSignalPhase::Yellow:
 		CurrentPhase = ETrafficSignalPhase::Red;
-		PhaseTimer += RedDuration;
+		// Multi-group signals: use a brief all-red clearance interval (2s)
+		// instead of the full RedDuration. The "red" for one group IS the
+		// green for the next group. Legacy (single-group) keeps full RedDuration.
+		PhaseTimer += (PhaseGroups.Num() > 1)
+			? FMath::Min(RedDuration, 2.0f)
+			: RedDuration;
 		break;
 
 	case ETrafficSignalPhase::Red:
@@ -149,24 +160,61 @@ void ATrafficSignalController::AdvancePhase()
 		PhaseTimer += GreenDuration;
 		break;
 	}
+
+	// Log every phase change (diagnostic-gated to avoid log spam).
+	if (GTrafficJunctionDiagnostics >= 1)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("SIGNAL PHASE-CHANGE: Signal='%s' JunctionId=%d NewPhase=%s "
+				 "GroupIndex=%d/%d Timer=%.2f"),
+			*GetName(), JunctionId,
+			CurrentPhase == ETrafficSignalPhase::Green ? TEXT("GREEN") :
+			CurrentPhase == ETrafficSignalPhase::Yellow ? TEXT("YELLOW") : TEXT("RED"),
+			CurrentGroupIndex, PhaseGroups.Num(), PhaseTimer);
+	}
 }
 
 bool ATrafficSignalController::IsLaneGreen(const FTrafficLaneHandle& Lane) const
 {
+	const bool bShouldLog = (GTrafficJunctionDiagnostics >= 2);
+
 	// Legacy mode: no phase groups configured — all lanes share the same phase.
 	if (PhaseGroups.Num() == 0)
 	{
-		return CurrentPhase == ETrafficSignalPhase::Green;
+		const bool bResult = (CurrentPhase == ETrafficSignalPhase::Green);
+		if (bShouldLog)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("SIGNAL IsLaneGreen: Signal='%s' Lane=%d Phase=%s Result=%s (legacy mode, no groups)"),
+				*GetName(), Lane.HandleId,
+				CurrentPhase == ETrafficSignalPhase::Green ? TEXT("GREEN") :
+				CurrentPhase == ETrafficSignalPhase::Yellow ? TEXT("YELLOW") : TEXT("RED"),
+				bResult ? TEXT("GREEN") : TEXT("RED"));
+		}
+		return bResult;
 	}
 
 	// Multi-phase: only lanes in the currently-green group get green.
 	if (CurrentPhase != ETrafficSignalPhase::Green)
 	{
+		if (bShouldLog)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("SIGNAL IsLaneGreen: Signal='%s' Lane=%d Phase=%s — NOT green (phase not Green)"),
+				*GetName(), Lane.HandleId,
+				CurrentPhase == ETrafficSignalPhase::Yellow ? TEXT("YELLOW") : TEXT("RED"));
+		}
 		return false;
 	}
 
 	if (!PhaseGroups.IsValidIndex(CurrentGroupIndex))
 	{
+		if (bShouldLog)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("SIGNAL IsLaneGreen: Signal='%s' Lane=%d GroupIndex=%d INVALID — returning false"),
+				*GetName(), Lane.HandleId, CurrentGroupIndex);
+		}
 		return false;
 	}
 
@@ -175,8 +223,21 @@ bool ATrafficSignalController::IsLaneGreen(const FTrafficLaneHandle& Lane) const
 	{
 		if (GreenLane == Lane)
 		{
+			if (bShouldLog)
+			{
+				UE_LOG(LogAAATraffic, Log,
+				TEXT("SIGNAL IsLaneGreen: Signal='%s' Lane=%d GroupIndex=%d — MATCH found, returning GREEN"),
+					*GetName(), Lane.HandleId, CurrentGroupIndex);
+			}
 			return true;
 		}
+	}
+
+	if (bShouldLog)
+	{
+		UE_LOG(LogAAATraffic, Log,
+				TEXT("SIGNAL IsLaneGreen: Signal='%s' Lane=%d GroupIndex=%d GreenLaneCount=%d — NOT in green group"),
+			*GetName(), Lane.HandleId, CurrentGroupIndex, ActiveGroup.GreenLanes.Num());
 	}
 	return false;
 }
