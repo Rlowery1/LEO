@@ -457,8 +457,8 @@ protected:
 
 	/**
 	 * Maximum time (seconds) a vehicle will wait at an intersection before
-	 * force-proceeding to break potential deadlocks. 0 = wait forever (not
-	 * recommended). Default 30s.
+	 * force-proceeding to break potential deadlocks. 0 = wait forever (no
+	 * timeout). Default 90s.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Intersection", meta = (ClampMin = "0"))
 	float MaxIntersectionWaitTimeSec;
@@ -471,13 +471,13 @@ protected:
 
 	// ── Physics Safety Net State ────────────────────────────
 
-	/** Consecutive frames the vehicle has been detected as flipped / airborne.
-	 *  After ConsecutiveFlipFramesThreshold frames, the vehicle is safety-despawned. */
-	int32 ConsecutiveFlipFrames = 0;
+	/** Accumulated seconds the vehicle has been continuously flipped / airborne.
+	 *  After FlipDespawnTimeSec, the vehicle is safety-despawned. */
+	float FlipTimeAccumulator = 0.0f;
 
-	/** Consecutive frames the vehicle has been stuck (throttle applied but near-zero movement).
-	 *  After ConsecutiveStuckFramesThreshold frames, the vehicle is safety-despawned. */
-	int32 ConsecutiveStuckFrames = 0;
+	/** Accumulated seconds the vehicle has been continuously stuck.
+	 *  After StuckDespawnTimeSec, the vehicle is safety-despawned. */
+	float StuckTimeAccumulator = 0.0f;
 
 	/** Throttle timer for the wake guard so it fires at most once per second
 	 *  instead of every single tick (avoids energy injection). */
@@ -495,13 +495,13 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Safety", meta = (ClampMin = "1000"))
 	float MaxAllowedSpeedCmPerSec;
 
-	/** Frames a vehicle must be flipped / airborne before being despawned.
-	 *  At 60 fps, 90 frames ≈ 1.5 seconds — enough to filter brief bumps. */
-	static constexpr int32 ConsecutiveFlipFramesThreshold = 90;
+	/** Seconds a vehicle must be continuously flipped / airborne before despawn.
+	 *  1.5 s is enough to filter brief bumps from terrain. */
+	static constexpr float FlipDespawnTimeSec = 1.5f;
 
-	/** Frames a vehicle must be stuck before being despawned.
-	 *  At 60 fps, 300 frames ≈ 5 seconds — generous grace period for temporary stops. */
-	static constexpr int32 ConsecutiveStuckFramesThreshold = 300;
+	/** Seconds a vehicle must be continuously stuck before despawn.
+	 *  5.0 s is a generous grace period for temporary stops. */
+	static constexpr float StuckDespawnTimeSec = 5.0f;
 
 	/**
 	 * Seed for deterministic random decisions.

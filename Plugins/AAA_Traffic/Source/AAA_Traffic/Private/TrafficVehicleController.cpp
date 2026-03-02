@@ -182,6 +182,7 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 	DistanceTraveledOnLane = 0.0f;
 	PreviousVehicleLocation = FVector::ZeroVector;
 	LastClosestIndex = 0;
+	PreviousCrossTrackError = 0.0f;
 	JunctionTransitionPoints.Empty();
 	JunctionTransitionIndex = 0;
 	bWaitingAtIntersection = false;
@@ -924,27 +925,27 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 
 		// --- Flip / Airborne detection ---
 		// If the vehicle's up vector Z drops below 0.3, it's significantly
-		// tilted or upside-down. Count consecutive frames and despawn after
-		// the threshold to filter brief bumps from terrain.
+		// tilted or upside-down. Accumulate time and despawn after the
+		// threshold to filter brief bumps from terrain.
 		const float UpZ = SafetyPawn->GetActorUpVector().Z;
 		if (UpZ < 0.3f)
 		{
-			++ConsecutiveFlipFrames;
-			if (ConsecutiveFlipFrames >= ConsecutiveFlipFramesThreshold)
+			FlipTimeAccumulator += EffectiveDeltaSeconds;
+			if (FlipTimeAccumulator >= FlipDespawnTimeSec)
 			{
 				bPendingRecoveryDespawn = true;
 				if (TrafficSub)
 				{
 					TrafficSub->RequestDespawn(this,
-						FString::Printf(TEXT("flipped/airborne for %d frames (UpZ=%.2f)"),
-							ConsecutiveFlipFrames, UpZ));
+						FString::Printf(TEXT("flipped/airborne for %.1fs (UpZ=%.2f)"),
+							FlipTimeAccumulator, UpZ));
 				}
 				return;
 			}
 		}
 		else
 		{
-			ConsecutiveFlipFrames = 0;
+			FlipTimeAccumulator = 0.0f;
 		}
 
 		// --- Stuck vehicle detection ---
@@ -957,22 +958,22 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 		const bool bShouldBeMoving = (TargetSpeed > 10.0f) && !bWaitingAtIntersection && !bAtDeadEnd;
 		if (bShouldBeMoving && MovedDist < 5.0f)
 		{
-			++ConsecutiveStuckFrames;
-			if (ConsecutiveStuckFrames >= ConsecutiveStuckFramesThreshold)
+			StuckTimeAccumulator += EffectiveDeltaSeconds;
+			if (StuckTimeAccumulator >= StuckDespawnTimeSec)
 			{
 				bPendingRecoveryDespawn = true;
 				if (TrafficSub)
 				{
 					TrafficSub->RequestDespawn(this,
-						FString::Printf(TEXT("stuck for %d frames (moved %.1f cm total)"),
-							ConsecutiveStuckFrames, MovedDist));
+						FString::Printf(TEXT("stuck for %.1fs (moved %.1f cm)"),
+							StuckTimeAccumulator, MovedDist));
 				}
 				return;
 			}
 		}
 		else
 		{
-			ConsecutiveStuckFrames = 0;
+			StuckTimeAccumulator = 0.0f;
 		}
 	}
 
@@ -1775,7 +1776,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 				// longer than MaxIntersectionWaitTimeSec, force-proceed to
 				// prevent permanent deadlocks. The junction may be blocked by
 				// a stuck vehicle, broken signal, or mutual denial cycle.
-				if (bWaitingAtIntersection && IntersectionWaitElapsed >= MaxIntersectionWaitTimeSec)
+				if (bWaitingAtIntersection && MaxIntersectionWaitTimeSec > 0.0f && IntersectionWaitElapsed >= MaxIntersectionWaitTimeSec)
 				{
 					UE_LOG(LogAAATraffic, Warning,
 						TEXT("JNCT TIMEOUT-FORCE-PROCEED: Pawn='%s' JunctionId=%d — "
@@ -1789,22 +1790,18 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 					// so this vehicle is visible to conflict detection. The old
 					// code just set bWaitingAtIntersection=false, making it a
 					// ghost that other vehicles couldn't see — causing collisions.
+					if (TrafficSub)
 					{
-						UWorld* ForceWorld = GetWorld();
-						UTrafficSubsystem* ForceSub = ForceWorld ? ForceWorld->GetSubsystem<UTrafficSubsystem>() : nullptr;
-						if (ForceSub)
+						// Try normal occupancy first — the blocking vehicle may
+						// have left by now, making a clean entry possible.
+						if (!TrafficSub->TryOccupyJunction(IntersectionJunctionId,
+							this, IntersectionFromLane, IntersectionToLane))
 						{
-							// Try normal occupancy first — the blocking vehicle may
-							// have left by now, making a clean entry possible.
-							if (!ForceSub->TryOccupyJunction(IntersectionJunctionId,
-								this, IntersectionFromLane, IntersectionToLane))
-							{
-								// Still blocked — force-occupy so we are at least
-								// visible in the occupant list. Other vehicles will
-								// see us and yield instead of driving through us.
-								ForceSub->ForceOccupyJunction(IntersectionJunctionId,
-									this, IntersectionFromLane, IntersectionToLane);
-							}
+							// Still blocked — force-occupy so we are at least
+							// visible in the occupant list. Other vehicles will
+							// see us and yield instead of driving through us.
+							TrafficSub->ForceOccupyJunction(IntersectionJunctionId,
+								this, IntersectionFromLane, IntersectionToLane);
 						}
 					}
 
@@ -3061,6 +3058,7 @@ void ATrafficVehicleController::FinalizeLaneChange()
 	TargetLanePoints.Empty();
 	LaneChangeProgress = 0.0f;
 	LaneChangeCooldownRemaining = LaneChangeCooldownTime;
+	PreviousCrossTrackError = 0.0f;
 
 	// Notify subsystem of new lane.
 	if (UWorld* World = GetWorld())
