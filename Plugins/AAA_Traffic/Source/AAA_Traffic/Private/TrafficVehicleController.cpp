@@ -123,6 +123,7 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, IntersectionSpeedLimitCmPerSec(2000.0f)
 	, MaxIntersectionWaitTimeSec(90.0f)
 	, VehicleFrontExtent(0.0f)
+	, MaxAllowedSpeedCmPerSec(8000.0f) // ~180 mph, well above any traffic speed
 	, RandomSeed(0)
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -826,6 +827,12 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 		return;
 	}
 
+	// --- Safety net: skip driving if despawn is pending ---
+	if (bPendingRecoveryDespawn)
+	{
+		return;
+	}
+
 	++LODFrameCounter;
 	if (LODFrameCounter >= 20) { LODFrameCounter = 0; } // Wrap at LCM(4,10) to prevent overflow.
 
@@ -879,6 +886,20 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 			}
 			if (Idx != LastClosestIndex)
 			{
+				// Zero velocity before teleport so the body doesn't carry
+				// residual momentum into the new location (prevents launch).
+				if (UChaosWheeledVehicleMovementComponent* MC =
+					GetPawn()->FindComponentByClass<UChaosWheeledVehicleMovementComponent>())
+				{
+					if (UPrimitiveComponent* Prim = MC->UpdatedPrimitive)
+					{
+						if (FBodyInstance* BI = Prim->GetBodyInstance())
+						{
+							BI->SetLinearVelocity(FVector::ZeroVector, false);
+							BI->SetAngularVelocityInRadians(FVector::ZeroVector, false);
+						}
+					}
+				}
 				GetPawn()->SetActorLocation(LanePoints[Idx], /*bSweep*/ false, /*OutSweepHitResult*/ nullptr, ETeleportType::TeleportPhysics);
 				LastClosestIndex = Idx;
 			}
@@ -890,6 +911,67 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 	// Active tick: pass accumulated time from skipped frames + this frame's delta.
 	const float EffectiveDeltaSeconds = DeltaSeconds + LODAccumulatedDeltaTime;
 	LODAccumulatedDeltaTime = 0.0f;
+
+	// ── Physics Safety Net ──────────────────────────────────
+	// Detect vehicles that are flipped, airborne, or stuck and despawn them
+	// to prevent physics explosions, traffic jams, and visual artifacts.
+	{
+		APawn* SafetyPawn = GetPawn();
+
+		// --- Flip / Airborne detection ---
+		// If the vehicle's up vector Z drops below 0.3, it's significantly
+		// tilted or upside-down. Count consecutive frames and despawn after
+		// the threshold to filter brief bumps from terrain.
+		const float UpZ = SafetyPawn->GetActorUpVector().Z;
+		if (UpZ < 0.3f)
+		{
+			++ConsecutiveFlipFrames;
+			if (ConsecutiveFlipFrames >= ConsecutiveFlipFramesThreshold)
+			{
+				bPendingRecoveryDespawn = true;
+				if (TrafficSub)
+				{
+					TrafficSub->RequestDespawn(this,
+						FString::Printf(TEXT("flipped/airborne for %d frames (UpZ=%.2f)"),
+							ConsecutiveFlipFrames, UpZ));
+				}
+				return;
+			}
+		}
+		else
+		{
+			ConsecutiveFlipFrames = 0;
+		}
+
+		// --- Stuck vehicle detection ---
+		// If throttle is being requested (TargetSpeed > 0) but the vehicle
+		// has barely moved for many consecutive frames, it's stuck in
+		// geometry or a collision deadlock. Despawn to clear the blockage.
+		const FVector CurrentLoc = SafetyPawn->GetActorLocation();
+		const float MovedDist = FVector::Dist(CurrentLoc, PreviousVehicleLocation);
+		// Only count stuck frames when the vehicle SHOULD be moving.
+		const bool bShouldBeMoving = (TargetSpeed > 10.0f) && !bWaitingAtIntersection && !bAtDeadEnd;
+		if (bShouldBeMoving && MovedDist < 5.0f)
+		{
+			++ConsecutiveStuckFrames;
+			if (ConsecutiveStuckFrames >= ConsecutiveStuckFramesThreshold)
+			{
+				bPendingRecoveryDespawn = true;
+				if (TrafficSub)
+				{
+					TrafficSub->RequestDespawn(this,
+						FString::Printf(TEXT("stuck for %d frames (moved %.1f cm total)"),
+							ConsecutiveStuckFrames, MovedDist));
+				}
+				return;
+			}
+		}
+		else
+		{
+			ConsecutiveStuckFrames = 0;
+		}
+	}
+
 	UpdateVehicleInput(EffectiveDeltaSeconds);
 
 #if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
@@ -1643,6 +1725,19 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 							const float OvershootDist = FVector::Dist(VehicleLocation, IntersectionEntryWorldPos);
 							if (OvershootDist > 500.0f) // > 5m overshoot
 							{
+								// Zero velocity before teleport to prevent physics launch.
+								if (UChaosWheeledVehicleMovementComponent* MC =
+									ControlledPawn->FindComponentByClass<UChaosWheeledVehicleMovementComponent>())
+								{
+									if (UPrimitiveComponent* Prim = MC->UpdatedPrimitive)
+									{
+										if (FBodyInstance* BI = Prim->GetBodyInstance())
+										{
+											BI->SetLinearVelocity(FVector::ZeroVector, false);
+											BI->SetAngularVelocityInRadians(FVector::ZeroVector, false);
+										}
+									}
+								}
 								ControlledPawn->SetActorLocation(
 									IntersectionEntryWorldPos + FVector(0.0f, 0.0f, 10.0f),
 									false, nullptr, ETeleportType::TeleportPhysics);
@@ -2142,32 +2237,47 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		ThrottleInput *= 0.5f;
 	}
 
-	if (ThrottleInput >= GTrafficWakeGuardMinThrottle
+	// Wake guard: keep the GT-level vehicle movement awake so throttle input
+	// takes effect. Throttled to once per second to avoid per-tick energy
+	// injection that was causing flying-car physics explosions.
+	// NOTE: Chaos-level NeverSleep is already set once in OnPossess.
+	// This guard only handles the GT SetSleeping/SetParked path.
+	WakeGuardCheckTimer += DeltaSeconds;
+	if (WakeGuardCheckTimer >= 1.0f
+		&& ThrottleInput >= GTrafficWakeGuardMinThrottle
 		&& BrakeInput <= KINDA_SMALL_NUMBER
 		&& FMath::Abs(CurrentSpeed) <= GTrafficWakeGuardMaxSpeed)
 	{
+		WakeGuardCheckTimer = 0.0f;
 		VehicleMovement->SetParked(false);
 		VehicleMovement->SetSleeping(false);
 		VehicleMovement->SetHandbrakeInput(false);
-
-		if (UPrimitiveComponent* Prim = VehicleMovement->UpdatedPrimitive)
-		{
-			Prim->WakeAllRigidBodies();
-			if (FBodyInstance* BI = Prim->GetBodyInstance())
-			{
-				BI->WakeInstance();
-				FPhysicsActorHandle PhysHandle = BI->GetPhysicsActorHandle();
-				if (PhysHandle)
-				{
-					PhysHandle->GetGameThreadAPI().SetSleepType(Chaos::ESleepType::NeverSleep);
-				}
-			}
-		}
 	}
 
 	VehicleMovement->SetThrottleInput(ThrottleInput);
 	VehicleMovement->SetSteeringInput(SteeringInput);
 	VehicleMovement->SetBrakeInput(BrakeInput);
+
+	// --- Velocity sanity clamp ---
+	// If the physics body somehow exceeds MaxAllowedSpeedCmPerSec (e.g. from
+	// a collision penetration-resolution impulse), zero the velocity entirely.
+	// This is a last-resort safety net — normal driving never reaches this.
+	if (UPrimitiveComponent* Prim = VehicleMovement->UpdatedPrimitive)
+	{
+		if (FBodyInstance* BI = Prim->GetBodyInstance())
+		{
+			const FVector LinearVel = BI->GetUnrealWorldVelocity();
+			if (LinearVel.SizeSquared() > MaxAllowedSpeedCmPerSec * MaxAllowedSpeedCmPerSec)
+			{
+				BI->SetLinearVelocity(FVector::ZeroVector, false);
+				BI->SetAngularVelocityInRadians(FVector::ZeroVector, false);
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("SAFETY VELOCITY-CLAMP: Pawn='%s' had runaway speed %.0f cm/s (max %.0f) — zeroed"),
+					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+					LinearVel.Size(), MaxAllowedSpeedCmPerSec);
+			}
+		}
+	}
 
 #if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	DbgThrottle = ThrottleInput;

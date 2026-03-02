@@ -305,6 +305,52 @@ void UTrafficSubsystem::PerformDespawnSweep()
 }
 
 // ---------------------------------------------------------------------------
+// Safety Despawn
+// ---------------------------------------------------------------------------
+
+void UTrafficSubsystem::RequestDespawn(ATrafficVehicleController* Controller, const FString& Reason)
+{
+	if (!Controller) return;
+
+	// Capture everything we need before deferring. The controller may be
+	// garbage-collected between now and next tick, so use a weak pointer.
+	TWeakObjectPtr<ATrafficVehicleController> WeakController(Controller);
+	const FString CapturedReason = Reason;
+
+	// Defer actual destruction to next tick to avoid invalidating iterators
+	// or destroying objects during another object's Tick.
+	GetWorld()->GetTimerManager().SetTimerForNextTick(
+		FTimerDelegate::CreateWeakLambda(this, [this, WeakController, CapturedReason]()
+		{
+			ATrafficVehicleController* Ctrl = WeakController.Get();
+			if (!Ctrl) return;
+
+			APawn* VehiclePawn = Ctrl->GetPawn();
+			const FString VehicleName = VehiclePawn
+				? VehiclePawn->GetName() : TEXT("unknown");
+
+			// Broadcast before destroy so listeners (e.g. spawner) can react.
+			OnVehicleDespawned.Broadcast(Ctrl, Ctrl->GetCurrentLane());
+
+			Ctrl->UnPossess();
+
+			if (VehiclePawn && VehiclePool)
+			{
+				VehiclePool->ReleaseVehicle(VehiclePawn);
+			}
+			else if (VehiclePawn)
+			{
+				VehiclePawn->Destroy();
+			}
+			Ctrl->Destroy();
+
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("TrafficSubsystem: SAFETY despawned '%s' — %s"),
+				*VehicleName, *CapturedReason);
+		}));
+}
+
+// ---------------------------------------------------------------------------
 // Spatial Grid
 // ---------------------------------------------------------------------------
 

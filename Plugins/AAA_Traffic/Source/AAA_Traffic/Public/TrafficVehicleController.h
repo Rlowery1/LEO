@@ -415,6 +415,40 @@ protected:
 	 *  reserved for future stop-line alignment logic. */
 	float VehicleFrontExtent = 0.0f;
 
+	// ── Physics Safety Net State ────────────────────────────
+
+	/** Consecutive frames the vehicle has been detected as flipped / airborne.
+	 *  After ConsecutiveFlipFramesThreshold frames, the vehicle is safety-despawned. */
+	int32 ConsecutiveFlipFrames = 0;
+
+	/** Consecutive frames the vehicle has been stuck (throttle applied but near-zero movement).
+	 *  After ConsecutiveStuckFramesThreshold frames, the vehicle is safety-despawned. */
+	int32 ConsecutiveStuckFrames = 0;
+
+	/** Throttle timer for the wake guard so it fires at most once per second
+	 *  instead of every single tick (avoids energy injection). */
+	float WakeGuardCheckTimer = 0.0f;
+
+	/** True once a safety despawn has been requested. Prevents driving input
+	 *  and further despawn requests while the deferred destroy is pending. */
+	bool bPendingRecoveryDespawn = false;
+
+	/**
+	 * Maximum allowed vehicle speed (cm/s). If the physics body's linear
+	 * velocity exceeds this, the velocity is zeroed as an emergency brake.
+	 * Default 8000 cm/s ≈ 180 mph — well above any realistic traffic speed.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Safety", meta = (ClampMin = "1000"))
+	float MaxAllowedSpeedCmPerSec;
+
+	/** Frames a vehicle must be flipped / airborne before being despawned.
+	 *  At 60 fps, 90 frames ≈ 1.5 seconds — enough to filter brief bumps. */
+	static constexpr int32 ConsecutiveFlipFramesThreshold = 90;
+
+	/** Frames a vehicle must be stuck before being despawned.
+	 *  At 60 fps, 300 frames ≈ 5 seconds — generous grace period for temporary stops. */
+	static constexpr int32 ConsecutiveStuckFramesThreshold = 300;
+
 	/**
 	 * Seed for deterministic random decisions.
 	 * Reserved for future use (e.g. lane choice at intersections).

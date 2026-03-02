@@ -152,6 +152,15 @@ public:
 	/** Get the vehicle object pool (used by spawner and despawn sweep). */
 	UTrafficVehiclePool* GetVehiclePool() const { return VehiclePool; }
 
+	// --- Safety Despawn ---
+
+	/**
+	 * Request immediate despawn of a vehicle for safety reasons (flipped,
+	 * stuck, runaway speed). The actual destruction is deferred to next tick
+	 * to avoid invalidating iterators or destroying objects mid-Tick.
+	 */
+	void RequestDespawn(ATrafficVehicleController* Controller, const FString& Reason);
+
 	// --- Despawn configuration ---
 
 	/** Maximum distance (cm) from the nearest player before a vehicle is despawned. */
