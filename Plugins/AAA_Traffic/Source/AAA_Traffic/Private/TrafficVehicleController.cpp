@@ -1558,7 +1558,12 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		constexpr float MinTransitionGuard = 50.0f; // cm — ~1 polyline sample
 
 		// DIAGNOSTIC: Log why the detection gate doesn't fire.
-		if (GTrafficJunctionDiagnostics >= 1 && !(RemainingDist < TransitionThreshold && DistanceTraveledOnLane > MinTransitionGuard))
+		const bool bLaneEndClose = (RemainingDist < TransitionThreshold);
+		const bool bApproachScanClose = (ApproachJunctionDistanceCm > 0.0f
+			&& ApproachJunctionDistanceCm < TransitionThreshold
+			&& ApproachJunctionId != 0);
+
+		if (GTrafficJunctionDiagnostics >= 1 && !((bLaneEndClose || bApproachScanClose) && DistanceTraveledOnLane > MinTransitionGuard))
 		{
 			// Only log once per second per vehicle to avoid total log flood.
 			static TMap<uint32, double> LastGateLogTime;
@@ -1586,7 +1591,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 			}
 		}
 
-		if (RemainingDist < TransitionThreshold && DistanceTraveledOnLane > MinTransitionGuard)
+		if ((bLaneEndClose || bApproachScanClose) && DistanceTraveledOnLane > MinTransitionGuard)
 		{
 			// --- Intersection approach ---
 			// Detect junctions via two methods:
@@ -1724,15 +1729,40 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 						}
 						else
 						{
-							// Fallback: use the last polyline point (non-split lanes
-							// or lanes without mask data). This is within ±50cm of the
-							// actual boundary for 100cm polyline spacing.
-							IntersectionEntryWorldPos = LanePoints.Last();
-							bHasIntersectionEntryPos = true;
-							UE_LOG(LogAAATraffic, Warning,
-								TEXT("JNCT ENTRYPOINT: Pawn='%s' Lane=%d EntryPt=(%.1f,%.1f,%.1f) Source=FallbackLast"),
-								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
-								CurrentLane.HandleId, LanePoints.Last().X, LanePoints.Last().Y, LanePoints.Last().Z);
+							// Fallback: prefer junction centroid projected onto approach
+							// direction over raw LanePoints.Last(), which can extend
+							// into the junction area for non-split roads.
+							FVector Centroid;
+							if (DetectedJunctionId != 0
+								&& CachedProvider->GetJunctionCentroid(DetectedJunctionId, Centroid)
+								&& LanePoints.Num() >= 2)
+							{
+								// Project centroid onto the last lane segment to get the
+								// point where the lane intersects the junction boundary.
+								const FVector& P0 = LanePoints[LanePoints.Num() - 2];
+								const FVector& P1 = LanePoints.Last();
+								const FVector SegDir = (P1 - P0).GetSafeNormal();
+								const float Proj = FVector::DotProduct(Centroid - P0, SegDir);
+								const float SegLen = FVector::Dist(P0, P1);
+								// Clamp to segment — entry can't be before P0 or after P1.
+								const float ClampedProj = FMath::Clamp(Proj, 0.0f, SegLen);
+								IntersectionEntryWorldPos = P0 + SegDir * ClampedProj;
+								bHasIntersectionEntryPos = true;
+								UE_LOG(LogAAATraffic, Warning,
+									TEXT("JNCT ENTRYPOINT: Pawn='%s' Lane=%d EntryPt=(%.1f,%.1f,%.1f) Source=CentroidProjection"),
+									GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+									CurrentLane.HandleId, IntersectionEntryWorldPos.X, IntersectionEntryWorldPos.Y, IntersectionEntryWorldPos.Z);
+							}
+							else
+							{
+								// Ultimate fallback: last polyline point.
+								IntersectionEntryWorldPos = LanePoints.Last();
+								bHasIntersectionEntryPos = true;
+								UE_LOG(LogAAATraffic, Warning,
+									TEXT("JNCT ENTRYPOINT: Pawn='%s' Lane=%d EntryPt=(%.1f,%.1f,%.1f) Source=FallbackLast"),
+									GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+									CurrentLane.HandleId, LanePoints.Last().X, LanePoints.Last().Y, LanePoints.Last().Z);
+							}
 						}
 					}
 
@@ -2082,14 +2112,28 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 
 				// Decel-curve brake toward intersection entry point.
 				// Compute distance to entry, checking for overshoot.
+				// Prefer polyline-based approach distance (arc) over Euclidean
+				// when available — Euclidean is too short on curved roads.
 				float DistToEntry = RemainingDist;
 				if (bHasIntersectionEntryPos)
 				{
 					const FVector ToEntry = IntersectionEntryWorldPos - VehicleLocation;
 					const float DotFwd = FVector::DotProduct(ToEntry, VehicleForward);
-					DistToEntry = (DotFwd > 0.0f)
-						? FVector::Dist(VehicleLocation, IntersectionEntryWorldPos)
-						: 0.0f; // Overshot — treat as zero.
+					if (DotFwd <= 0.0f)
+					{
+						DistToEntry = 0.0f; // Overshot — treat as zero.
+					}
+					else if (ApproachJunctionDistanceCm > 0.0f
+						&& ApproachJunctionId == IntersectionJunctionId)
+					{
+						// Use polyline arc distance from approach scan — more
+						// accurate than straight-line on curved roads.
+						DistToEntry = ApproachJunctionDistanceCm;
+					}
+					else
+					{
+						DistToEntry = FVector::Dist(VehicleLocation, IntersectionEntryWorldPos);
+					}
 				}
 
 				// Desired speed from constant-decel stopping curve: v = sqrt(2*a*d)
@@ -3071,6 +3115,20 @@ void ATrafficVehicleController::EvaluateLaneChange()
 	const float CurrentSpeed = FMath::Abs(VehicleMovement->GetForwardSpeed());
 	const float EffectiveTarget = FMath::Max(TargetSpeed, 1.0f);
 
+	// Suppress non-navigational lane changes when approaching a junction.
+	// The approach braking envelope is active — passing maneuvers would be
+	// immediately aborted by the junction detection gate, causing turn-signal
+	// jitter and wasted cooldown cycles.
+	if (bApproachingIntersection && !bNavigationalLaneChange)
+	{
+		if (IsVehicleTraceEnabled(2))
+		{
+			AddLaneDecisionTrace(TEXT("LaneChange.RejectApproaching"), 0,
+				ApproachJunctionDistanceCm, 0.0f, TEXT("Approaching intersection — suppressed"));
+		}
+		return;
+	}
+
 	// --- Navigational pre-positioning ---
 	// If the vehicle needs to change lanes before a junction turn, bypass the
 	// speed-ratio and leader-distance motivation checks.  Only the safety
@@ -3450,8 +3508,16 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 
 	// Use direction toward the look-ahead point (lane-aligned) instead of
 	// the vehicle's forward vector, which may be temporarily misaligned.
+	// Exception: during an active lane change, the vehicle is steering between
+	// source and target lanes — the source-lane polyline direction would miss
+	// leaders on the target lane. Use the actual vehicle forward in that case.
 	FVector SweepDirection = ControlledPawn->GetActorForwardVector();
-	if (LanePoints.Num() >= 2)
+	if (LaneChangeState != ELaneChangeState::None)
+	{
+		// During lane change: vehicle forward vector tracks actual travel path.
+		// Already set above — keep it.
+	}
+	else if (LanePoints.Num() >= 2)
 	{
 		// Use the cached closest index (updated earlier this frame in UpdateVehicleInput)
 		// to avoid calling the non-const FindClosestPointIndex from this const method.
