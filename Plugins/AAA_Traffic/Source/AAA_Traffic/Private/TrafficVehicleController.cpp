@@ -2136,6 +2136,15 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 					}
 				}
 
+				// Offset so the front bumper (not vehicle center) aligns with
+				// the entry point.  VehicleFrontExtent is the distance from
+				// the actor origin to the front of the mesh, computed during
+				// OnPossess from the bounding box.
+				if (DistToEntry > 0.0f)
+				{
+					DistToEntry = FMath::Max(DistToEntry - VehicleFrontExtent, 0.0f);
+				}
+
 				// Desired speed from constant-decel stopping curve: v = sqrt(2*a*d)
 				// Uses the same tunable decel as the approach speed envelope
 				// so both systems agree on braking physics.
