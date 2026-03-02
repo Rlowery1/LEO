@@ -344,6 +344,26 @@ bool URoadBLDReflectionProvider::GetLanePath(
 	const bool bCanDoEdgeSampling = LeftEdge && RightEdge && RefLine
 		&& Get3DPosFunc && ConvertDistFunc;
 
+	// ── DIAG: Log once per lane when edge sampling is unavailable ─
+	if (!bCanDoEdgeSampling)
+	{
+		static TSet<int32> LoggedLanes;
+		if (!LoggedLanes.Contains(Lane.HandleId))
+		{
+			LoggedLanes.Add(Lane.HandleId);
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("RoadBLDReflectionProvider: GetLanePath FALLBACK for lane %d — "
+					 "using road centerline instead of lane edges. "
+					 "LeftEdge=%s  RightEdge=%s  RefLine=%s  Get3DPosFunc=%s  ConvertDistFunc=%s"),
+				Lane.HandleId,
+				LeftEdge        ? TEXT("OK") : TEXT("NULL"),
+				RightEdge       ? TEXT("OK") : TEXT("NULL"),
+				RefLine         ? TEXT("OK") : TEXT("NULL"),
+				Get3DPosFunc    ? TEXT("OK") : TEXT("NULL"),
+				ConvertDistFunc ? TEXT("OK") : TEXT("NULL"));
+		}
+	}
+
 	for (int32 i = 0; i < NumSamples; ++i)
 	{
 		const double Dist = FMath::Min(RoadLength,
@@ -666,6 +686,43 @@ void URoadBLDReflectionProvider::CacheRoadData(UWorld* World)
 					}
 				}
 			}
+
+			// ── DIAG: Log class-level function resolution result ─────
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("RoadBLDReflectionProvider: Function resolution — "
+					 "Get3DPosFunc=%s  ConvertDistFunc=%s  LeftEdgeProp=%s  RightEdgeProp=%s"),
+				Get3DPosFunc   ? TEXT("OK") : TEXT("NULL"),
+				ConvertDistFunc ? TEXT("OK") : TEXT("NULL"),
+				LeftEdgeProp   ? TEXT("OK") : TEXT("NULL"),
+				RightEdgeProp  ? TEXT("OK") : TEXT("NULL"));
+		}
+
+		// ── BUG-5 FIX: Retry Get3DPosFunc on subsequent roads ────
+		// The property resolution block above is one-shot (guarded by !LeftEdgeProp).
+		// If the first road's lanes all had null edge curves, Get3DPosFunc stays null.
+		// This block retries on every road until the function is found.
+		if (!Get3DPosFunc && LeftEdgeProp && Lanes.Num() > 0)
+		{
+			FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(LeftEdgeProp);
+			if (ObjProp)
+			{
+				for (UObject* L : Lanes)
+				{
+					if (!L) { continue; }
+					UObject* Edge = ObjProp->GetObjectPropertyValue_InContainer(L);
+					if (Edge)
+					{
+						Get3DPosFunc = Edge->GetClass()->FindFunctionByName(TEXT("Get3DPositionAtDistance"));
+						if (Get3DPosFunc)
+						{
+							UE_LOG(LogAAATraffic, Log,
+								TEXT("RoadBLDReflectionProvider: Get3DPosFunc resolved on road '%s' (deferred resolution)."),
+								*RoadActor->GetName());
+							break;
+						}
+					}
+				}
+			}
 		}
 
 		// ── Create lane handles ──────────────────────────────────
@@ -708,15 +765,60 @@ void URoadBLDReflectionProvider::CacheRoadData(UWorld* World)
 				if (ObjP) { LData.RightEdge = ObjP->GetObjectPropertyValue_InContainer(LaneObj); }
 			}
 
+			// ── DIAG: Warn when a drivable lane has null edge curves ─
+			if (!LData.LeftEdge.Get() || !LData.RightEdge.Get())
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("RoadBLDReflectionProvider: Lane %d ('%s') on road '%s' "
+						 "has NULL edge curves — LeftEdge=%s  RightEdge=%s. "
+						 "Lane will fall back to road-center polyline."),
+					LaneId,
+					*LaneObj->GetName(),
+					*RoadActor->GetName(),
+					LData.LeftEdge.Get()  ? TEXT("OK") : TEXT("NULL"),
+					LData.RightEdge.Get() ? TEXT("OK") : TEXT("NULL"));
+			}
+
 			LaneToHandleMap.Add(LaneObj, LaneId);
 		}
 	}
 
 	bCached = true;
 
-	UE_LOG(LogAAATraffic, Log,
-		TEXT("RoadBLDReflectionProvider: Cached %d roads, %d lanes via reflection."),
-		RoadHandleMap.Num(), LaneHandleMap.Num());
+	// ── DIAG: Post-cache edge sampling summary ──────────────────
+	{
+		int32 TotalLanes = 0;
+		int32 LanesWithBothEdges = 0;
+		int32 LanesWithMissingEdges = 0;
+		for (const auto& Pair : LaneHandleMap)
+		{
+			++TotalLanes;
+			if (Pair.Value.LeftEdge.Get() && Pair.Value.RightEdge.Get())
+			{
+				++LanesWithBothEdges;
+			}
+			else
+			{
+				++LanesWithMissingEdges;
+			}
+		}
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: Cached %d roads, %d lanes. "
+				 "EdgeSampling: %d/%d lanes have both edges, %d missing. "
+				 "Get3DPosFunc=%s  ConvertDistFunc=%s"),
+			RoadHandleMap.Num(), TotalLanes,
+			LanesWithBothEdges, TotalLanes, LanesWithMissingEdges,
+			Get3DPosFunc    ? TEXT("OK") : TEXT("NULL"),
+			ConvertDistFunc ? TEXT("OK") : TEXT("NULL"));
+
+		if (LanesWithMissingEdges > 0 || !Get3DPosFunc || !ConvertDistFunc)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("RoadBLDReflectionProvider: *** Edge sampling will FAIL for %d lane(s). "
+					 "Vehicles on those lanes will drive on the road centerline. ***"),
+				(!Get3DPosFunc || !ConvertDistFunc) ? TotalLanes : LanesWithMissingEdges);
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3248,46 +3350,14 @@ bool URoadBLDReflectionProvider::GetJunctionPath(
 	const FTrafficLaneHandle& ToLane,
 	TArray<FVector>& OutPath)
 {
-	// Resolve junction for FromLane (virtual-aware).
-	const int32 FromJunctionId = GetJunctionForLane(FromLane);
-	if (FromJunctionId == 0)
-	{
-		return false;
-	}
-
-	// Validate that ToLane maps to the same junction.
-	const int32 ToJunctionId = GetJunctionForLane(ToLane);
-	if (ToJunctionId != FromJunctionId)
-	{
-		return false;
-	}
-
-	const FVector* Centroid = JunctionCentroids.Find(FromJunctionId);
-	if (!Centroid)
-	{
-		return false;
-	}
-
-	// Build a 3-point path: FromLane endpoint → junction centroid → ToLane startpoint.
-	TArray<FVector> FromPoints;
-	float FromWidth;
-	TArray<FVector> ToPoints;
-	float ToWidth;
-
-	if (!GetLanePath(FromLane, FromPoints, FromWidth) || FromPoints.Num() == 0)
-	{
-		return false;
-	}
-	if (!GetLanePath(ToLane, ToPoints, ToWidth) || ToPoints.Num() == 0)
-	{
-		return false;
-	}
-
-	OutPath.Reset(3);
-	OutPath.Add(FromPoints.Last());
-	OutPath.Add(*Centroid);
-	OutPath.Add(ToPoints[0]);
-	return true;
+	// BUG-4 FIX: The old implementation produced a 3-point V-shaped path
+	// (entry → centroid → exit) which created sharp turns that vehicles
+	// couldn't follow smoothly. By returning false, we let the controller's
+	// Hermite cubic fallback synthesize a smooth curve from the end of FromLane
+	// to the start of ToLane, using lane tangents for continuity.
+	// Junction conflict detection (DoJunctionPathsConflict) is unaffected
+	// because it independently fetches lane endpoints.
+	return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -3580,63 +3650,85 @@ void URoadBLDReflectionProvider::PrecomputeJunctionMap()
 			continue;
 		}
 
-		// Walk forward from this lane through successors.
-		float AccDist = 0.0f;
+		// BFS walk forward from this lane through ALL successor branches
+		// to find the nearest downstream junction. Previous code followed
+		// only the first unvisited path at each fork, missing junctions
+		// reachable via other branches.
+		struct FBFSEntry
+		{
+			int32 LaneId;
+			int32 PreviousLaneId;
+			float AccumulatedDist;
+		};
+
+		TArray<FBFSEntry> Queue;
 		TSet<int32> Visited;
 		Visited.Add(StartLaneId);
-
-		int32 CurrentId = StartLaneId;
-		FTrafficLaneHandle PreviousLane(StartLaneId);
 		bool bFound = false;
 
-		for (int32 Hop = 0; Hop < MaxWalkHops; ++Hop)
+		// Seed the queue with all direct successors of the start lane.
 		{
-			const TArray<FTrafficLaneHandle>* NextLanes = LaneConnectionMap.Find(CurrentId);
-			if (!NextLanes || NextLanes->Num() == 0)
+			const TArray<FTrafficLaneHandle>* NextLanes = LaneConnectionMap.Find(StartLaneId);
+			if (NextLanes)
 			{
-				break; // dead end
+				for (const FTrafficLaneHandle& Next : *NextLanes)
+				{
+					if (!Visited.Contains(Next.HandleId))
+					{
+						Visited.Add(Next.HandleId);
+						FBFSEntry Entry;
+						Entry.LaneId = Next.HandleId;
+						Entry.PreviousLaneId = StartLaneId;
+						Entry.AccumulatedDist = 0.0f;
+						Queue.Add(Entry);
+					}
+				}
+			}
+		}
+
+		int32 QueueIdx = 0;
+		while (QueueIdx < Queue.Num() && QueueIdx < MaxWalkHops)
+		{
+			const FBFSEntry Current = Queue[QueueIdx++];
+
+			// Check if this lane is a junction lane.
+			const int32* CurJunction = LaneToJunctionMap.Find(Current.LaneId);
+			if (CurJunction && *CurJunction != 0)
+			{
+				FJunctionScanResult Result;
+				Result.JunctionId = *CurJunction;
+				Result.DistanceCm = Current.AccumulatedDist;
+				Result.JunctionLane = FTrafficLaneHandle(Current.LaneId);
+				Result.ApproachLane = FTrafficLaneHandle(Current.PreviousLaneId);
+				PrecomputedJunctionMap.Add(StartLaneId, Result);
+				bFound = true;
+				++FreeFlowWithJunctionAhead;
+				break; // found nearest junction — done for this start lane
 			}
 
-			bool bAdvanced = false;
-			for (const FTrafficLaneHandle& NextLane : *NextLanes)
+			// Accumulate this lane's length and enqueue its successors.
+			float DistAfterThis = Current.AccumulatedDist;
+			const float* CurLen = PrecomputedLaneLengths.Find(Current.LaneId);
+			if (CurLen)
 			{
-				if (Visited.Contains(NextLane.HandleId))
-				{
-					continue;
-				}
-				Visited.Add(NextLane.HandleId);
-
-				// Check if this successor is a junction lane.
-				const int32* NextJunction = LaneToJunctionMap.Find(NextLane.HandleId);
-				if (NextJunction && *NextJunction != 0)
-				{
-					FJunctionScanResult Result;
-					Result.JunctionId = *NextJunction;
-					Result.DistanceCm = AccDist;
-					Result.JunctionLane = NextLane;
-					Result.ApproachLane = FTrafficLaneHandle(CurrentId);
-					PrecomputedJunctionMap.Add(StartLaneId, Result);
-					bFound = true;
-					++FreeFlowWithJunctionAhead;
-					break;
-				}
-
-				// Not a junction — accumulate its length and continue.
-				const float* NextLen = PrecomputedLaneLengths.Find(NextLane.HandleId);
-				if (NextLen)
-				{
-					AccDist += *NextLen;
-				}
-
-				PreviousLane = FTrafficLaneHandle(CurrentId);
-				CurrentId = NextLane.HandleId;
-				bAdvanced = true;
-				break; // follow first unvisited path
+				DistAfterThis += *CurLen;
 			}
 
-			if (bFound || !bAdvanced)
+			const TArray<FTrafficLaneHandle>* NextLanes = LaneConnectionMap.Find(Current.LaneId);
+			if (NextLanes)
 			{
-				break;
+				for (const FTrafficLaneHandle& Next : *NextLanes)
+				{
+					if (!Visited.Contains(Next.HandleId))
+					{
+						Visited.Add(Next.HandleId);
+						FBFSEntry Entry;
+						Entry.LaneId = Next.HandleId;
+						Entry.PreviousLaneId = Current.LaneId;
+						Entry.AccumulatedDist = DistAfterThis;
+						Queue.Add(Entry);
+					}
+				}
 			}
 		}
 

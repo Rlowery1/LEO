@@ -1623,19 +1623,51 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 						}
 
 						// Compute exit lane for the 4-arg conflict-detection occupy call.
-						// From = current lane, To = first connected lane from junction lane.
+						// Pre-select the exit using weighted random (same logic as
+						// CheckLaneTransition) so conflict detection and actual driving
+						// use the SAME exit lane — prevents false-negative conflicts.
 						IntersectionFromLane = CurrentLane;
 						IntersectionToLane = FTrafficLaneHandle();
 						{
 							TArray<FTrafficLaneHandle> JunctionExits = CachedProvider->GetConnectedLanes(DetectedJunctionLane);
 							if (JunctionExits.Num() > 0)
 							{
-								// Sort for determinism, pick first (direction-weighted selection
-								// happens later in CheckLaneTransition, but for conflict detection
-								// any consistent exit suffices).
 								JunctionExits.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
 								{ return A.HandleId < B.HandleId; });
-								IntersectionToLane = JunctionExits[0];
+
+								if (JunctionExits.Num() == 1)
+								{
+									IntersectionToLane = JunctionExits[0];
+								}
+								else
+								{
+									// Direction-weighted selection (deterministic via seeded stream).
+									const FVector CurDir = CachedProvider->GetLaneDirection(CurrentLane);
+									TArray<float> ExitWeights;
+									ExitWeights.Reserve(JunctionExits.Num());
+									float TotalExitWeight = 0.0f;
+									for (const FTrafficLaneHandle& Exit : JunctionExits)
+									{
+										const FVector ExitDir = CachedProvider->GetLaneDirection(Exit);
+										const float Dot = FVector::DotProduct(CurDir, ExitDir);
+										const float W = FMath::Max(Dot + 1.0f, 0.01f);
+										ExitWeights.Add(W);
+										TotalExitWeight += W;
+									}
+									const float ExitRoll = RandomStream.FRandRange(0.0f, TotalExitWeight);
+									float Cumulative = 0.0f;
+									int32 PickedIdx = JunctionExits.Num() - 1;
+									for (int32 Idx = 0; Idx < JunctionExits.Num(); ++Idx)
+									{
+										Cumulative += ExitWeights[Idx];
+										if (ExitRoll <= Cumulative)
+										{
+											PickedIdx = Idx;
+											break;
+										}
+									}
+									IntersectionToLane = JunctionExits[PickedIdx];
+								}
 							}
 						}
 
@@ -1871,10 +1903,14 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 				}
 				else
 				{
-					// Under envelope — coast (no acceleration toward intersection).
+					// Under envelope — coast if still rolling, hold brake if stopped.
+					// Without holding brake a stopped vehicle on a slope rolls freely
+					// (Throttle=0, Brake=0 = no forces).
+					const bool bEffectivelyStopped = FMath::Abs(CurrentSpeed) < 10.0f;
 					VehicleMovement->SetThrottleInput(0.0f);
 					VehicleMovement->SetSteeringInput(0.0f);
-					VehicleMovement->SetBrakeInput(0.0f);
+					VehicleMovement->SetBrakeInput(bEffectivelyStopped ? 1.0f : 0.0f);
+					WaitBrake = bEffectivelyStopped ? 1.0f : 0.0f;
 				}
 
 #if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
@@ -2592,6 +2628,29 @@ void ATrafficVehicleController::CheckLaneTransition()
 	}
 
 	// --- Weighted lane selection (Feature 4) ---
+	// If a junction exit was pre-selected at detection time (IntersectionToLane),
+	// reuse it to guarantee conflict detection and actual driving agree.
+	// Otherwise fall back to weighted random selection.
+	FTrafficLaneHandle NextLane;
+
+	// Check if the pre-selected exit is valid and present in the connected list.
+	bool bUsedPreselected = false;
+	if (IntersectionToLane.HandleId != 0)
+	{
+		for (const FTrafficLaneHandle& C : Connected)
+		{
+			if (C.HandleId == IntersectionToLane.HandleId)
+			{
+				NextLane = IntersectionToLane;
+				bUsedPreselected = true;
+				AddLaneDecisionTrace(TEXT("TransitionCheck.UsedPreselectedExit"), NextLane.HandleId, 0.0f, 0.0f, TEXT("Reused junction pre-selected exit"));
+				break;
+			}
+		}
+	}
+
+	if (!bUsedPreselected)
+	{
 	// Weight by direction alignment with current lane to prefer "going straight."
 	// Sort by HandleId first for determinism, then build a CDF.
 	Connected.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
@@ -2638,13 +2697,14 @@ void ATrafficVehicleController::CheckLaneTransition()
 		}
 	}
 
-	const FTrafficLaneHandle NextLane = Connected[LaneIndex];
+	NextLane = Connected[LaneIndex];
 	AddLaneDecisionTrace(
 		TEXT("TransitionCheck.SelectedNextLane"),
 		NextLane.HandleId,
 		Roll,
 		TotalWeight,
 		FString::Printf(TEXT("LaneIndex=%d CandidateCount=%d"), LaneIndex, Connected.Num()));
+	} // end !bUsedPreselected
 
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("TrafficVehicleController: Transitioning from lane %d to lane %d (%d candidates)."),
