@@ -1802,6 +1802,40 @@ void URoadBLDReflectionProvider::CacheLaneEndpoints()
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("RoadBLDReflectionProvider: Cached endpoints for %d lanes, road widths for %d roads."),
 		LaneEndpointMap.Num(), RoadTotalWidthMap.Num());
+
+	// ── Build RoadClassifiedSpeedLimits: classify by lane count ──
+	// Speed tiers match TrafficSpawner defaults:
+	//   1-2 lanes = residential (1118 cm/s ≈ 25 mph)
+	//   3-4 lanes = urban (2012 cm/s ≈ 45 mph)
+	//   5+ lanes  = highway (2906 cm/s ≈ 65 mph)
+	static constexpr float ResidentialSpeed = 1118.0f;
+	static constexpr float UrbanSpeed = 2012.0f;
+	static constexpr float HighwaySpeed = 2906.0f;
+
+	RoadClassifiedSpeedLimits.Empty();
+	for (const auto& RoadEntry : RoadToLaneHandles)
+	{
+		const int32 RoadId = RoadEntry.Key;
+		const int32 LaneCount = RoadEntry.Value.Num();
+		float ClassifiedSpeed;
+		if (LaneCount <= 2)
+		{
+			ClassifiedSpeed = ResidentialSpeed;
+		}
+		else if (LaneCount <= 4)
+		{
+			ClassifiedSpeed = UrbanSpeed;
+		}
+		else
+		{
+			ClassifiedSpeed = HighwaySpeed;
+		}
+		RoadClassifiedSpeedLimits.Add(RoadId, ClassifiedSpeed);
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDReflectionProvider: Classified speed limits for %d roads (by lane count)."),
+		RoadClassifiedSpeedLimits.Num());
 }
 
 // ---------------------------------------------------------------------------
@@ -3474,10 +3508,25 @@ FTrafficRoadHandle URoadBLDReflectionProvider::GetRoadForLane(const FTrafficLane
 	return FTrafficRoadHandle();
 }
 
-float URoadBLDReflectionProvider::GetLaneSpeedLimit(const FTrafficLaneHandle& /*Lane*/)
+float URoadBLDReflectionProvider::GetLaneSpeedLimit(const FTrafficLaneHandle& Lane)
 {
-	// RoadBLD does not expose per-lane speed limits. Return -1 so the caller
-	// knows to fall back to its own default speed.
+	// Look up the lane's road, then return the classified speed limit.
+	// Virtual lanes map to their original lane's road via EffectiveId.
+	int32 EffectiveId = Lane.HandleId;
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
+	{
+		EffectiveId = VInfo->OriginalLaneHandle;
+	}
+
+	if (const int32* RoadId = LaneToRoadHandleMap.Find(EffectiveId))
+	{
+		if (const float* Speed = RoadClassifiedSpeedLimits.Find(*RoadId))
+		{
+			return *Speed;
+		}
+	}
+
+	// No classification data — caller falls back to its own default.
 	return -1.0f;
 }
 

@@ -161,6 +161,42 @@ void ATrafficVehicleController::SetDefaultSpeedLimit(float InSpeedLimit)
 	DefaultSpeedLimit = FMath::Max(0.0f, InSpeedLimit);
 }
 
+// ---------------------------------------------------------------------------
+// Turn signal helpers
+// ---------------------------------------------------------------------------
+
+void ATrafficVehicleController::SetTurnSignal(ETurnSignalState NewState)
+{
+	if (CurrentTurnSignal == NewState) { return; }
+	CurrentTurnSignal = NewState;
+	OnTurnSignalChanged.Broadcast(NewState);
+}
+
+ETurnSignalState ATrafficVehicleController::ComputeTurnDirection(
+	const FTrafficLaneHandle& FromLane,
+	const FTrafficLaneHandle& ToLane) const
+{
+	if (!CachedProvider || !FromLane.IsValid() || !ToLane.IsValid())
+	{
+		return ETurnSignalState::Off;
+	}
+
+	const FVector ApproachDir = CachedProvider->GetLaneDirection(FromLane);
+	const FVector ExitDir = CachedProvider->GetLaneDirection(ToLane);
+
+	// Cross product Z: positive = left turn, negative = right turn.
+	const float CrossZ = FVector::CrossProduct(ApproachDir, ExitDir).Z;
+
+	// Threshold: ~15° deviation from straight — below this, treat as straight-through.
+	constexpr float StraightThreshold = 0.26f; // sin(15°) ≈ 0.259
+	if (FMath::Abs(CrossZ) < StraightThreshold)
+	{
+		return ETurnSignalState::Off;
+	}
+
+	return (CrossZ > 0.0f) ? ETurnSignalState::Left : ETurnSignalState::Right;
+}
+
 void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle& InLane)
 {
 	// ── JUNCTION DIAG: log the state BEFORE we reset it ──
@@ -200,6 +236,17 @@ void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle
 	ApproachSpeedLimitCmPerSec = 0.0f;
 	ApproachJunctionId = 0;
 	ApproachJunctionLane = FTrafficLaneHandle();
+
+	// Reset stop-sign/yield state.
+	StopSignStopElapsed = 0.0f;
+	bStopSignWaitComplete = false;
+
+	// Reset turn signal.
+	CurrentTurnSignal = ETurnSignalState::Off;
+
+	// Reset navigational pre-positioning.
+	bNavigationalLaneChange = false;
+	NavigationalTargetLane = FTrafficLaneHandle();
 
 	// Reset lane-change state when entering a new lane.
 	LaneChangeState = ELaneChangeState::None;
@@ -1343,6 +1390,88 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 			DbgApproachSpeedLimit = ApproachSpeedLimitCmPerSec;
 			DbgApproachJunctionId = ApproachJunctionId;
 #endif
+
+			// --- Lane pre-positioning for upcoming turn ---
+			// If the vehicle is far enough from the junction and has not yet
+			// started a navigational lane change, pre-select the exit direction
+			// and move toward the appropriate side lane.
+			if (!bNavigationalLaneChange
+				&& ApproachJunctionDistanceCm > MinPrePositionDistanceCm
+				&& LaneChangeState == ELaneChangeState::None
+				&& ApproachJunctionLane.IsValid())
+			{
+				// Get exit lanes from the junction lane.
+				TArray<FTrafficLaneHandle> ApproachExits = CachedProvider->GetConnectedLanes(ApproachJunctionLane);
+				if (ApproachExits.Num() > 1)
+				{
+					// Direction-weighted exit selection (deterministic).
+					ApproachExits.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
+					{ return A.HandleId < B.HandleId; });
+
+					const FVector CurDir = CachedProvider->GetLaneDirection(CurrentLane);
+					TArray<float> Weights;
+					Weights.Reserve(ApproachExits.Num());
+					float TotalW = 0.0f;
+					for (const FTrafficLaneHandle& Exit : ApproachExits)
+					{
+						const FVector ExitDir = CachedProvider->GetLaneDirection(Exit);
+						const float Dot = FVector::DotProduct(CurDir, ExitDir);
+						const float W = FMath::Max(Dot + 1.0f, 0.01f);
+						Weights.Add(W);
+						TotalW += W;
+					}
+					const float Roll = RandomStream.FRandRange(0.0f, TotalW);
+					float Cum = 0.0f;
+					int32 PickedIdx = ApproachExits.Num() - 1;
+					for (int32 Idx = 0; Idx < ApproachExits.Num(); ++Idx)
+					{
+						Cum += Weights[Idx];
+						if (Roll <= Cum) { PickedIdx = Idx; break; }
+					}
+					const FTrafficLaneHandle ChosenExit = ApproachExits[PickedIdx];
+
+					// Determine turn direction.
+					const ETurnSignalState TurnDir = ComputeTurnDirection(CurrentLane, ChosenExit);
+
+					// Map turn direction to target lane:
+					//   Right turn → walk to rightmost lane.
+					//   Left turn  → walk to leftmost lane.
+					FTrafficLaneHandle TargetSideLane = FTrafficLaneHandle();
+					if (TurnDir == ETurnSignalState::Right)
+					{
+						FTrafficLaneHandle Walk = CachedProvider->GetAdjacentLane(CurrentLane, ETrafficLaneSide::Right);
+						if (Walk.IsValid()) { TargetSideLane = Walk; }
+						while (Walk.IsValid())
+						{
+							TargetSideLane = Walk;
+							Walk = CachedProvider->GetAdjacentLane(Walk, ETrafficLaneSide::Right);
+						}
+					}
+					else if (TurnDir == ETurnSignalState::Left)
+					{
+						FTrafficLaneHandle Walk = CachedProvider->GetAdjacentLane(CurrentLane, ETrafficLaneSide::Left);
+						if (Walk.IsValid()) { TargetSideLane = Walk; }
+						while (Walk.IsValid())
+						{
+							TargetSideLane = Walk;
+							Walk = CachedProvider->GetAdjacentLane(Walk, ETrafficLaneSide::Left);
+						}
+					}
+
+					if (TargetSideLane.IsValid() && TargetSideLane != CurrentLane)
+					{
+						NavigationalTargetLane = TargetSideLane;
+						bNavigationalLaneChange = true;
+						UE_LOG(LogAAATraffic, Log,
+							TEXT("TrafficVehicleController: Pre-positioning %s from lane %d → lane %d "
+								 "(turn=%s, junction dist=%.0f cm)."),
+							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+							CurrentLane.HandleId, TargetSideLane.HandleId,
+							TurnDir == ETurnSignalState::Left ? TEXT("LEFT") : TEXT("RIGHT"),
+							ApproachJunctionDistanceCm);
+					}
+				}
+			}
 		}
 		else
 		{
@@ -1671,16 +1800,61 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 							}
 						}
 
+						// Activate turn signal based on approach → exit direction.
+						SetTurnSignal(ComputeTurnDirection(IntersectionFromLane, IntersectionToLane));
+
 						UE_LOG(LogAAATraffic, Warning,
 							TEXT("JNCT OCCUPY-ATTEMPT: Pawn='%s' JunctionId=%d HasSignal=%s "
-								 "SignalAllowsGreen=%s DesiredNext=%d ExitLane=%d — about to TryOccupyJunction"),
+								 "SignalAllowsGreen=%s DesiredNext=%d ExitLane=%d ControlMode=%d — about to TryOccupyJunction"),
 							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 							DetectedJunctionId,
 							Signal ? TEXT("YES") : TEXT("NO"),
 							bSignalAllows ? TEXT("YES") : TEXT("NO"),
 							DetectedJunctionLane.HandleId,
-							IntersectionToLane.HandleId);
+							IntersectionToLane.HandleId,
+							Signal ? static_cast<int32>(Signal->GetControlMode()) : -1);
 
+						// Determine junction control mode.
+						const EJunctionControlMode JunctionMode = Signal
+							? Signal->GetControlMode()
+							: EJunctionControlMode::Yield; // No controller = uncontrolled (yield-like).
+
+						if (JunctionMode == EJunctionControlMode::Yield)
+						{
+							// Yield: try to occupy immediately. If clear, proceed without stopping.
+							if (TrafficSub->TryOccupyJunction(DetectedJunctionId, this, IntersectionFromLane, IntersectionToLane))
+							{
+								UE_LOG(LogAAATraffic, Warning,
+									TEXT("JNCT YIELD-PROCEED: Pawn='%s' JunctionId=%d — clear, proceeding without stop"),
+									GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+									DetectedJunctionId);
+							}
+							else
+							{
+								// Not clear — must wait (will slow down via approach braking).
+								bWaitingAtIntersection = true;
+								bStopSignWaitComplete = true; // No mandatory stop for yield.
+								StopSignStopElapsed = 0.0f;
+								UE_LOG(LogAAATraffic, Warning,
+									TEXT("JNCT YIELD-WAIT: Pawn='%s' JunctionId=%d — occupied, waiting for clearance"),
+									GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+									DetectedJunctionId);
+							}
+						}
+						else if (JunctionMode == EJunctionControlMode::StopSign || JunctionMode == EJunctionControlMode::FlashingRed)
+						{
+							// StopSign/FlashingRed: always wait — vehicle must come to a full stop first.
+							bWaitingAtIntersection = true;
+							bStopSignWaitComplete = false;
+							StopSignStopElapsed = 0.0f;
+							UE_LOG(LogAAATraffic, Warning,
+								TEXT("JNCT STOPSIGN-WAIT: Pawn='%s' JunctionId=%d — must stop and wait %.1fs"),
+								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+								DetectedJunctionId,
+								Signal ? Signal->StopSignWaitTimeSec : 2.0f);
+						}
+						else // Signal mode
+						{
 						if (bSignalAllows && TrafficSub->TryOccupyJunction(DetectedJunctionId, this, IntersectionFromLane, IntersectionToLane))
 						{
 							UE_LOG(LogAAATraffic, Warning,
@@ -1691,6 +1865,8 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 						else
 						{
 							bWaitingAtIntersection = true;
+							bStopSignWaitComplete = true; // N/A for signals.
+							StopSignStopElapsed = 0.0f;
 							UE_LOG(LogAAATraffic, Warning,
 								TEXT("JNCT OCCUPY-DENIED: Pawn='%s' JunctionId=%d SignalAllows=%s "
 									 "— WAITING at intersection"),
@@ -1698,6 +1874,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 								DetectedJunctionId,
 								bSignalAllows ? TEXT("YES-occupied") : TEXT("NO-signal-red"));
 						}
+						} // end Signal mode
 					}
 				}
 				else
@@ -1752,15 +1929,55 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 
 					bool bSignalAllows = true;
 					ATrafficSignalController* Signal = TrafficSub->GetSignalForJunction(IntersectionJunctionId);
+					const EJunctionControlMode JunctionMode = Signal
+						? Signal->GetControlMode()
+						: EJunctionControlMode::Yield;
+
+					if (JunctionMode == EJunctionControlMode::Signal)
+					{
+						// Signal mode: wait for green.
 					if (Signal)
 					{
 						bSignalAllows = Signal->IsLaneGreen(IntersectionJunctionLane);
 					}
+					}
+					else if (JunctionMode == EJunctionControlMode::StopSign || JunctionMode == EJunctionControlMode::FlashingRed)
+					{
+						// Stop sign: must be at full stop for StopSignWaitTimeSec before proceeding.
+						if (!bStopSignWaitComplete)
+						{
+							// Check if vehicle is effectively stopped.
+							if (FMath::Abs(CurrentSpeed) < 10.0f)
+							{
+								StopSignStopElapsed += 0.25f; // Each retry interval adds time.
+								const float RequiredWait = Signal ? Signal->StopSignWaitTimeSec : 2.0f;
+								if (StopSignStopElapsed >= RequiredWait)
+								{
+									bStopSignWaitComplete = true;
+									UE_LOG(LogAAATraffic, Warning,
+										TEXT("JNCT STOPSIGN-WAIT-DONE: Pawn='%s' JunctionId=%d — "
+											 "waited %.1fs at stop, now checking occupancy"),
+										GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+										IntersectionJunctionId, StopSignStopElapsed);
+								}
+							}
+							else
+							{
+								// Not yet stopped — reset timer.
+								StopSignStopElapsed = 0.0f;
+							}
+							bSignalAllows = false; // Don't proceed until wait is complete.
+						}
+						// else bStopSignWaitComplete = true → bSignalAllows stays true, check occupy.
+					}
+					// Yield mode: bSignalAllows stays true, just check occupancy.
 
 					if (bSignalAllows && TrafficSub->TryOccupyJunction(IntersectionJunctionId, this, IntersectionFromLane, IntersectionToLane))
 					{
 						bWaitingAtIntersection = false;
 						IntersectionWaitElapsed = 0.0f;
+						StopSignStopElapsed = 0.0f;
+						bStopSignWaitComplete = false;
 
 						// Safety: if the vehicle overshot the entry point while waiting,
 						// teleport it back so FindClosestPointIndex maps correctly on the
@@ -2030,6 +2247,13 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 			// Finished junction transition — release junction occupancy and proceed.
 			JunctionTransitionPoints.Empty();
 			JunctionTransitionIndex = 0;
+
+			// Turn signal off — junction turn is complete.
+			SetTurnSignal(ETurnSignalState::Off);
+
+			// Clear navigational pre-positioning — now on a new road.
+			bNavigationalLaneChange = false;
+			NavigationalTargetLane = FTrafficLaneHandle();
 
 			UE_LOG(LogAAATraffic, Warning,
 				TEXT("JNCT RELEASE-PATH2-CHECK: Pawn='%s' IntersectionJunctionId=%d "
@@ -2606,6 +2830,7 @@ void ATrafficVehicleController::CheckLaneTransition()
 	if (!CachedProvider)
 	{
 		bAtDeadEnd = true;
+		SetTurnSignal(ETurnSignalState::Hazard);
 		AddLaneDecisionTrace(TEXT("TransitionCheck.NoProvider"), 0, 0.0f, 0.0f, TEXT("No cached provider"));
 		FlushLaneDecisionTrace(TEXT("NoProviderDeadEnd"), true);
 		UE_LOG(LogAAATraffic, Log,
@@ -2619,6 +2844,7 @@ void ATrafficVehicleController::CheckLaneTransition()
 	if (Connected.IsEmpty())
 	{
 		bAtDeadEnd = true;
+		SetTurnSignal(ETurnSignalState::Hazard);
 		AddLaneDecisionTrace(TEXT("TransitionCheck.NoConnected"), 0, 0.0f, 0.0f, TEXT("No connected lanes"));
 		FlushLaneDecisionTrace(TEXT("NoConnectedDeadEnd"), true);
 		UE_LOG(LogAAATraffic, Log,
@@ -2772,6 +2998,7 @@ void ATrafficVehicleController::CheckLaneTransition()
 	if (!bLaneDataReady)
 	{
 		bAtDeadEnd = true;
+		SetTurnSignal(ETurnSignalState::Hazard);
 		AddLaneDecisionTrace(TEXT("TransitionCheck.InitializeFailed"), NextLane.HandleId, 0.0f, 0.0f, TEXT("InitializeLaneFollowing failed"));
 		FlushLaneDecisionTrace(TEXT("TransitionInitializeFailed"), true);
 		UE_LOG(LogAAATraffic, Warning,
@@ -2844,35 +3071,76 @@ void ATrafficVehicleController::EvaluateLaneChange()
 	const float CurrentSpeed = FMath::Abs(VehicleMovement->GetForwardSpeed());
 	const float EffectiveTarget = FMath::Max(TargetSpeed, 1.0f);
 
-	// Only consider lane change if we're significantly slower than desired.
-	if (CurrentSpeed / EffectiveTarget >= LaneChangeSpeedThreshold)
+	// --- Navigational pre-positioning ---
+	// If the vehicle needs to change lanes before a junction turn, bypass the
+	// speed-ratio and leader-distance motivation checks.  Only the safety
+	// checks (direction, gap, blind-spot) still apply.
+	bool bNavigationalAttempt = false;
+	ETrafficLaneSide NavigationalSide = ETrafficLaneSide::Left;
+	if (bNavigationalLaneChange && NavigationalTargetLane.IsValid() && NavigationalTargetLane != CurrentLane)
 	{
-		if (IsVehicleTraceEnabled(2))
+		bNavigationalAttempt = true;
+		// Walk left from current lane to see if the target is on the left side.
+		bool bFoundLeft = false;
+		FTrafficLaneHandle Walk = CachedProvider->GetAdjacentLane(CurrentLane, ETrafficLaneSide::Left);
+		for (int32 Safety = 0; Safety < 8 && Walk.IsValid(); ++Safety)
 		{
-			AddLaneDecisionTrace(TEXT("LaneChange.RejectSpeedRatio"), 0, CurrentSpeed / EffectiveTarget, LaneChangeSpeedThreshold, TEXT("Not slow enough"));
+			if (Walk == NavigationalTargetLane) { bFoundLeft = true; break; }
+			Walk = CachedProvider->GetAdjacentLane(Walk, ETrafficLaneSide::Left);
 		}
-		return;
+		NavigationalSide = bFoundLeft ? ETrafficLaneSide::Left : ETrafficLaneSide::Right;
+		AddLaneDecisionTrace(TEXT("LaneChange.NavPrePos"), NavigationalTargetLane.HandleId,
+			bFoundLeft ? -1.0f : 1.0f, 0.0f, TEXT("Navigational pre-positioning attempt"));
+	}
+	else if (bNavigationalLaneChange)
+	{
+		// Already in target lane or target became invalid — clear.
+		bNavigationalLaneChange = false;
+		NavigationalTargetLane = FTrafficLaneHandle();
 	}
 
-	// Verify a slow leader is actually ahead (avoid false triggers from turns/hills).
-	float LeaderSpeed = 0.0f;
-	const float LeaderDist = GetLeaderDistance(LeaderSpeed);
-	if (LeaderDist < 0.0f || LeaderDist > DetectionDistance * 0.75f)
+	float LeaderDist = -1.0f;
+	if (!bNavigationalAttempt)
 	{
-		if (IsVehicleTraceEnabled(2))
+		// Only consider lane change if we're significantly slower than desired.
+		if (CurrentSpeed / EffectiveTarget >= LaneChangeSpeedThreshold)
 		{
-			AddLaneDecisionTrace(TEXT("LaneChange.RejectLeaderDistance"), 0, LeaderDist, DetectionDistance * 0.75f, TEXT("No close slow leader"));
+			if (IsVehicleTraceEnabled(2))
+			{
+				AddLaneDecisionTrace(TEXT("LaneChange.RejectSpeedRatio"), 0, CurrentSpeed / EffectiveTarget, LaneChangeSpeedThreshold, TEXT("Not slow enough"));
+			}
+			return;
 		}
-		return; // No close leader — speed issue is not from congestion.
+
+		// Verify a slow leader is actually ahead (avoid false triggers from turns/hills).
+		float LeaderSpeed = 0.0f;
+		LeaderDist = GetLeaderDistance(LeaderSpeed);
+		if (LeaderDist < 0.0f || LeaderDist > DetectionDistance * 0.75f)
+		{
+			if (IsVehicleTraceEnabled(2))
+			{
+				AddLaneDecisionTrace(TEXT("LaneChange.RejectLeaderDistance"), 0, LeaderDist, DetectionDistance * 0.75f, TEXT("No close slow leader"));
+			}
+			return; // No close leader — speed issue is not from congestion.
+		}
 	}
 
 	const FVector MyDirection = CachedProvider->GetLaneDirection(CurrentLane);
 
-	// Try both sides — deterministic order: Left first, then Right.
-	const ETrafficLaneSide Sides[] = { ETrafficLaneSide::Left, ETrafficLaneSide::Right };
-
-	for (ETrafficLaneSide Side : Sides)
+	// Choose sides to evaluate:
+	// - Navigational: only the computed side toward the target lane.
+	// - Normal: both sides in deterministic order (Left first, then Right).
+	ETrafficLaneSide SidesBuffer[2] = { ETrafficLaneSide::Left, ETrafficLaneSide::Right };
+	int32 NumSides = 2;
+	if (bNavigationalAttempt)
 	{
+		SidesBuffer[0] = NavigationalSide;
+		NumSides = 1;
+	}
+
+	for (int32 SideIdx = 0; SideIdx < NumSides; ++SideIdx)
+	{
+		const ETrafficLaneSide Side = SidesBuffer[SideIdx];
 		FTrafficLaneHandle CandidateLane = CachedProvider->GetAdjacentLane(CurrentLane, Side);
 		if (!CandidateLane.IsValid())
 		{
@@ -2973,6 +3241,9 @@ void ATrafficVehicleController::EvaluateLaneChange()
 		TargetLanePoints = MoveTemp(CandidatePoints);
 		TargetLaneWidth = CandidateWidth;
 		LaneChangeProgress = 0.0f;
+
+		// Activate turn signal for lane change direction.
+		SetTurnSignal(Side == ETrafficLaneSide::Left ? ETurnSignalState::Left : ETurnSignalState::Right);
 
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("TrafficVehicleController: Beginning lane change from lane %d to lane %d (%s)."),
@@ -3120,6 +3391,13 @@ void ATrafficVehicleController::FinalizeLaneChange()
 	LaneChangeCooldownRemaining = LaneChangeCooldownTime;
 	PreviousCrossTrackError = 0.0f;
 
+	// Turn signal off — lane change complete.
+	SetTurnSignal(ETurnSignalState::Off);
+
+	// Clear navigational lane change flag.
+	bNavigationalLaneChange = false;
+	NavigationalTargetLane = FTrafficLaneHandle();
+
 	// Notify subsystem of new lane.
 	if (UWorld* World = GetWorld())
 	{
@@ -3148,6 +3426,13 @@ void ATrafficVehicleController::AbortLaneChange()
 	LaneChangeProgress = 0.0f;
 	LaneChangeSettleTimer = 0.0f;
 	LaneChangeCooldownRemaining = LaneChangeCooldownTime;
+
+	// Turn signal off — lane change aborted.
+	SetTurnSignal(ETurnSignalState::Off);
+
+	// Clear navigational lane change flag.
+	bNavigationalLaneChange = false;
+	NavigationalTargetLane = FTrafficLaneHandle();
 	FlushLaneDecisionTrace(TEXT("LaneChangeAbort"), true);
 }
 

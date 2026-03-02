@@ -23,6 +23,26 @@ enum class ELaneChangeState : uint8
 };
 
 /**
+ * Turn signal indicator state — exposed to Blueprint for visual binding
+ * (e.g. activating brake-light / turn-signal meshes or materials).
+ */
+UENUM(BlueprintType)
+enum class ETurnSignalState : uint8
+{
+	/** No signal active. */
+	Off,
+	/** Left turn signal. */
+	Left,
+	/** Right turn signal. */
+	Right,
+	/** Hazard lights (both sides). */
+	Hazard
+};
+
+/** Delegate broadcast when the vehicle's turn signal state changes. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTurnSignalChanged, ETurnSignalState, NewState);
+
+/**
  * AI controller that drives a Chaos vehicle along a lane
  * obtained from an ITrafficRoadProvider adapter.
  *
@@ -71,6 +91,15 @@ public:
 	/** Set the base (default) speed limit used when the provider has no lane speed data. */
 	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	void SetDefaultSpeedLimit(float InSpeedLimit);
+
+	/** Get the current turn signal state (Off, Left, Right, Hazard). */
+	UFUNCTION(BlueprintPure, Category = "Traffic")
+	ETurnSignalState GetTurnSignalState() const { return CurrentTurnSignal; }
+
+	/** Fired whenever the turn signal state changes. Bind in Blueprint to
+	 *  activate turn signal lights on the vehicle mesh. */
+	UPROPERTY(BlueprintAssignable, Category = "Traffic")
+	FOnTurnSignalChanged OnTurnSignalChanged;
 
 protected:
 	virtual void OnPossess(APawn* InPawn) override;
@@ -235,6 +264,41 @@ private:
 
 	/** Elapsed time (seconds) spent waiting at the current intersection. */
 	float IntersectionWaitElapsed = 0.0f;
+
+	/** Elapsed time (seconds) spent at a full stop at a stop-sign junction.
+	 *  Once this reaches the signal controller's StopSignWaitTimeSec, the
+	 *  vehicle is allowed to proceed (if occupancy is clear). */
+	float StopSignStopElapsed = 0.0f;
+
+	/** True when the vehicle has completed the mandatory stop-sign wait
+	 *  and is now waiting only for junction occupancy clearance. */
+	bool bStopSignWaitComplete = false;
+
+	// ── Turn signal state ───────────────────────────────────
+
+	/** Current turn signal state. */
+	ETurnSignalState CurrentTurnSignal = ETurnSignalState::Off;
+
+	/** Set the turn signal and broadcast delegate (no-op if state unchanged). */
+	void SetTurnSignal(ETurnSignalState NewState);
+
+	/**
+	 * Compute the turn direction for a junction transition.
+	 * Uses cross product of approach direction × exit direction.
+	 * Returns Left, Right, or Off (straight-through).
+	 */
+	ETurnSignalState ComputeTurnDirection(const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane) const;
+
+	// ── Lane pre-positioning state ──────────────────────────
+
+	/** Target lane handle for navigational lane change (pre-positioning before junction). */
+	FTrafficLaneHandle NavigationalTargetLane;
+
+	/** True when a navigational (junction pre-positioning) lane change is pending or active. */
+	bool bNavigationalLaneChange = false;
+
+	/** Minimum distance (cm) before junction to attempt pre-positioning lane change. */
+	static constexpr float MinPrePositionDistanceCm = 15000.0f; // 150m
 
 	/** Per-instance log throttle counter for waiting-state diagnostics.
 	 *  Replaces the old static int32 that was shared across all instances

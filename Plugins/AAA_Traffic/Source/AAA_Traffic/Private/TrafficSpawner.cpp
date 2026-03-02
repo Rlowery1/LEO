@@ -1200,7 +1200,27 @@ void ATrafficSpawner::PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Prov
 
 		Signal->JunctionId = JId;
 
+		// Auto-classify by approach road count:
+		//   4+ approach roads → Signal (full cycling)
+		//   3 approach roads  → StopSign (all-way stop)
+		//   2 or fewer        → Yield (slow-proceed if clear)
+		const int32 ApproachRoadCount = LanesByRoad.Num();
+		if (ApproachRoadCount >= 4)
+		{
+			Signal->ControlMode = EJunctionControlMode::Signal;
+		}
+		else if (ApproachRoadCount == 3)
+		{
+			Signal->ControlMode = EJunctionControlMode::StopSign;
+		}
+		else
+		{
+			Signal->ControlMode = EJunctionControlMode::Yield;
+		}
+
 		// Build phase groups: each approach road gets its own green phase.
+		// (Only meaningful for Signal mode, but populated for all modes for
+		// completeness in case the user changes the mode in the editor.)
 		TArray<int32> RoadKeys;
 		LanesByRoad.GetKeys(RoadKeys);
 		RoadKeys.Sort();
@@ -1228,7 +1248,8 @@ void ATrafficSpawner::PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Prov
 	if (SignalsPlaced > 0)
 	{
 		UE_LOG(LogAAATraffic, Log,
-			TEXT("TrafficSpawner: Auto-placed %d signal controllers across %d junctions."),
+			TEXT("TrafficSpawner: Auto-placed %d junction controllers across %d junctions "
+				 "(mode auto-classified by approach road count: 4+=Signal, 3=StopSign, 2=Yield)."),
 			SignalsPlaced, JunctionIds.Num());
 	}
 }
