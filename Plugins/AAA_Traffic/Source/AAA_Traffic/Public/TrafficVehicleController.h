@@ -255,6 +255,23 @@ private:
 	/** Distance traveled by the vehicle this tick (computed once, consumed by blend). */
 	float DistanceThisTick;
 
+	/** Previous-tick cross-track error (CrossZ) for the steering derivative term. */
+	float PreviousCrossTrackError = 0.0f;
+
+	// ── Computed adaptive distances (set each tick in UpdateVehicleInput) ─
+	// These are derived from the time-based tuning properties × current speed.
+	// Internal code (GetLookAheadPoint, GetLeaderDistance, etc.) reads these
+	// instead of the old fixed-distance UPROPERTYs.
+
+	/** Computed look-ahead distance (cm) for this tick. */
+	float LookAheadDistance = 300.0f;
+
+	/** Computed following distance (cm) for this tick. */
+	float FollowingDistance = 200.0f;
+
+	/** Computed detection distance (cm) for this tick. */
+	float DetectionDistance = 1500.0f;
+
 	/** Cached index from last FindClosestPointIndex call (for O(1) amortized search). */
 	int32 LastClosestIndex;
 
@@ -312,17 +329,54 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))
 	float TargetSpeed;
 
-	/** Distance ahead on the lane path (cm) used as the steering target. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "100"))
-	float LookAheadDistance;
+	// ── Adaptive Driving Parameters (time-based) ───────────
+	// These replace the old fixed-distance properties. At runtime the
+	// controller computes: EffectiveDistance = Speed * TimeSec, clamped
+	// to a minimum. This means distances grow with speed automatically.
 
-	/** Minimum safe following distance behind a leader (cm). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "100"))
-	float FollowingDistance;
+	/**
+	 * Time (seconds) of look-ahead along the lane centerline for the
+	 * steering target. Effective distance = CurrentSpeed * this value,
+	 * clamped to MinLookAheadDistanceCm. Default 0.6s.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Steering", meta = (ClampMin = "0.1"))
+	float LookAheadTimeSec;
 
-	/** Maximum forward detection range for vehicles ahead (cm). */
+	/** Floor for look-ahead distance (cm) at very low speeds. Default 300. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Steering", meta = (ClampMin = "50"))
+	float MinLookAheadDistanceCm;
+
+	/**
+	 * Derivative (damping) gain for the PD steering controller.
+	 * Larger values reduce steering oscillation on straights.
+	 * 0 = pure P controller (old behavior). Default 0.5.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Steering", meta = (ClampMin = "0", ClampMax = "2"))
+	float SteeringDampingFactor;
+
+	/**
+	 * Time (seconds) of safe following gap behind a leader vehicle.
+	 * Effective distance = CurrentSpeed * this value, clamped to
+	 * MinFollowingDistanceCm. Default 1.5s (standard 1.5-second rule).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "0.3"))
+	float FollowingTimeSec;
+
+	/** Floor for following distance (cm) at very low speeds. Default 200. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "50"))
+	float MinFollowingDistanceCm;
+
+	/**
+	 * Time (seconds) of forward detection range for leader vehicles.
+	 * Effective distance = CurrentSpeed * this value, clamped to
+	 * MinDetectionDistanceCm. Default 4.0s.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "1.0"))
+	float DetectionTimeSec;
+
+	/** Floor for detection distance (cm) at very low speeds. Default 1500. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Proximity", meta = (ClampMin = "500"))
-	float DetectionDistance;
+	float MinDetectionDistanceCm;
 
 	// ── Lane Change Tuning ──────────────────────────────────
 

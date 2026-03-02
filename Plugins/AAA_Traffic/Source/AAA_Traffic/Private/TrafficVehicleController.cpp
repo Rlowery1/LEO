@@ -107,9 +107,13 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, LaneChangeCooldownRemaining(0.0f)
 	, BaseTargetSpeed(0.0f)
 	, TargetSpeed(1500.f)
-	, LookAheadDistance(500.f)
-	, FollowingDistance(300.f)
-	, DetectionDistance(2000.f)
+	, LookAheadTimeSec(0.6f)
+	, MinLookAheadDistanceCm(300.0f)
+	, SteeringDampingFactor(0.5f)
+	, FollowingTimeSec(1.5f)
+	, MinFollowingDistanceCm(200.0f)
+	, DetectionTimeSec(4.0f)
+	, MinDetectionDistanceCm(1500.0f)
 	, LaneChangeDistance(1500.f)
 	, LaneChangeCooldownTime(5.0f)
 	, LaneChangeSpeedThreshold(0.6f)
@@ -1194,6 +1198,14 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	const FVector VehicleForward = ControlledPawn->GetActorForwardVector();
 	const float CurrentSpeed = VehicleMovement->GetForwardSpeed();
 
+	// ── Compute adaptive distances from time-based parameters ──
+	// Each distance = |CurrentSpeed| × TimeSec, clamped to a floor so
+	// behaviour remains stable even when the vehicle is nearly stopped.
+	const float AbsSpeed = FMath::Abs(CurrentSpeed);
+	LookAheadDistance  = FMath::Max(AbsSpeed * LookAheadTimeSec,  MinLookAheadDistanceCm);
+	FollowingDistance  = FMath::Max(AbsSpeed * FollowingTimeSec,  MinFollowingDistanceCm);
+	DetectionDistance  = FMath::Max(AbsSpeed * DetectionTimeSec,  MinDetectionDistanceCm);
+
 #if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	// Initialize debug cache each tick — will be overwritten by decision branches.
 	DbgCurrentSpeed = CurrentSpeed;
@@ -2034,14 +2046,29 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		TargetPoint = GetLookAheadPoint(VehicleLocation, ClosestIndex);
 	}
 
-	// --- Steering ---
+	// --- PD Steering ---
 	const FVector ToTarget = (TargetPoint - VehicleLocation).GetSafeNormal2D();
 	const FVector Forward2D = VehicleForward.GetSafeNormal2D();
 	const float CrossZ = FVector::CrossProduct(Forward2D, ToTarget).Z;
 
-	// CrossZ is positive when target is to the right, negative when left.
-	// Scale for reasonable responsiveness.
-	const float SteeringInput = FMath::Clamp(CrossZ * 2.0f, -1.0f, 1.0f);
+	// Proportional term: CrossZ is positive when target is right, negative left.
+	const float PTerm = CrossZ * 2.0f;
+
+	// Derivative term: rate of change of cross-track error provides damping.
+	// Prevents oscillatory steering on long straights (the root cause of
+	// center-line drift identified in the investigation).
+	const float CrossTrackDerivative = (DeltaSeconds > KINDA_SMALL_NUMBER)
+		? (CrossZ - PreviousCrossTrackError) / DeltaSeconds
+		: 0.0f;
+	PreviousCrossTrackError = CrossZ;
+
+	// Damping contribution: scale derivative by the tunable factor and
+	// normalize against a reference rate so the gain is intuitive (1.0 =
+	// moderate damping at 60 fps). Clamp to prevent derivative kick from
+	// sudden lane-change blend transitions.
+	const float DTerm = FMath::Clamp(CrossTrackDerivative * SteeringDampingFactor * 0.016f, -0.3f, 0.3f);
+
+	const float SteeringInput = FMath::Clamp(PTerm + DTerm, -1.0f, 1.0f);
 
 	// --- Throttle / Brake ---
 	// Compute effective target speed accounting for vehicle ahead.
@@ -2231,10 +2258,13 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		BrakeInput = FMath::Clamp((CurrentSpeed - EffectiveTargetSpeed) / FMath::Max(EffectiveTargetSpeed, 1.0f), 0.0f, 1.0f);
 	}
 
-	// Back off throttle in sharp turns
-	if (FMath::Abs(SteeringInput) > 0.5f)
+	// Smooth turn-speed reduction: scale throttle proportionally to steering
+	// magnitude instead of a binary 50% cut at 0.5. At SteeringInput = 0
+	// → full throttle, at 1.0 → 30% throttle. Linear interpolation.
 	{
-		ThrottleInput *= 0.5f;
+		const float AbsSteering = FMath::Abs(SteeringInput);
+		const float TurnThrottleScale = FMath::Lerp(1.0f, 0.3f, AbsSteering);
+		ThrottleInput *= TurnThrottleScale;
 	}
 
 	// Wake guard: keep the GT-level vehicle movement awake so throttle input
