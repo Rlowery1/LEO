@@ -162,4 +162,83 @@ public:
 	 * path points already oriented in the correct travel direction.
 	 */
 	virtual bool IsLaneReversed(const FTrafficLaneHandle& Lane) { return false; }
+
+	/**
+	 * Get the exact 3D world position where an intersection begins for a
+	 * given approach lane. Derived from intersection mask geometry (not
+	 * quantized polyline indices), so it adapts to any intersection shape.
+	 *
+	 * @param ApproachLane  Handle to a free-flow lane that precedes an intersection.
+	 * @param OutPoint      Filled with the precise intersection boundary position.
+	 * @return true if the lane approaches an intersection and the point was computed.
+	 */
+	virtual bool GetIntersectionEntryPoint(const FTrafficLaneHandle& ApproachLane, FVector& OutPoint) { return false; }
+
+	/**
+	 * Test whether two junction-crossing movements conflict (i.e. their paths
+	 * through the junction would geometrically intersect).
+	 * Used by multi-vehicle junction occupancy to allow non-conflicting
+	 * movements to proceed simultaneously.
+	 *
+	 * @param FromA  Approach lane of vehicle A (pre-junction free-flow lane).
+	 * @param ToA    Exit lane of vehicle A (post-junction free-flow lane).
+	 * @param FromB  Approach lane of vehicle B.
+	 * @param ToB    Exit lane of vehicle B.
+	 * @return true if the movements conflict (default: conservative, always true).
+	 */
+	virtual bool DoJunctionPathsConflict(
+		const FTrafficLaneHandle& FromA, const FTrafficLaneHandle& ToA,
+		const FTrafficLaneHandle& FromB, const FTrafficLaneHandle& ToB) { return true; }
+
+	/**
+	 * Get the total polyline length of a lane (cm).
+	 * Used by the multi-hop junction scan to accumulate distance through
+	 * the lane graph without re-fetching full polyline data.
+	 * Returns 0.0 if the lane is unknown.
+	 */
+	virtual float GetLaneLength(const FTrafficLaneHandle& Lane) { return 0.0f; }
+
+	/**
+	 * Result of a multi-hop junction scan ahead of a given lane.
+	 */
+	struct FJunctionScanResult
+	{
+		/** Junction ID found (0 = none within search range). */
+		int32 JunctionId = 0;
+
+		/** Total distance (cm) from the current position to the junction entry. */
+		float DistanceCm = 0.0f;
+
+		/** The lane handle that IS the junction lane (for signal queries). */
+		FTrafficLaneHandle JunctionLane;
+
+		/** The free-flow lane immediately before the junction (approach lane). */
+		FTrafficLaneHandle ApproachLane;
+
+		bool IsValid() const { return JunctionId != 0; }
+	};
+
+	/**
+	 * Walk the lane graph forward from the given lane to find the nearest
+	 * upcoming junction within MaxSearchDistCm.
+	 *
+	 * Starts at RemainingDistOnCurrentLane from the end of StartLane, then
+	 * follows GetConnectedLanes hop-by-hop, accumulating polyline lengths,
+	 * until a lane with GetJunctionForLane() != 0 is found or
+	 * MaxSearchDistCm is exceeded.
+	 *
+	 * Default implementation uses GetConnectedLanes / GetJunctionForLane /
+	 * GetLaneLength — adapters can override for optimized lookups.
+	 *
+	 * @param StartLane                Handle to the vehicle's current lane.
+	 * @param RemainingDistOnCurrentLane  Distance remaining on StartLane (cm).
+	 * @param MaxSearchDistCm          Maximum forward search distance (cm).
+	 * @param MaxHops                  Maximum number of lane transitions to follow.
+	 * @return Scan result with junction info, or invalid if none found.
+	 */
+	virtual FJunctionScanResult GetDistanceToNextJunction(
+		const FTrafficLaneHandle& StartLane,
+		float RemainingDistOnCurrentLane,
+		float MaxSearchDistCm = 50000.0f,
+		int32 MaxHops = 10);
 };

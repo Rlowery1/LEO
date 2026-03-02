@@ -32,11 +32,6 @@
       "LoadingPhase": "Default"
     },
     {
-      "Name": "AAA_TrafficRoadBLD",
-      "Type": "Runtime",
-      "LoadingPhase": "Default"
-    },
-    {
       "Name": "AAA_TrafficEditor",
       "Type": "Editor",
       "LoadingPhase": "PostEngineInit"

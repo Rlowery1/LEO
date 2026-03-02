@@ -148,7 +148,11 @@ void UTrafficSubsystem::UnregisterVehicle(ATrafficVehicleController* InControlle
 	// Release any junction this vehicle may be occupying.
 	for (auto It = JunctionOccupancy.CreateIterator(); It; ++It)
 	{
-		if (It.Value().Get() == InController)
+		It.Value().RemoveAll([InController](const FJunctionOccupant& Occ)
+		{
+			return Occ.Controller.Get() == InController;
+		});
+		if (It.Value().Num() == 0)
 		{
 			It.RemoveCurrent();
 		}
@@ -445,34 +449,139 @@ ATrafficSignalController* UTrafficSubsystem::GetSignalForJunction(int32 Junction
 }
 
 // ---------------------------------------------------------------------------
-// Junction Occupancy
+// Road Speed Limits
 // ---------------------------------------------------------------------------
 
-bool UTrafficSubsystem::TryOccupyJunction(int32 JunctionId, ATrafficVehicleController* Controller)
+void UTrafficSubsystem::SetRoadSpeedLimit(int32 RoadHandleId, float SpeedLimit)
 {
-	if (JunctionId == 0 || !Controller) return true; // No junction — always OK.
-
-	TWeakObjectPtr<ATrafficVehicleController>& Occupant = JunctionOccupancy.FindOrAdd(JunctionId);
-	ATrafficVehicleController* Current = Occupant.Get();
-
-	if (!Current || Current == Controller)
+	if (RoadHandleId != 0 && SpeedLimit > 0.0f)
 	{
-		Occupant = Controller;
-		return true;
+		RoadSpeedLimits.Add(RoadHandleId, SpeedLimit);
+	}
+}
+
+float UTrafficSubsystem::GetRoadSpeedLimit(int32 RoadHandleId) const
+{
+	if (const float* Found = RoadSpeedLimits.Find(RoadHandleId))
+	{
+		return *Found;
+	}
+	return -1.0f;
+}
+
+// ---------------------------------------------------------------------------
+// Junction Occupancy — multi-vehicle with geometric conflict detection
+// ---------------------------------------------------------------------------
+
+bool UTrafficSubsystem::TryOccupyJunction(int32 JunctionId,
+	ATrafficVehicleController* Controller,
+	const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane)
+{
+	if (JunctionId == 0 || !Controller)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("JNCT TryOccupy: JunctionId=%d Controller=%s — trivial pass (no junction or no controller)"),
+			JunctionId, Controller ? TEXT("valid") : TEXT("NULL"));
+		return true; // No junction — always OK.
 	}
 
-	// Junction is occupied by another vehicle — do not override existing occupancy.
-	// Once granted, occupancy remains exclusive until the holder releases it.
-	return false;
+	const FString CallerName = (Controller && Controller->GetPawn())
+		? Controller->GetPawn()->GetName() : TEXT("NULL");
+
+	TArray<FJunctionOccupant>& Occupants = JunctionOccupancy.FindOrAdd(JunctionId);
+
+	// Purge stale entries (GC'd controllers).
+	Occupants.RemoveAll([](const FJunctionOccupant& O) { return !O.Controller.IsValid(); });
+
+	// Self-reentry: already occupying this junction — always OK.
+	for (const FJunctionOccupant& Occ : Occupants)
+	{
+		if (Occ.Controller.Get() == Controller)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JNCT TryOccupy: JunctionId=%d Caller='%s' — GRANTED (self-reentry)"),
+				JunctionId, *CallerName);
+			return true;
+		}
+	}
+
+	// Conflict test: check against every existing occupant.
+	ITrafficRoadProvider* Provider = GetProvider();
+	for (const FJunctionOccupant& Occ : Occupants)
+	{
+		if (!Occ.Controller.IsValid()) { continue; }
+
+		// If no provider or either occupant has invalid lane info, be conservative.
+		bool bConflict = true;
+		if (Provider && FromLane.IsValid() && ToLane.IsValid()
+			&& Occ.FromLane.IsValid() && Occ.ToLane.IsValid())
+		{
+			bConflict = Provider->DoJunctionPathsConflict(
+				FromLane, ToLane, Occ.FromLane, Occ.ToLane);
+		}
+
+		if (bConflict)
+		{
+			const FString OccName = (Occ.Controller.Get() && Occ.Controller.Get()->GetPawn())
+				? Occ.Controller.Get()->GetPawn()->GetName() : TEXT("STALE");
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JNCT TryOccupy: JunctionId=%d Caller='%s' CONFLICTS with '%s' "
+					 "(From=%d→To=%d vs From=%d→To=%d) — DENIED"),
+				JunctionId, *CallerName, *OccName,
+				FromLane.HandleId, ToLane.HandleId,
+				Occ.FromLane.HandleId, Occ.ToLane.HandleId);
+			return false;
+		}
+	}
+
+	// No conflicts — grant entry.
+	FJunctionOccupant NewOccupant;
+	NewOccupant.Controller = Controller;
+	NewOccupant.FromLane = FromLane;
+	NewOccupant.ToLane = ToLane;
+	Occupants.Add(NewOccupant);
+
+	UE_LOG(LogAAATraffic, Warning,
+		TEXT("JNCT TryOccupy: JunctionId=%d Caller='%s' From=%d To=%d — GRANTED (%d occupants now)"),
+		JunctionId, *CallerName, FromLane.HandleId, ToLane.HandleId, Occupants.Num());
+	return true;
 }
 
 void UTrafficSubsystem::ReleaseJunction(int32 JunctionId, ATrafficVehicleController* Controller)
 {
-	if (TWeakObjectPtr<ATrafficVehicleController>* Occupant = JunctionOccupancy.Find(JunctionId))
+	const FString CallerName = (Controller && Controller->GetPawn())
+		? Controller->GetPawn()->GetName() : TEXT("NULL");
+
+	if (TArray<FJunctionOccupant>* Occupants = JunctionOccupancy.Find(JunctionId))
 	{
-		if (Occupant->Get() == Controller)
+		const int32 Removed = Occupants->RemoveAll([Controller](const FJunctionOccupant& O)
 		{
-			JunctionOccupancy.Remove(JunctionId);
+			return O.Controller.Get() == Controller;
+		});
+
+		if (Removed > 0)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JNCT Release: JunctionId=%d Caller='%s' — RELEASED (%d remaining occupants)"),
+				JunctionId, *CallerName, Occupants->Num());
+
+			// Clean up empty junctions.
+			if (Occupants->Num() == 0)
+			{
+				JunctionOccupancy.Remove(JunctionId);
+			}
 		}
+		else
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JNCT Release: JunctionId=%d Caller='%s' — NOT FOUND in occupant list (already released?)"),
+				JunctionId, *CallerName);
+		}
+	}
+	else
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("JNCT Release: JunctionId=%d Caller='%s' — junction NOT in occupancy map"),
+			JunctionId, *CallerName);
 	}
 }
