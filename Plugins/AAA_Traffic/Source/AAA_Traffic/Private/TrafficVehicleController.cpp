@@ -463,22 +463,26 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 		}
 
 		// --- Compute front-bumper extent from actor bounds ---
-		// The bounding box forward half-length tells us how far the front
-		// bumper is from the actor origin along the forward axis.
-		// This adapts to any vehicle mesh — sedans, trucks, buses.
+		// Distance from actor origin to the front-most point of the
+		// bounding box along the forward axis.  Uses the AABB support
+		// function: for each world axis pick Max or Min depending on
+		// the sign of the forward vector, giving the corner that
+		// projects furthest forward.  This is orientation-correct
+		// regardless of which world axis the car faces at spawn.
 		{
 			const FBox ActorBounds = InPawn->GetComponentsBoundingBox(/*bNonColliding=*/ false);
 			if (ActorBounds.IsValid)
 			{
 				const FVector ActorOrigin = InPawn->GetActorLocation();
-				const FVector ActorForward = InPawn->GetActorForwardVector();
-				// Project bounding box extents onto the forward axis.
-				const FVector HalfExtents = ActorBounds.GetExtent();
-				// Use the box center-to-max projected onto forward direction.
-				// For a typical vehicle, the forward extent is roughly half the length.
-				const FVector BoxCenter = ActorBounds.GetCenter();
-				const FVector OriginToMax = ActorBounds.Max - ActorOrigin;
-				VehicleFrontExtent = FMath::Abs(FVector::DotProduct(OriginToMax, ActorForward));
+				const FVector Fwd = InPawn->GetActorForwardVector();
+
+				// Support point: the AABB corner furthest along Fwd.
+				FVector FrontCorner;
+				FrontCorner.X = (Fwd.X >= 0.0f) ? ActorBounds.Max.X : ActorBounds.Min.X;
+				FrontCorner.Y = (Fwd.Y >= 0.0f) ? ActorBounds.Max.Y : ActorBounds.Min.Y;
+				FrontCorner.Z = (Fwd.Z >= 0.0f) ? ActorBounds.Max.Z : ActorBounds.Min.Z;
+
+				VehicleFrontExtent = FVector::DotProduct(FrontCorner - ActorOrigin, Fwd);
 				// Clamp to reasonable range to handle edge cases.
 				VehicleFrontExtent = FMath::Clamp(VehicleFrontExtent, 50.0f, 1000.0f);
 			}
@@ -1374,7 +1378,10 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 			//   v_approach = sqrt(2 * decel * distToJunction)
 			// This is the maximum speed at which the vehicle can still stop
 			// before the junction using comfort deceleration.
-			const float SafeDist = FMath::Max(ApproachJunctionDistanceCm - ApproachSafetyMarginCm, 0.0f);
+			// Subtract VehicleFrontExtent so the front bumper (not actor
+			// origin) is the reference — matches the decel-curve offset
+			// in the bWaitingAtIntersection braking code.
+			const float SafeDist = FMath::Max(ApproachJunctionDistanceCm - ApproachSafetyMarginCm - VehicleFrontExtent, 0.0f);
 			ApproachSpeedLimitCmPerSec = FMath::Sqrt(
 				FMath::Max(2.0f * ApproachDecelCmPerSec2 * SafeDist, 0.0f));
 
