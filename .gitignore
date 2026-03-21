@@ -33,3 +33,8 @@ Thumbs.db
 # Never commit UE content in this repo (code-only plugin)
 *.uasset
 *.umap
+
+# Temp holding dir for old flat files
+_old_flat/
+
+_old_flat/

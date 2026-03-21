@@ -6,6 +6,13 @@
 #include "AIController.h"
 #include "DrawDebugHelpers.h"
 #include "TrafficRoadProvider.h"
+#include "SteeringComputer.h"
+#include "AccelerationModel.h"
+#include "SpeedEnvelope.h"
+#include "LeaderDetector.h"
+#include "LaneChangeCoordinator.h"
+#include "LaneTransitionEngine.h"
+#include "JunctionNegotiator.h"
 #include "TrafficVehicleController.generated.h"
 
 /**
@@ -167,6 +174,9 @@ class AAA_TRAFFIC_API ATrafficVehicleController : public AAIController
 	GENERATED_BODY()
 
 	friend class UTrafficSubsystem;
+	friend struct FLaneChangeCoordinator;
+	friend struct FLaneTransitionEngine;
+	friend struct FJunctionNegotiator;
 
 public:
 	ATrafficVehicleController();
@@ -246,6 +256,22 @@ private:
 	/** Feed throttle / steering / brake into the vehicle movement component. */
 	void UpdateVehicleInput(float DeltaSeconds);
 
+	/** Diagnostic ticking: delayed movement check, periodic state logging.
+	 *  Defined in TrafficVehicleController_Diagnostics.cpp. */
+	void TickDiagnostics(float DeltaSeconds);
+
+	/** In-world debug visualization for this vehicle.
+	 *  Defined in TrafficVehicleController_DebugDraw.cpp. */
+	void DrawVehicleDebug();
+
+	/** Intersection waiting logic: right-of-way, signal compliance, braking.
+	 *  Returns true if waiting (caller should return from UpdateVehicleInput).
+	 *  Defined in TrafficVehicleController_Waiting.cpp. */
+	bool TickIntersectionWaiting(float DeltaSeconds, float CurrentSpeed,
+		const FVector& VehicleLocation, const FVector& VehicleForward,
+		int32 ClosestIndex, float RemainingDist,
+		class UChaosWheeledVehicleMovementComponent* VehicleMovement);
+
 	/**
 	 * Find the index of the closest lane point to the given world position.
 	 * Uses a cached last-known index with bounded search for O(1) amortized performance.
@@ -281,31 +307,18 @@ private:
 	 */
 	float GetLeaderDistance(float& OutLeaderSpeed) const;
 
-	// ── Lane change ─────────────────────────────────────────
+	// ── Lane change (delegated to FLaneChangeCoordinator) ───
 
-	/**
-	 * Evaluate whether to begin a lane change (slow leader ahead, gap available).
-	 * Called every tick when LaneChangeState == None and cooldown has expired.
-	 */
-	void EvaluateLaneChange();
+	/** Lane-change coordinator: evaluate, blend, settle, finalize. */
+	FLaneChangeCoordinator LaneChangeCoord_;
 
-	/**
-	 * Advance the active lane-change blend.
-	 * Interpolates the steering target between source and target lane polylines.
-	 * Returns the blended look-ahead point for this frame.
-	 */
-	FVector UpdateLaneChangeBlend(const FVector& VehicleLocation, int32 ClosestIndex);
+	// ── Lane transitions (delegated to FLaneTransitionEngine) ───
 
-	/**
-	 * Complete a lane change: adopt target lane as current, reset state.
-	 */
-	void FinalizeLaneChange();
+	/** Lane-end transition engine: exit selection, init, junction curves. */
+	FLaneTransitionEngine TransitionEngine_;
 
-	/**
-	 * Abort a lane change: return to source lane, reset state.
-	 * Called when continuous gap check detects it's unsafe to continue.
-	 */
-	void AbortLaneChange();
+	/** Junction negotiator: approach, detection, occupy, release, traversal. */
+	FJunctionNegotiator JunctionNeg_;
 
 	/**
 	 * Pick a junction exit using the centralized surveyor table.
@@ -400,14 +413,6 @@ private:
 	/** Updates brake light state and broadcasts delegate if changed. */
 	void SetBrakeLights(bool bNewState);
 
-	// ── Lane pre-positioning state ──────────────────────────
-
-	/** Target lane handle for navigational lane change (pre-positioning before junction). */
-	FTrafficLaneHandle NavigationalTargetLane;
-
-	/** True when a navigational (junction pre-positioning) lane change is pending or active. */
-	bool bNavigationalLaneChange = false;
-
 	// ── Dead-end despawn state ──────────────────────────────
 
 	/** Countdown (seconds) before a vehicle stopped at a dead-end is
@@ -438,8 +443,8 @@ private:
 	/** Distance traveled by the vehicle this tick (computed once, consumed by blend). */
 	float DistanceThisTick;
 
-	/** Previous-tick heading cross product (CrossZ) for the steering derivative term. */
-	float PreviousHeadingCrossZ = 0.0f;
+	/** Steering computer — pure pursuit + CTE + feedforward + damping. */
+	FSteeringComputer SteeringComputer;
 
 	// ── Computed adaptive distances (set each tick in UpdateVehicleInput) ─
 	// These are derived from the time-based tuning properties × current speed.
@@ -460,29 +465,6 @@ private:
 
 	/** Frame counter for LOD-based tick gating. */
 	uint32 LODFrameCounter;
-
-	// ── Lane-change state ───────────────────────────────────
-
-	/** Current lane-change phase. */
-	ELaneChangeState LaneChangeState;
-
-	/** Handle to the target lane during an active lane change. */
-	FTrafficLaneHandle TargetLaneHandle;
-
-	/** Cached centerline of the target lane (for blending). */
-	TArray<FVector> TargetLanePoints;
-
-	/** Width of the target lane (cm). */
-	float TargetLaneWidth = 0.0f;
-
-	/** Progress of the lane-change blend (0 = source, 1 = target). */
-	float LaneChangeProgress = 0.0f;
-
-	/** Time remaining in the Completing settling phase (seconds). */
-	float LaneChangeSettleTimer = 0.0f;
-
-	/** Time remaining before another lane change can be considered (seconds). */
-	float LaneChangeCooldownRemaining = 0.0f;
 
 	/** Base target speed before lane speed-limit adjustments. */
 	float BaseTargetSpeed = 0.0f;
@@ -784,34 +766,19 @@ protected:
 
 	// ── IDM Runtime State ───────────────────────────────────
 
-	/** Per-vehicle personality multiplier for max acceleration (set in SetRandomSeed). */
-	float IDMPersonalityAccelScale = 1.0f;
+	/** IDM+ acceleration model — owns delay buffer, smoothing, personality. */
+	FAccelerationModel AccelModel;
 
-	/** Per-vehicle personality multiplier for comfortable decel (set in SetRandomSeed). */
-	float IDMPersonalityDecelScale = 1.0f;
+	/** Speed-cap stack — approach, intersection, curvature, zone anticipation. */
+	FSpeedEnvelope SpeedEnvelope_;
 
-	/** Per-vehicle personality multiplier for time headway (set in SetRandomSeed). */
-	float IDMPersonalityTimeHeadwayScale = 1.0f;
-
-	/** Smoothed IDM acceleration from previous tick (for exponential filter). */
-	float SmoothedIDMAccel = 0.0f;
+	/** Leader vehicle detector — polyline sweep + spatial grid + brake lights. */
+	FLeaderDetector LeaderDetector_;
 
 	/** Vehicle-specific maximum brake deceleration (cm/s²), computed from
 	 *  Chaos wheel MaxBrakeTorque and vehicle mass in OnPossess.
 	 *  Used for emergency braking normalization.  Fallback = 600 (~6 m/s²). */
 	float MaxBrakeDecelCmPerSec2 = 600.0f;
-
-	/** Ring-buffer of (Time, LeaderDist, LeaderSpeed) for reaction delay. */
-	struct FLeaderSample
-	{
-		float Time = 0.0f;
-		float Dist = -1.0f;
-		float Speed = 0.0f;
-	};
-	TArray<FLeaderSample> LeaderDelayBuffer;
-
-	/** Monotonic clock for indexing into the reaction-delay buffer. */
-	float IDMTimeClock = 0.0f;
 
 	/** True once a safety despawn has been requested. Prevents driving input
 	 *  and further despawn requests while the deferred destroy is pending. */

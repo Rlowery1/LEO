@@ -1,0 +1,131 @@
+// Copyright AAA_Traffic Contributors. All Rights Reserved.
+
+#include "SteeringComputer.h"
+
+// ---------------------------------------------------------------------------
+// FSteeringComputer::Compute
+// ---------------------------------------------------------------------------
+
+FSteeringOutput FSteeringComputer::Compute(const FSteeringInput& In)
+{
+	FSteeringOutput Out;
+
+	// ── Curvature feedforward ────────────────────────────────
+	// Compute local curvature from the active polyline.
+	if (In.JunctionCurvePoints.Num() > 0
+		&& In.JunctionCurveIndex > 0
+		&& In.JunctionCurveIndex < In.JunctionCurvePoints.Num())
+	{
+		Out.LocalCurvature = ComputeLocalCurvature(
+			In.JunctionCurvePoints, In.JunctionCurveIndex, In.CurveScanWindowSize);
+	}
+	else if (In.LanePoints.Num() >= 3)
+	{
+		Out.LocalCurvature = ComputeLocalCurvature(
+			In.LanePoints, In.ClosestIndex, In.CurveScanWindowSize);
+	}
+
+	// δ_ff = atan(Wheelbase × κ) / MaxSteerAngle
+	Out.FeedforwardTerm = FMath::Atan(In.WheelbaseCm * Out.LocalCurvature)
+		/ In.MaxSteerAngleRad;
+
+	// ── Pure pursuit ─────────────────────────────────────────
+	const FVector ToTargetVec = In.TargetPoint - In.VehicleLocation;
+	const float Ld = ToTargetVec.Size2D();
+	const FVector ToTargetDir = ToTargetVec.GetSafeNormal2D();
+	const FVector Forward2D = In.VehicleForward.GetSafeNormal2D();
+	const float CrossZ = FVector::CrossProduct(Forward2D, ToTargetDir).Z;
+
+	const float PurePursuitAngle = (Ld > KINDA_SMALL_NUMBER)
+		? FMath::Atan(2.0f * In.WheelbaseCm * CrossZ / Ld)
+		: 0.0f;
+	Out.PurePursuitTerm = PurePursuitAngle / In.MaxSteerAngleRad;
+
+	// ── Cross-track error (CTE) ──────────────────────────────
+	// Suppress CTE during junction curve following: the vehicle is
+	// intentionally off the new lane's centerline while executing the turn.
+	const bool bFollowingJunctionCurve = (In.JunctionCurvePoints.Num() > 0
+		&& In.JunctionCurveIndex < In.JunctionCurvePoints.Num() - 1);
+
+	if (!bFollowingJunctionCurve && In.LanePoints.Num() >= 2)
+	{
+		const int32 SegIdx = FMath::Clamp(In.ClosestIndex, 0, In.LanePoints.Num() - 2);
+		const FVector& SegA = In.LanePoints[SegIdx];
+		const FVector& SegB = In.LanePoints[SegIdx + 1];
+		const FVector SegDir = (SegB - SegA).GetSafeNormal2D();
+		if (!SegDir.IsNearlyZero())
+		{
+			const FVector VehicleToSeg = In.VehicleLocation - SegA;
+			Out.SignedCTE = FVector2D::CrossProduct(
+				FVector2D(SegDir), FVector2D(VehicleToSeg));
+		}
+	}
+
+	// CTE → steering correction via atan soft saturation.
+	Out.HalfLaneWidth = FMath::Max(In.EffectiveLaneWidth * 0.5f, 50.0f);
+	const float CTENormalized = Out.SignedCTE / Out.HalfLaneWidth;
+	Out.CTETerm = (In.CTECorrectionGain > KINDA_SMALL_NUMBER)
+		? FMath::Atan(In.CTECorrectionGain * CTENormalized) / In.MaxSteerAngleRad
+		: 0.0f;
+
+	// ── Derivative damping ───────────────────────────────────
+	const float CrossTrackDerivative = (In.DeltaSeconds > KINDA_SMALL_NUMBER)
+		? (CrossZ - PreviousHeadingCrossZ) / In.DeltaSeconds
+		: 0.0f;
+	PreviousHeadingCrossZ = CrossZ;
+
+	Out.DerivativeTerm = FMath::Clamp(
+		CrossTrackDerivative * In.SteeringDampingFactor * 0.016f,
+		-0.3f, 0.3f);
+
+	// ── Combine ──────────────────────────────────────────────
+	// CTE is SUBTRACTED — positive CTE (right of center) steers left.
+	Out.SteeringInput = FMath::Clamp(
+		Out.FeedforwardTerm + Out.PurePursuitTerm - Out.CTETerm + Out.DerivativeTerm,
+		-1.0f, 1.0f);
+
+	return Out;
+}
+
+// ---------------------------------------------------------------------------
+// FSteeringComputer::ComputeLocalCurvature
+// ---------------------------------------------------------------------------
+
+float FSteeringComputer::ComputeLocalCurvature(
+	TArrayView<const FVector> Points,
+	int32 CenterIndex,
+	int32 WindowSize)
+{
+	if (Points.Num() < 3) { return 0.0f; }
+
+	const int32 Spread = FMath::Max(WindowSize / 2, 1);
+	const int32 IdxA = FMath::Max(0, CenterIndex - Spread);
+	const int32 IdxC = FMath::Min(Points.Num() - 1, CenterIndex + Spread);
+	const int32 IdxB = FMath::Clamp(CenterIndex, IdxA + 1, IdxC - 1);
+
+	if (IdxA == IdxB || IdxB == IdxC) { return 0.0f; }
+
+	const FVector& A = Points[IdxA];
+	const FVector& B = Points[IdxB];
+	const FVector& C = Points[IdxC];
+
+	const float AB = FVector::Dist2D(A, B);
+	const float BC = FVector::Dist2D(B, C);
+	const float CA = FVector::Dist2D(C, A);
+	const float Denom = AB * BC * CA;
+
+	if (Denom < KINDA_SMALL_NUMBER) { return 0.0f; }
+
+	const float SignedArea2 = (B.X - A.X) * (C.Y - A.Y)
+		- (B.Y - A.Y) * (C.X - A.X);
+	return (2.0f * SignedArea2) / Denom;
+}
+
+// ---------------------------------------------------------------------------
+// FSteeringComputer::Reset
+// ---------------------------------------------------------------------------
+
+void FSteeringComputer::Reset()
+{
+	PreviousHeadingCrossZ = 0.0f;
+}
