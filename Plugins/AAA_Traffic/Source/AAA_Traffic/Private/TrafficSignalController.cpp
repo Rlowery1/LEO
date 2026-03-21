@@ -13,11 +13,14 @@ extern int32 GTrafficDebugDraw;
 extern int32 GTrafficJunctionDiagnostics;
 
 ATrafficSignalController::ATrafficSignalController()
-	: JunctionId(0)
+	: ControlMode(EJunctionControlMode::Signal)
+	, JunctionId(0)
 	, GreenDuration(15.0f)
 	, YellowDuration(3.0f)
 	, RedDuration(15.0f)
 	, PhaseOffset(0.0f)
+	, AllRedClearanceSec(2.0f)
+	, StopSignWaitTimeSec(2.0f)
 	, CurrentPhase(ETrafficSignalPhase::Red)
 	, PhaseTimer(0.0f)
 	, CurrentGroupIndex(0)
@@ -50,28 +53,44 @@ void ATrafficSignalController::BeginPlay()
 
 	// Apply phase offset: advance through complete cycles to determine starting phase.
 	// This allows staggering signals at nearby junctions.
-	float RemainingOffset = FMath::Max(PhaseOffset, 0.0f);
-	CurrentPhase = ETrafficSignalPhase::Green;
-	PhaseTimer = GreenDuration;
-
-	while (RemainingOffset > 0.0f)
+	// Only relevant for Signal mode — other modes don't cycle.
+	if (ControlMode == EJunctionControlMode::Signal)
 	{
-		if (RemainingOffset >= PhaseTimer)
+		float RemainingOffset = FMath::Max(PhaseOffset, 0.0f);
+		CurrentPhase = ETrafficSignalPhase::Green;
+		PhaseTimer = GreenDuration;
+
+		while (RemainingOffset > 0.0f)
 		{
-			RemainingOffset -= PhaseTimer;
-			PhaseTimer = 0.0f; // Reset before advancing so additive AdvancePhase works correctly.
-			AdvancePhase();
-		}
-		else
-		{
-			PhaseTimer -= RemainingOffset;
-			RemainingOffset = 0.0f;
+			if (RemainingOffset >= PhaseTimer)
+			{
+				RemainingOffset -= PhaseTimer;
+				PhaseTimer = 0.0f; // Reset before advancing so additive AdvancePhase works correctly.
+				AdvancePhase();
+			}
+			else
+			{
+				PhaseTimer -= RemainingOffset;
+				RemainingOffset = 0.0f;
+			}
 		}
 	}
+	else
+	{
+		// Non-signal modes stay permanently Red (IsLaneGreen returns false).
+		CurrentPhase = ETrafficSignalPhase::Red;
+		PhaseTimer = 0.0f;
+	}
+
+	const TCHAR* ModeStr =
+		ControlMode == EJunctionControlMode::Signal     ? TEXT("Signal") :
+		ControlMode == EJunctionControlMode::StopSign    ? TEXT("StopSign") :
+		ControlMode == EJunctionControlMode::Yield       ? TEXT("Yield") :
+		ControlMode == EJunctionControlMode::FlashingRed ? TEXT("FlashingRed") : TEXT("Unknown");
 
 	UE_LOG(LogAAATraffic, Log,
-		TEXT("TrafficSignalController '%s': Registered for junction %d — starting phase: %s (%.1fs remaining)."),
-		*GetName(), JunctionId,
+		TEXT("TrafficSignalController '%s': Registered for junction %d — mode: %s, starting phase: %s (%.1fs remaining)."),
+		*GetName(), JunctionId, ModeStr,
 		CurrentPhase == ETrafficSignalPhase::Green ? TEXT("Green") :
 		CurrentPhase == ETrafficSignalPhase::Yellow ? TEXT("Yellow") : TEXT("Red"),
 		PhaseTimer);
@@ -97,28 +116,49 @@ void ATrafficSignalController::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
-	PhaseTimer -= DeltaSeconds;
-
-	while (PhaseTimer <= 0.0f)
+	// Only cycle phases for Signal mode. StopSign/Yield/FlashingRed are static.
+	if (ControlMode == EJunctionControlMode::Signal)
 	{
-		AdvancePhase();
+		PhaseTimer -= DeltaSeconds;
+
+		while (PhaseTimer <= 0.0f)
+		{
+			AdvancePhase();
+		}
 	}
 
 #if ENABLE_DRAW_DEBUG
 	if (bDebugDrawSignal || GTrafficDebugDraw != 0)
 	{
 		FColor PhaseColor = FColor::Red;
-		if (CurrentPhase == ETrafficSignalPhase::Green) { PhaseColor = FColor::Green; }
-		else if (CurrentPhase == ETrafficSignalPhase::Yellow) { PhaseColor = FColor::Yellow; }
+		FString ModeLabel;
+		if (ControlMode == EJunctionControlMode::Signal)
+		{
+			if (CurrentPhase == ETrafficSignalPhase::Green) { PhaseColor = FColor::Green; }
+			else if (CurrentPhase == ETrafficSignalPhase::Yellow) { PhaseColor = FColor::Yellow; }
+			ModeLabel = CurrentPhase == ETrafficSignalPhase::Green ? TEXT("G") :
+				CurrentPhase == ETrafficSignalPhase::Yellow ? TEXT("Y") : TEXT("R");
+		}
+		else if (ControlMode == EJunctionControlMode::StopSign)
+		{
+			PhaseColor = FColor::Red;
+			ModeLabel = TEXT("STOP");
+		}
+		else if (ControlMode == EJunctionControlMode::Yield)
+		{
+			PhaseColor = FColor::Orange;
+			ModeLabel = TEXT("YIELD");
+		}
+		else // FlashingRed
+		{
+			PhaseColor = FColor::Red;
+			ModeLabel = TEXT("FLASH");
+		}
 
 		DrawDebugSphere(GetWorld(), GetActorLocation() + FVector(0, 0, 200), 80.0f, 8, PhaseColor, false, -1.0f, 0, 3.0f);
 
-		// Draw the junction ID as text above the sphere.
 		DrawDebugString(GetWorld(), GetActorLocation() + FVector(0, 0, 350),
-			FString::Printf(TEXT("J%d %s %.1fs"), JunctionId,
-				CurrentPhase == ETrafficSignalPhase::Green ? TEXT("G") :
-				CurrentPhase == ETrafficSignalPhase::Yellow ? TEXT("Y") : TEXT("R"),
-				PhaseTimer),
+			FString::Printf(TEXT("J%d %s"), JunctionId, *ModeLabel),
 			nullptr, PhaseColor, 0.0f, false);
 	}
 #endif
@@ -142,11 +182,12 @@ void ATrafficSignalController::AdvancePhase()
 
 	case ETrafficSignalPhase::Yellow:
 		CurrentPhase = ETrafficSignalPhase::Red;
-		// Multi-group signals: use a brief all-red clearance interval (2s)
-		// instead of the full RedDuration. The "red" for one group IS the
-		// green for the next group. Legacy (single-group) keeps full RedDuration.
+		// Multi-group signals: use the designer-tunable all-red clearance
+		// interval instead of the full RedDuration. The "red" for one group
+		// IS the green for the next group. Legacy (single-group) keeps
+		// full RedDuration.
 		PhaseTimer += (PhaseGroups.Num() > 1)
-			? FMath::Min(RedDuration, 2.0f)
+			? FMath::Min(RedDuration, AllRedClearanceSec)
 			: RedDuration;
 		break;
 
@@ -157,7 +198,16 @@ void ATrafficSignalController::AdvancePhase()
 			CurrentGroupIndex = (CurrentGroupIndex + 1) % PhaseGroups.Num();
 		}
 		CurrentPhase = ETrafficSignalPhase::Green;
-		PhaseTimer += GreenDuration;
+		// Use per-group duration if set, otherwise fall back to controller default.
+		{
+			float GroupGreen = GreenDuration;
+			if (PhaseGroups.IsValidIndex(CurrentGroupIndex)
+				&& PhaseGroups[CurrentGroupIndex].GroupGreenDuration > 0.0f)
+			{
+				GroupGreen = PhaseGroups[CurrentGroupIndex].GroupGreenDuration;
+			}
+			PhaseTimer += GroupGreen;
+		}
 		break;
 	}
 
@@ -177,6 +227,18 @@ void ATrafficSignalController::AdvancePhase()
 bool ATrafficSignalController::IsLaneGreen(const FTrafficLaneHandle& Lane) const
 {
 	const bool bShouldLog = (GTrafficJunctionDiagnostics >= 2);
+
+	// Non-Signal modes always return false — vehicles must stop or yield.
+	if (ControlMode != EJunctionControlMode::Signal)
+	{
+		if (bShouldLog)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("SIGNAL IsLaneGreen: Signal='%s' Lane=%d ControlMode=%d — returning RED (non-Signal mode)"),
+				*GetName(), Lane.HandleId, static_cast<int32>(ControlMode));
+		}
+		return false;
+	}
 
 	// Legacy mode: no phase groups configured — all lanes share the same phase.
 	if (PhaseGroups.Num() == 0)
@@ -238,6 +300,24 @@ bool ATrafficSignalController::IsLaneGreen(const FTrafficLaneHandle& Lane) const
 		UE_LOG(LogAAATraffic, Log,
 				TEXT("SIGNAL IsLaneGreen: Signal='%s' Lane=%d GroupIndex=%d GreenLaneCount=%d — NOT in green group"),
 			*GetName(), Lane.HandleId, CurrentGroupIndex, ActiveGroup.GreenLanes.Num());
+	}
+	return false;
+}
+
+bool ATrafficSignalController::IsLaneProtectedGreen(const FTrafficLaneHandle& Lane) const
+{
+	// Must be in Signal mode with phase groups and currently Green.
+	if (ControlMode != EJunctionControlMode::Signal) { return false; }
+	if (PhaseGroups.Num() == 0) { return false; }
+	if (CurrentPhase != ETrafficSignalPhase::Green) { return false; }
+	if (!PhaseGroups.IsValidIndex(CurrentGroupIndex)) { return false; }
+
+	const FSignalPhaseGroup& ActiveGroup = PhaseGroups[CurrentGroupIndex];
+	if (!ActiveGroup.bIsProtectedArrow) { return false; }
+
+	for (const FTrafficLaneHandle& GreenLane : ActiveGroup.GreenLanes)
+	{
+		if (GreenLane == Lane) { return true; }
 	}
 	return false;
 }

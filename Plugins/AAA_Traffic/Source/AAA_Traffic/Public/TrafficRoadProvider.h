@@ -150,6 +150,13 @@ public:
 	virtual bool GetJunctionCentroid(int32 JunctionId, FVector& OutCentroid) { return false; }
 
 	/**
+	 * Get all lane handles that belong to a given junction.
+	 * Returns handles for every lane whose GetJunctionForLane() == JunctionId.
+	 * Used to discover cross-road turn options at intersections.
+	 */
+	virtual TArray<FTrafficLaneHandle> GetLanesForJunction(int32 JunctionId) { return {}; }
+
+	/**
 	 * Get a smooth path through a junction between two connected lanes.
 	 * Fills OutPath with a series of world-space points representing the junction trajectory.
 	 * Returns true if a path was generated, false otherwise (caller should fall back to straight-line).
@@ -197,6 +204,56 @@ public:
 	 * Returns 0.0 if the lane is unknown.
 	 */
 	virtual float GetLaneLength(const FTrafficLaneHandle& Lane) { return 0.0f; }
+
+	/**
+	 * Get the traffic flow direction at a specific distance along a lane.
+	 * Returns a unit tangent vector at the given parametric position.
+	 * More accurate than GetLaneDirection() which returns a single chord
+	 * for the entire lane (start-to-end), losing all curvature information.
+	 *
+	 * Default implementation derives the tangent from the polyline: fetches
+	 * the lane path and finds the segment at the requested distance.
+	 *
+	 * @param Lane      Handle to the lane.
+	 * @param Distance  Distance along the lane centerline (cm) from the start.
+	 * @return Unit direction vector at that position.
+	 */
+	virtual FVector GetLaneDirectionAtDistance(const FTrafficLaneHandle& Lane, float Distance);
+
+	/**
+	 * Get the lane width at a specific distance along a lane (cm).
+	 * Adapters with variable-width data (e.g. tapered lanes, turn pockets)
+	 * should override this.  Default returns the uniform width from GetLanePath.
+	 *
+	 * @param Lane      Handle to the lane.
+	 * @param Distance  Distance along the lane centerline (cm) from the start.
+	 * @return Lane width in cm at that position.
+	 */
+	virtual float GetLaneWidthAtDistance(const FTrafficLaneHandle& Lane, float Distance);
+
+	/**
+	 * Get the curvature (1/radius, in 1/cm) at a specific distance along a lane.
+	 * Positive = turning left, negative = turning right (following right-hand rule Z-up).
+	 * Adapters with native curvature or turn-radius data should override this.
+	 * Default returns 0.0 (straight).
+	 *
+	 * @param Lane      Handle to the lane.
+	 * @param Distance  Distance along the lane centerline (cm) from the start.
+	 * @return Signed curvature in 1/cm.
+	 */
+	virtual float GetLaneCurvatureAtDistance(const FTrafficLaneHandle& Lane, float Distance) { return 0.0f; }
+
+	/**
+	 * Get the true arc length of a lane (cm) from the road kit's native curve.
+	 * Unlike GetLaneLength() which sums polyline segments (and may under-report
+	 * on curves due to chord approximation), this returns the analytical or
+	 * high-resolution arc length when available.
+	 * Default falls back to GetLaneLength().
+	 *
+	 * @param Lane  Handle to the lane.
+	 * @return Arc length in cm.
+	 */
+	virtual float GetLaneArcLength(const FTrafficLaneHandle& Lane) { return GetLaneLength(Lane); }
 
 	/**
 	 * Result of a multi-hop junction scan ahead of a given lane.

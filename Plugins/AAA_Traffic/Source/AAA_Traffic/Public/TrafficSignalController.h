@@ -24,6 +24,25 @@ enum class ETrafficSignalPhase : uint8
 };
 
 /**
+ * How a junction is controlled.
+ * Selected per-controller via the ControlMode dropdown in the Details panel.
+ * Auto-placed signals get a heuristic default based on approach road count
+ * (4+ = Signal, 3 = StopSign, 2 = Yield).
+ */
+UENUM(BlueprintType)
+enum class EJunctionControlMode : uint8
+{
+	/** Full traffic light cycling (Green → Yellow → Red per phase group). */
+	Signal,
+	/** All-way stop: vehicles must come to a full stop, wait, then proceed when clear. */
+	StopSign,
+	/** Yield: vehicles slow down and proceed without full stop if the junction is clear. */
+	Yield,
+	/** Flashing red on all approaches — treated as an all-way stop. */
+	FlashingRed
+};
+
+/**
  * A group of lanes that share a green phase in a multi-phase signal.
  * For a simple 4-way intersection, you might have 2 groups: one for N/S lanes
  * and one for E/W lanes.
@@ -43,6 +62,21 @@ struct FSignalPhaseGroup
 	/** Lanes that receive green during this group's phase. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal")
 	TArray<FTrafficLaneHandle> GreenLanes;
+
+	/**
+	 * Per-group green duration override (seconds).
+	 * 0 = use the controller's default GreenDuration.
+	 * Set shorter (e.g. 8-12s) for protected left-turn phases.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal", meta = (ClampMin = "0"))
+	float GroupGreenDuration = 0.0f;
+
+	/**
+	 * True when this phase group is a protected arrow (e.g. left-turn arrow).
+	 * Vehicles in a protected-arrow phase do NOT yield to oncoming traffic.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal")
+	bool bIsProtectedArrow = false;
 };
 
 /**
@@ -81,13 +115,41 @@ public:
 
 	/**
 	 * Check if a given lane has a green signal right now.
-	 * When PhaseGroups are configured, checks if the lane is in the current green group.
-	 * When PhaseGroups is empty (legacy mode), returns true if the whole signal is green.
+	 * When ControlMode is Signal: checks phase groups or legacy phase.
+	 * When ControlMode is StopSign/FlashingRed: always returns false (vehicles must stop).
+	 * When ControlMode is Yield: always returns false (vehicles must slow/check occupancy).
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Traffic|Signal")
 	bool IsLaneGreen(const FTrafficLaneHandle& Lane) const;
 
+	/**
+	 * Check if a given lane has a protected green arrow right now.
+	 * Returns true only when the lane is green AND its phase group has bIsProtectedArrow set.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Traffic|Signal")
+	bool IsLaneProtectedGreen(const FTrafficLaneHandle& Lane) const;
+
+	/**
+	 * Get the control mode for this junction controller.
+	 * Vehicles use this to decide stop-sign vs yield vs signal behavior.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Traffic|Signal")
+	EJunctionControlMode GetControlMode() const { return ControlMode; }
+
 	// --- Configuration ---
+
+	/**
+	 * How this junction is controlled. Determines vehicle behavior on approach:
+	 * - Signal: full green/yellow/red cycling
+	 * - StopSign: full stop required, wait StopSignWaitTimeSec, then proceed when clear
+	 * - Yield: slow approach, proceed without stopping if clear
+	 * - FlashingRed: treated as all-way stop
+	 *
+	 * Auto-placed controllers get a heuristic default. Change in the Details panel
+	 * to override any junction.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal")
+	EJunctionControlMode ControlMode;
 
 	/** The junction identifier this signal controls (must match the road provider's junction IDs). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal")
@@ -110,6 +172,16 @@ public:
 	float PhaseOffset;
 
 	/**
+	 * All-red clearance interval (seconds) for multi-group signals.
+	 * After Yellow, ALL directions stay Red for this duration before the
+	 * next group gets Green. Must be long enough for vehicles already in
+	 * the intersection to clear. Auto-placed signals derive this from
+	 * junction crossing distance; manual overrides are respected.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal", meta = (ClampMin = "1.0", ClampMax = "10.0"))
+	float AllRedClearanceSec;
+
+	/**
 	 * Optional multi-phase groups. Each group defines a set of lanes that get green
 	 * simultaneously. The signal cycles through groups in order:
 	 *   Group0 Green → Yellow → Red(all-red gap) → Group1 Green → Yellow → ...
@@ -118,6 +190,13 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal")
 	TArray<FSignalPhaseGroup> PhaseGroups;
+
+	/**
+	 * Time (seconds) vehicles must wait at a full stop before proceeding
+	 * (StopSign and FlashingRed control modes only). Default 2.0s.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal", meta = (ClampMin = "0.5", EditCondition = "ControlMode == EJunctionControlMode::StopSign || ControlMode == EJunctionControlMode::FlashingRed"))
+	float StopSignWaitTimeSec;
 
 	/** When true (non-Shipping builds), draws a sphere at this signal's location colored by the current phase. Has no effect in Shipping. */
 	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")

@@ -50,6 +50,7 @@ public:
 	virtual float GetLaneSpeedLimit(const FTrafficLaneHandle& Lane) override;
 	virtual int32 GetJunctionForLane(const FTrafficLaneHandle& Lane) override;
 	virtual bool GetJunctionCentroid(int32 JunctionId, FVector& OutCentroid) override;
+	virtual TArray<FTrafficLaneHandle> GetLanesForJunction(int32 JunctionId) override;
 	virtual bool GetJunctionPath(const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane, TArray<FVector>& OutPath) override;
 	virtual bool IsLaneReversed(const FTrafficLaneHandle& Lane) override;
 	virtual bool GetIntersectionEntryPoint(const FTrafficLaneHandle& ApproachLane, FVector& OutPoint) override;
@@ -57,11 +58,20 @@ public:
 		const FTrafficLaneHandle& FromA, const FTrafficLaneHandle& ToA,
 		const FTrafficLaneHandle& FromB, const FTrafficLaneHandle& ToB) override;
 	virtual float GetLaneLength(const FTrafficLaneHandle& Lane) override;
+	virtual FVector GetLaneDirectionAtDistance(const FTrafficLaneHandle& Lane, float Distance) override;
+	virtual float GetLaneWidthAtDistance(const FTrafficLaneHandle& Lane, float Distance) override;
+	virtual float GetLaneCurvatureAtDistance(const FTrafficLaneHandle& Lane, float Distance) override;
+	virtual float GetLaneArcLength(const FTrafficLaneHandle& Lane) override;
 	virtual FJunctionScanResult GetDistanceToNextJunction(
 		const FTrafficLaneHandle& StartLane,
 		float RemainingDistOnCurrentLane,
 		float MaxSearchDistCm = 50000.0f,
 		int32 MaxHops = 10) override;
+
+	/** Update classified speed tiers and rebuild RoadClassifiedSpeedLimits.
+	 *  Called by TrafficSpawner after provider is ready, before spawning vehicles.
+	 *  Values are in cm/s. */
+	void SetSpeedTiers(float InResidentialSpeed, float InUrbanSpeed, float InHighwaySpeed);
 
 private:
 	// ── Data caching ────────────────────────────────────────
@@ -78,6 +88,11 @@ private:
 
 	/** Cache start/end positions and directions for every lane. Called after CacheRoadData. */
 	void CacheLaneEndpoints();
+
+	/** Rebuild RoadClassifiedSpeedLimits from lane count + geometry.
+	 *  Called by CacheLaneEndpoints and SetSpeedTiers.
+	 *  Caps each road's speed at the physics-safe limit for its tightest curve. */
+	void RebuildRoadSpeedClassification();
 
 	/** Detect through-roads (lanes that pass through an intersection without being split)
 	 *  and create virtual lane segments so vehicles can exit/enter at the intersection. */
@@ -108,20 +123,11 @@ private:
 	/** Detect lanes whose travel direction is reversed (left-of-center on 2-way roads). */
 	void DetectReversedLanes();
 
-	/** Diagnostic: dump all RoadNetworkCorner data to the log so we can see what RoadBLD actually provides. */
-	void DumpCornerDiagnostics(UWorld* World);
-
 	/** Trigger RoadBLD incremental rebuild and dump diagnostic arrays (pre/post).
 	 *  Separated from BuildLaneConnectivity to keep connectivity logic focused. */
 	void TriggerRoadBLDRebuildAndDiagnostics(UWorld* World, AActor* NetworkActor);
 
 	// ── Reflection helpers ──────────────────────────────────
-
-	/**
-	 * Call a UFUNCTION on a UObject via ProcessEvent, with typed parameters.
-	 * Caller supplies a pre-zeroed param struct sized to Func->ParmsSize.
-	 */
-	static void CallReflection(UObject* Target, UFunction* Func, void* Params);
 
 	/**
 	 * Get the road length (double) from a DynamicRoad actor.
@@ -263,6 +269,9 @@ private:
 	/** Junction ID → centroid world position (for junction path generation). */
 	TMap<int32, FVector> JunctionCentroids;
 
+	/** Junction ID → list of lane handle IDs belonging to that junction (reverse of LaneToJunctionMap). */
+	TMap<int32, TArray<int32>> JunctionToLanesMap;
+
 	/** Lane handles whose travel direction is reversed relative to reference line. */
 	TSet<int32> ReversedLaneSet;
 
@@ -302,6 +311,17 @@ private:
 
 	/** Road handle ID → total road width (sum of all lane widths on that road, in cm). */
 	TMap<int32, float> RoadTotalWidthMap;
+
+	/** Road handle ID → classified speed limit (cm/s), computed from lane count.
+	 *  1-2 lanes = residential (1118 cm/s ≈ 25 mph)
+	 *  3-4 lanes = urban (2012 cm/s ≈ 45 mph)
+	 *  5+ lanes  = highway (2906 cm/s ≈ 65 mph) */
+	TMap<int32, float> RoadClassifiedSpeedLimits;
+
+	/** Configurable speed tiers (cm/s) — updated via SetSpeedTiers(). */
+	float ConfiguredResidentialSpeed = 1118.0f;
+	float ConfiguredUrbanSpeed = 2012.0f;
+	float ConfiguredHighwaySpeed = 2906.0f;
 
 	// ── Precomputed full-network junction map (built once at startup) ──
 
@@ -348,7 +368,4 @@ private:
 
 	/** Lane class LaneWidth property. */
 	FProperty* LaneWidthProp = nullptr;
-
-	/** FRoadNetworkCorner::IntersectionPoint property. */
-	FProperty* IntersectionPointProp = nullptr;
 };
