@@ -14,8 +14,6 @@ public class AAA_Traffic : ModuleRules
 				"Core",
 				"CoreUObject",
 				"Engine",
-				"InputCore",
-				"EnhancedInput",
 				"AIModule",
 				"ChaosVehicles"
 			}

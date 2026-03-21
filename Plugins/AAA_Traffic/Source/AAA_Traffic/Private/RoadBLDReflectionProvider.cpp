@@ -348,6 +348,14 @@ bool URoadBLDReflectionProvider::GetLanePath(
 	if (!bCanDoEdgeSampling)
 	{
 		static TSet<int32> LoggedLanes;
+		static TWeakObjectPtr<UWorld> LoggedLanesWorld;
+		// Clear on new PIE session so diagnostics re-fire for fresh play.
+		UWorld* CurrentWorld = GetWorld();
+		if (!LoggedLanesWorld.IsValid() || LoggedLanesWorld.Get() != CurrentWorld)
+		{
+			LoggedLanes.Empty();
+			LoggedLanesWorld = CurrentWorld;
+		}
 		if (!LoggedLanes.Contains(Lane.HandleId))
 		{
 			LoggedLanes.Add(Lane.HandleId);
@@ -402,16 +410,18 @@ bool URoadBLDReflectionProvider::GetLanePath(
 
 FVector URoadBLDReflectionProvider::GetLaneDirection(const FTrafficLaneHandle& Lane)
 {
-	// Virtual or cached endpoint — use cached endpoint data.
+	// Return the tangent at the START of the lane (first segment direction),
+	// not the start-to-end chord.  The chord loses all curvature information
+	// on curved roads — a 180° loop road would return a near-zero vector.
 	if (const FLaneEndpointCache* Cached = LaneEndpointMap.Find(Lane.HandleId))
 	{
-		return (Cached->EndPos - Cached->StartPos).GetSafeNormal();
+		return Cached->StartDir;
 	}
 	TArray<FVector> Points;
 	float Width;
 	if (GetLanePath(Lane, Points, Width) && Points.Num() >= 2)
 	{
-		return (Points.Last() - Points[0]).GetSafeNormal();
+		return (Points[1] - Points[0]).GetSafeNormal();
 	}
 	return FVector::ForwardVector;
 }
@@ -1036,30 +1046,200 @@ void URoadBLDReflectionProvider::TriggerRoadBLDRebuildAndDiagnostics(UWorld* Wor
 		}
 	}
 
-	// ── Post-rebuild dump: check all arrays again ───────────────
+	// ── UNCONDITIONAL post-rebuild array inventory ─────────────
+	// Always log the count of every corner-related array so we know
+	// exactly where CornerBuilder stored its data.  This is the single
+	// source of truth for diagnosing "0 cross-road connections."
+	{
+		UE_LOG(LogAAATraffic, Log, TEXT("===== POST-REBUILD CORNER ARRAY INVENTORY ====="));
+
+		// 1. RoadNetworkCorners
+		FArrayProperty* CornersArr = CastField<FArrayProperty>(
+			DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkCorners")));
+		int32 NC = 0;
+		if (CornersArr)
+		{
+			FScriptArrayHelper H(CornersArr, CornersArr->ContainerPtrToValuePtr<void>(NetworkActor));
+			NC = H.Num();
+		}
+		UE_LOG(LogAAATraffic, Log, TEXT("  RoadNetworkCorners: %s (%d entries)"),
+			CornersArr ? TEXT("found") : TEXT("NOT FOUND"), NC);
+
+		// 2. CornerEditData
+		FArrayProperty* EditArr = CastField<FArrayProperty>(
+			DynNetworkClass->FindPropertyByName(TEXT("CornerEditData")));
+		int32 NE = 0;
+		if (EditArr)
+		{
+			FScriptArrayHelper H(EditArr, EditArr->ContainerPtrToValuePtr<void>(NetworkActor));
+			NE = H.Num();
+		}
+		UE_LOG(LogAAATraffic, Log, TEXT("  CornerEditData:     %s (%d entries)"),
+			EditArr ? TEXT("found") : TEXT("NOT FOUND"), NE);
+
+		// 3. IntersectionMasks
+		FArrayProperty* MasksArr = CastField<FArrayProperty>(
+			DynNetworkClass->FindPropertyByName(TEXT("IntersectionMasks")));
+		int32 NM = 0;
+		if (MasksArr)
+		{
+			FScriptArrayHelper H(MasksArr, MasksArr->ContainerPtrToValuePtr<void>(NetworkActor));
+			NM = H.Num();
+		}
+		UE_LOG(LogAAATraffic, Log, TEXT("  IntersectionMasks:  %s (%d entries)"),
+			MasksArr ? TEXT("found") : TEXT("NOT FOUND"), NM);
+
+		// 4. RoadNetworkPerimeterCuts
+		FArrayProperty* CutsArr = CastField<FArrayProperty>(
+			DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkPerimeterCuts")));
+		int32 NP = 0;
+		if (CutsArr)
+		{
+			FScriptArrayHelper H(CutsArr, CutsArr->ContainerPtrToValuePtr<void>(NetworkActor));
+			NP = H.Num();
+		}
+		UE_LOG(LogAAATraffic, Log, TEXT("  PerimeterCuts:      %s (%d entries)"),
+			CutsArr ? TEXT("found") : TEXT("NOT FOUND"), NP);
+
+		// 5. Enumerate ALL TArray properties on DynNetworkClass that
+		//    contain "Corner" or "Edge" in their name — catches any
+		//    array we haven't thought of yet.
+		UE_LOG(LogAAATraffic, Log, TEXT("  -- All array properties on %s containing 'Corner' or 'Edge':"),
+			*DynNetworkClass->GetName());
+		for (TFieldIterator<FArrayProperty> It(DynNetworkClass); It; ++It)
+		{
+			FString PropName = It->GetName();
+			if (PropName.Contains(TEXT("Corner")) || PropName.Contains(TEXT("Edge")))
+			{
+				FScriptArrayHelper H(*It, It->ContainerPtrToValuePtr<void>(NetworkActor));
+				UE_LOG(LogAAATraffic, Log, TEXT("     %s: %d entries"), *PropName, H.Num());
+			}
+		}
+
+		// 6. Enumerate ALL UFunctions on DynNetworkClass that contain
+		//    "Corner" — shows what API is available.
+		UE_LOG(LogAAATraffic, Log, TEXT("  -- All UFunctions containing 'Corner':"));
+		for (TFieldIterator<UFunction> It(DynNetworkClass); It; ++It)
+		{
+			FString FuncName = It->GetName();
+			if (FuncName.Contains(TEXT("Corner")))
+			{
+				UE_LOG(LogAAATraffic, Log, TEXT("     %s"), *FuncName);
+			}
+		}
+
+		// 7. PerimeterCuts corner-index dump: if cuts reference corners
+		//    by index, show which indices they use.
+		if (CutsArr && NP > 0)
+		{
+			FStructProperty* SP = CastField<FStructProperty>(CutsArr->Inner);
+			if (SP)
+			{
+				UScriptStruct* CS = SP->Struct;
+				FIntProperty* LCIProp = CastField<FIntProperty>(CS->FindPropertyByName(TEXT("LeftCornerIndex")));
+				FIntProperty* RCIProp = CastField<FIntProperty>(CS->FindPropertyByName(TEXT("RightCornerIndex")));
+				FProperty* PRoadProp = CS->FindPropertyByName(TEXT("ParentRoad"));
+				FObjectPropertyBase* PRoadObj = CastField<FObjectPropertyBase>(PRoadProp);
+				FProperty* DistProp = CS->FindPropertyByName(TEXT("Distance"));
+				FScriptArrayHelper CutsHelper(CutsArr, CutsArr->ContainerPtrToValuePtr<void>(NetworkActor));
+				for (int32 i = 0; i < CutsHelper.Num(); ++i)
+				{
+					const uint8* Ptr = CutsHelper.GetRawPtr(i);
+					int32 LCI = LCIProp ? LCIProp->GetPropertyValue_InContainer(Ptr) : -999;
+					int32 RCI = RCIProp ? RCIProp->GetPropertyValue_InContainer(Ptr) : -999;
+					UObject* PR = PRoadObj ? PRoadObj->GetObjectPropertyValue_InContainer(Ptr) : nullptr;
+					double Dist = 0;
+					if (FDoubleProperty* DP = CastField<FDoubleProperty>(DistProp)) { Dist = DP->GetPropertyValue_InContainer(Ptr); }
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("  PerimeterCut[%d]: LeftCorner=%d RightCorner=%d Dist=%.1f Road=%s"),
+						i, LCI, RCI, Dist, PR ? *PR->GetName() : TEXT("NULL"));
+				}
+			}
+		}
+
+		// 8. If RoadNetworkCorners has entries, dump their StartEdge/EndEdge
+		if (CornersArr && NC > 0)
+		{
+			FStructProperty* SP = CastField<FStructProperty>(CornersArr->Inner);
+			if (SP)
+			{
+				UScriptStruct* CS = SP->Struct;
+				FObjectPropertyBase* SEProp = CastField<FObjectPropertyBase>(CS->FindPropertyByName(TEXT("StartEdge")));
+				FObjectPropertyBase* EEProp = CastField<FObjectPropertyBase>(CS->FindPropertyByName(TEXT("EndEdge")));
+				FBoolProperty* StaleProp = CastField<FBoolProperty>(CS->FindPropertyByName(TEXT("bStale")));
+				FScriptArrayHelper CornersHelper(CornersArr, CornersArr->ContainerPtrToValuePtr<void>(NetworkActor));
+				for (int32 i = 0; i < CornersHelper.Num(); ++i)
+				{
+					const uint8* Ptr = CornersHelper.GetRawPtr(i);
+					UObject* SE = SEProp ? SEProp->GetObjectPropertyValue_InContainer(Ptr) : nullptr;
+					UObject* EE = EEProp ? EEProp->GetObjectPropertyValue_InContainer(Ptr) : nullptr;
+					bool bStale = StaleProp ? StaleProp->GetPropertyValue_InContainer(Ptr) : false;
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("  Corner[%d]: StartEdge=%s EndEdge=%s Stale=%s"),
+						i,
+						SE ? *SE->GetName() : TEXT("NULL"),
+						EE ? *EE->GetName() : TEXT("NULL"),
+						bStale ? TEXT("YES") : TEXT("no"));
+				}
+			}
+		}
+
+		// 9. Edge-walking probe: call GetNextCornerConnection on the
+		//    first edge with detailed return-value logging.
+		UFunction* ProbeFunc = DynNetworkClass->FindFunctionByName(TEXT("GetNextCornerConnection"));
+		if (ProbeFunc)
+		{
+			// Find the first valid edge from the first road.
+			UObject* ProbeEdge = nullptr;
+			for (auto& Pair : RoadHandleMap)
+			{
+				UObject* RoadObj = Pair.Value.Get();
+				if (!RoadObj) { continue; }
+				FArrayProperty* ECProp = CastField<FArrayProperty>(
+					RoadObj->GetClass()->FindPropertyByName(TEXT("EdgeCurves")));
+				if (!ECProp) { continue; }
+				FScriptArrayHelper EH(ECProp, ECProp->ContainerPtrToValuePtr<void>(RoadObj));
+				FObjectPropertyBase* InnerObj = CastField<FObjectPropertyBase>(ECProp->Inner);
+				if (!InnerObj) { continue; }
+				for (int32 e = 0; e < EH.Num(); ++e)
+				{
+					UObject* E = InnerObj->GetObjectPropertyValue(EH.GetRawPtr(e));
+					if (E) { ProbeEdge = E; break; }
+				}
+				if (ProbeEdge) { break; }
+			}
+
+			if (ProbeEdge)
+			{
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("  Edge-walk probe: calling GetNextCornerConnection(Edge=%s, Dist=-1.0)"),
+					*ProbeEdge->GetName());
+
+				// Dump the function's parameter layout.
+				for (TFieldIterator<FProperty> It(ProbeFunc); It; ++It)
+				{
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("    Param: %s  Type=%s  Offset=%d  Size=%d  Flags=0x%llX"),
+						*It->GetName(),
+						*It->GetCPPType(),
+						It->GetOffset_ForInternal(),
+						It->GetSize(),
+						It->GetPropertyFlags());
+				}
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("    ParmsSize=%d  ReturnValueOffset=%d"),
+					ProbeFunc->ParmsSize,
+					ProbeFunc->ReturnValueOffset);
+			}
+		}
+
+		UE_LOG(LogAAATraffic, Log, TEXT("===== END POST-REBUILD CORNER ARRAY INVENTORY ====="));
+	}
+
+	// ── Extended post-rebuild dump (gated behind CVar) ──────────
 	if (GEnableDiagnosticDumps)
 	{
-		UE_LOG(LogAAATraffic, Log, TEXT("===== POST-REBUILD ROADBLD INTERSECTION DATA DUMP ====="));
-
-		FArrayProperty* CornersArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkCorners")));
-		int32 NC = 0;
-		if (CornersArr) { FScriptArrayHelper H(CornersArr, CornersArr->ContainerPtrToValuePtr<void>(NetworkActor)); NC = H.Num(); }
-		UE_LOG(LogAAATraffic, Log, TEXT("  RoadNetworkCorners: %d entries"), NC);
-
-		FArrayProperty* EditArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("CornerEditData")));
-		int32 NE = 0;
-		if (EditArr) { FScriptArrayHelper H(EditArr, EditArr->ContainerPtrToValuePtr<void>(NetworkActor)); NE = H.Num(); }
-		UE_LOG(LogAAATraffic, Log, TEXT("  CornerEditData: %d entries"), NE);
-
-		FArrayProperty* MasksArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("IntersectionMasks")));
-		int32 NM = 0;
-		if (MasksArr) { FScriptArrayHelper H(MasksArr, MasksArr->ContainerPtrToValuePtr<void>(NetworkActor)); NM = H.Num(); }
-		UE_LOG(LogAAATraffic, Log, TEXT("  IntersectionMasks: %d entries"), NM);
-
-		FArrayProperty* CutsArr = CastField<FArrayProperty>(DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkPerimeterCuts")));
-		int32 NP = 0;
-		if (CutsArr) { FScriptArrayHelper H(CutsArr, CutsArr->ContainerPtrToValuePtr<void>(NetworkActor)); NP = H.Num(); }
-		UE_LOG(LogAAATraffic, Log, TEXT("  RoadNetworkPerimeterCuts: %d entries"), NP);
+		UE_LOG(LogAAATraffic, Log, TEXT("===== POST-REBUILD ROADBLD EXTENDED DUMP ====="));
 
 		if (DynRoadClass)
 		{
@@ -1073,17 +1253,17 @@ void URoadBLDReflectionProvider::TriggerRoadBLDRebuildAndDiagnostics(UWorld* Wor
 			}
 		}
 
-		UE_LOG(LogAAATraffic, Log, TEXT("===== END POST-REBUILD DUMP ====="));
+		UE_LOG(LogAAATraffic, Log, TEXT("===== END POST-REBUILD EXTENDED DUMP ====="));
 	} // GEnableDiagnosticDumps
 }
 
 // ---------------------------------------------------------------------------
 // BuildLaneConnectivity — edge-walking corner discovery
 // ---------------------------------------------------------------------------
-// RoadNetworkCorners TArray is empty by design — RoadBLD stores corners
-// in an internal model, not in the reflected property. Instead, walk each
-// road's edge curves using GetNextCornerConnection() to discover all
-// intersection corners and build cross-road lane connections.
+// Attempt edge-walking via GetNextCornerConnection() first. If that returns
+// zero corners (common — the function may require editor-only state), fall
+// back to reading the RoadNetworkCorners TArray which CornerBuilder
+// populates during RebuildRoadNetworkIncremental.
 
 void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 {
@@ -1209,12 +1389,6 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 		return;
 	}
 
-	// Cache IntersectionPointProp for later use by other phases.
-	if (CornerIntersectionPtProp)
-	{
-		IntersectionPointProp = CornerIntersectionPtProp;
-	}
-
 	// ── Resolve edge-curve LeftLane/RightLane properties ──
 	FObjectPropertyBase* EdgeLeftLaneObj = nullptr;
 	FObjectPropertyBase* EdgeRightLaneObj = nullptr;
@@ -1301,6 +1475,7 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 	TSet<FGuid> SeenCornerIDs;
 	int32 CornerConnections = 0;
 	int32 TotalCornersFound = 0;
+	int32 TotalEdgesWalked = 0;
 
 	// Sort road handles for deterministic iteration.
 	TArray<int32> SortedRoadHandles;
@@ -1326,6 +1501,8 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 		{
 			UObject* EdgeObj = InnerObjProp->GetObjectPropertyValue(EdgesHelper.GetRawPtr(e));
 			if (!EdgeObj) { continue; }
+
+			++TotalEdgesWalked;
 
 			// Walk corners along this edge using GetNextCornerConnection.
 			// Start at distance -1.0 to catch any corner at distance 0.0.
@@ -1443,39 +1620,93 @@ void URoadBLDReflectionProvider::BuildLaneConnectivity(UWorld* World)
 
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("RoadBLDReflectionProvider: Edge-walking corner discovery — "
-			 "found %d unique corners, added %d cross-road connections."),
+			 "walked %d edges across %d roads, found %d unique corners, "
+			 "added %d cross-road connections."),
+		TotalEdgesWalked, SortedRoadHandles.Num(),
 		TotalCornersFound, CornerConnections);
+
+	// ── Fallback: if edge-walking found nothing, try the TArray directly ──
+	// After RebuildRoadNetworkIncremental, CornerBuilder may populate
+	// RoadNetworkCorners even when GetNextCornerConnection returns empty.
+	if (TotalCornersFound == 0)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: Edge-walking found 0 corners — "
+				 "falling back to RoadNetworkCorners TArray."));
+		BuildLaneConnectivityFromCornersArray(World, NetworkActor);
+	}
 }
 
 // ---------------------------------------------------------------------------
-// BuildLaneConnectivityFromCornersArray — legacy fallback (reads TArray)
+// BuildLaneConnectivityFromCornersArray — reads RoadNetworkCorners TArray
 // ---------------------------------------------------------------------------
-// Kept as a fallback in case GetNextCornerConnection is unavailable.
-// This path reads RoadNetworkCorners which is typically empty by design.
+// Primary fallback when GetNextCornerConnection edge-walking returns empty.
+// After RebuildRoadNetworkIncremental, CornerBuilder populates this TArray
+// with the computed intersection corners.
 
 void URoadBLDReflectionProvider::BuildLaneConnectivityFromCornersArray(
 	UWorld* World, AActor* NetworkActor)
 {
 	if (!NetworkActor || !DynNetworkClass) { return; }
 
-	FProperty* CornersProp = DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkCorners"));
-	FArrayProperty* CornerArrayProp = CornersProp ? CastField<FArrayProperty>(CornersProp) : nullptr;
+	// Try RoadNetworkCorners first, then CornerEditData as fallback.
+	// CornerBuilder may populate either or both arrays depending on
+	// RoadBLD version and configuration.
+	FArrayProperty* CornerArrayProp = nullptr;
+	FName UsedArrayName = NAME_None;
+
+	{
+		FProperty* P = DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkCorners"));
+		FArrayProperty* AP = P ? CastField<FArrayProperty>(P) : nullptr;
+		if (AP)
+		{
+			FScriptArrayHelper H(AP, AP->ContainerPtrToValuePtr<void>(NetworkActor));
+			if (H.Num() > 0)
+			{
+				CornerArrayProp = AP;
+				UsedArrayName = TEXT("RoadNetworkCorners");
+			}
+			else
+			{
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("RoadBLDReflectionProvider: RoadNetworkCorners has 0 entries — trying CornerEditData."));
+			}
+		}
+	}
+
+	if (!CornerArrayProp)
+	{
+		FProperty* P = DynNetworkClass->FindPropertyByName(TEXT("CornerEditData"));
+		FArrayProperty* AP = P ? CastField<FArrayProperty>(P) : nullptr;
+		if (AP)
+		{
+			FScriptArrayHelper H(AP, AP->ContainerPtrToValuePtr<void>(NetworkActor));
+			if (H.Num() > 0)
+			{
+				CornerArrayProp = AP;
+				UsedArrayName = TEXT("CornerEditData");
+			}
+			else
+			{
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("RoadBLDReflectionProvider: CornerEditData also has 0 entries — no corner-based connectivity."));
+			}
+		}
+	}
+
 	if (!CornerArrayProp)
 	{
 		UE_LOG(LogAAATraffic, Log,
-			TEXT("RoadBLDReflectionProvider: RoadNetworkCorners property not found — skipping."));
+			TEXT("RoadBLDReflectionProvider: No populated corner array found — skipping corner-based connectivity."));
 		return;
 	}
 
 	FScriptArrayHelper ArrayHelper(CornerArrayProp, CornerArrayProp->ContainerPtrToValuePtr<void>(NetworkActor));
 	const int32 NumCorners = ArrayHelper.Num();
 
-	if (NumCorners == 0)
-	{
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("RoadBLDReflectionProvider: RoadNetworkCorners is empty — no corner-based connectivity (legacy path)."));
-		return;
-	}
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDReflectionProvider: Using %s with %d entries for corner connectivity."),
+		*UsedArrayName.ToString(), NumCorners);
 
 	FStructProperty* StructProp = CastField<FStructProperty>(CornerArrayProp->Inner);
 	if (!StructProp) { return; }
@@ -1488,9 +1719,15 @@ void URoadBLDReflectionProvider::BuildLaneConnectivityFromCornersArray(
 	FBoolProperty* bStaleNative = CastField<FBoolProperty>(
 		CornerStruct->FindPropertyByName(TEXT("bStale")));
 	FProperty* IntPtProp = CornerStruct->FindPropertyByName(TEXT("IntersectionPoint"));
-	if (IntPtProp) { IntersectionPointProp = IntPtProp; }
 
-	if (!StartEdgeObjProp || !EndEdgeObjProp) { return; }
+	if (!StartEdgeObjProp || !EndEdgeObjProp)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("RoadBLDReflectionProvider: %s entries lack StartEdge/EndEdge — "
+				 "cannot build corner connections."),
+			*UsedArrayName.ToString());
+		return;
+	}
 
 	// Resolve edge-curve lane properties from first valid edge.
 	FObjectPropertyBase* EdgeLeftLaneObj = nullptr;
@@ -1514,8 +1751,58 @@ void URoadBLDReflectionProvider::BuildLaneConnectivityFromCornersArray(
 		if (!Edge) { return; }
 		UObject* LeftLane  = EdgeLeftLaneObj->GetObjectPropertyValue_InContainer(Edge);
 		UObject* RightLane = EdgeRightLaneObj->GetObjectPropertyValue_InContainer(Edge);
-		if (LeftLane)  { if (const int32* H = LaneToHandleMap.Find(LeftLane))  { OutHandles.AddUnique(*H); } }
-		if (RightLane) { if (const int32* H = LaneToHandleMap.Find(RightLane)) { OutHandles.AddUnique(*H); } }
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("    CollectLaneHandles: Edge=%s LeftLane=%s(%p) RightLane=%s(%p) LaneToHandleMap.Num=%d"),
+			*Edge->GetName(),
+			LeftLane ? *LeftLane->GetName() : TEXT("NULL"), static_cast<void*>(LeftLane),
+			RightLane ? *RightLane->GetName() : TEXT("NULL"), static_cast<void*>(RightLane),
+			LaneToHandleMap.Num());
+
+		if (LeftLane)
+		{
+			if (const int32* H = LaneToHandleMap.Find(LeftLane))
+			{
+				OutHandles.AddUnique(*H);
+			}
+			else
+			{
+				// Edge->LeftLane points to a lane UObject not in our map.
+				// Try by-name fallback: find any cached lane with the same name.
+				for (const auto& MapPair : LaneToHandleMap)
+				{
+					if (MapPair.Key.IsValid() && MapPair.Key->GetName() == LeftLane->GetName())
+					{
+						OutHandles.AddUnique(MapPair.Value);
+						UE_LOG(LogAAATraffic, Log,
+							TEXT("      LeftLane '%s' matched by name to handle %d (cached ptr=%p vs edge ptr=%p)"),
+							*LeftLane->GetName(), MapPair.Value, static_cast<void*>(MapPair.Key.Get()), static_cast<void*>(LeftLane));
+						break;
+					}
+				}
+			}
+		}
+		if (RightLane)
+		{
+			if (const int32* H = LaneToHandleMap.Find(RightLane))
+			{
+				OutHandles.AddUnique(*H);
+			}
+			else
+			{
+				for (const auto& MapPair : LaneToHandleMap)
+				{
+					if (MapPair.Key.IsValid() && MapPair.Key->GetName() == RightLane->GetName())
+					{
+						OutHandles.AddUnique(MapPair.Value);
+						UE_LOG(LogAAATraffic, Log,
+							TEXT("      RightLane '%s' matched by name to handle %d (cached ptr=%p vs edge ptr=%p)"),
+							*RightLane->GetName(), MapPair.Value, static_cast<void*>(MapPair.Key.Get()), static_cast<void*>(RightLane));
+						break;
+					}
+				}
+			}
+		}
 	};
 
 	int32 CornerConnections = 0;
@@ -1532,6 +1819,7 @@ void URoadBLDReflectionProvider::BuildLaneConnectivityFromCornersArray(
 		CollectLaneHandles(StartEdge, StartHandles);
 		CollectLaneHandles(EndEdge, EndHandles);
 
+		// Connect StartEdge lanes ↔ EndEdge lanes (bidirectional).
 		for (const int32 Src : StartHandles)
 		{
 			TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(Src);
@@ -1544,211 +1832,32 @@ void URoadBLDReflectionProvider::BuildLaneConnectivityFromCornersArray(
 				}
 			}
 		}
+		for (const int32 Src : EndHandles)
+		{
+			TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(Src);
+			for (const int32 Dst : StartHandles)
+			{
+				if (Src != Dst)
+				{
+					Conns.AddUnique(FTrafficLaneHandle(Dst));
+					++CornerConnections;
+				}
+			}
+		}
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("  TArray Corner[%d]: StartEdge=%s EndEdge=%s StartLanes=[%s] EndLanes=[%s]"),
+			i,
+			*StartEdge->GetName(), *EndEdge->GetName(),
+			*FString::JoinBy(StartHandles, TEXT(","),
+				[](int32 H) { return FString::FromInt(H); }),
+			*FString::JoinBy(EndHandles, TEXT(","),
+				[](int32 H) { return FString::FromInt(H); }));
 	}
 
 	UE_LOG(LogAAATraffic, Log,
-		TEXT("RoadBLDReflectionProvider: Legacy TArray corner connectivity added %d links from %d corners."),
+		TEXT("RoadBLDReflectionProvider: TArray corner connectivity added %d links from %d corners."),
 		CornerConnections, NumCorners);
-}
-
-// ---------------------------------------------------------------------------
-// DumpCornerDiagnostics — print all RoadNetworkCorner data to the log
-// ---------------------------------------------------------------------------
-
-void URoadBLDReflectionProvider::DumpCornerDiagnostics(UWorld* World)
-{
-	// Gated behind CVar — this function performs extensive reflection queries
-	// and string formatting for every corner, which is expensive at scale.
-	if (!GEnableDiagnosticDumps)
-	{
-		return;
-	}
-
-	if (!World || !DynNetworkClass)
-	{
-		UE_LOG(LogAAATraffic, Log, TEXT("CornerDump: No world or network class — skipping."));
-		return;
-	}
-
-	// Find the DynamicRoadNetwork actor deterministically.
-	AActor* NetworkActor = nullptr;
-	{
-		TArray<AActor*> CandidateNetworks;
-		for (TActorIterator<AActor> It(World); It; ++It)
-		{
-			if (It->GetClass()->IsChildOf(DynNetworkClass))
-			{
-				CandidateNetworks.Add(*It);
-			}
-		}
-		if (CandidateNetworks.Num() == 0)
-		{
-			UE_LOG(LogAAATraffic, Log, TEXT("CornerDump: No DynamicRoadNetwork actor found."));
-			return;
-		}
-
-		// Deterministically pick the first actor sorted by name.
-		CandidateNetworks.Sort([](const AActor& A, const AActor& B)
-		{
-			return A.GetName() < B.GetName();
-		});
-
-		NetworkActor = CandidateNetworks[0];
-	}
-
-	// Access RoadNetworkCorners array.
-	FProperty* CornersProp = DynNetworkClass->FindPropertyByName(TEXT("RoadNetworkCorners"));
-	FArrayProperty* CornerArrayProp = CornersProp ? CastField<FArrayProperty>(CornersProp) : nullptr;
-	if (!CornerArrayProp)
-	{
-		UE_LOG(LogAAATraffic, Log, TEXT("CornerDump: RoadNetworkCorners property not found."));
-		return;
-	}
-
-	FScriptArrayHelper ArrayHelper(CornerArrayProp, CornerArrayProp->ContainerPtrToValuePtr<void>(NetworkActor));
-	const int32 NumCorners = ArrayHelper.Num();
-
-	UE_LOG(LogAAATraffic, Log, TEXT("===== CORNER DIAGNOSTIC DUMP: %d corners total ====="), NumCorners);
-
-	if (NumCorners == 0) { return; }
-
-	// Resolve struct.
-	FStructProperty* StructProp = CastField<FStructProperty>(CornerArrayProp->Inner);
-	if (!StructProp) { return; }
-	UScriptStruct* CS = StructProp->Struct;
-
-	// Resolve all corner properties.
-	FProperty* StartEdgeProp    = CS->FindPropertyByName(TEXT("StartEdge"));
-	FProperty* EndEdgeProp      = CS->FindPropertyByName(TEXT("EndEdge"));
-	FProperty* bStaleProp       = CS->FindPropertyByName(TEXT("bStale"));
-	FProperty* IntPointProp     = CS->FindPropertyByName(TEXT("IntersectionPoint"));
-	FProperty* StartDistProp    = CS->FindPropertyByName(TEXT("StartDistance"));
-	FProperty* EndDistProp      = CS->FindPropertyByName(TEXT("EndDistance"));
-	FProperty* StartOffsetProp  = CS->FindPropertyByName(TEXT("StartOffset"));
-	FProperty* EndOffsetProp    = CS->FindPropertyByName(TEXT("EndOffset"));
-	FProperty* DirAProp         = CS->FindPropertyByName(TEXT("DirectionA"));
-	FProperty* DirBProp         = CS->FindPropertyByName(TEXT("DirectionB"));
-	FProperty* RadiusProp       = CS->FindPropertyByName(TEXT("CornerRadius"));
-	FProperty* CornerIDProp     = CS->FindPropertyByName(TEXT("CornerID"));
-
-	FObjectPropertyBase* StartEdgeObj = CastField<FObjectPropertyBase>(StartEdgeProp);
-	FObjectPropertyBase* EndEdgeObj   = CastField<FObjectPropertyBase>(EndEdgeProp);
-	FBoolProperty*       bStaleNat    = CastField<FBoolProperty>(bStaleProp);
-
-	// Resolve edge→lane properties from first valid edge.
-	FObjectPropertyBase* EdgeLeftLaneObj  = nullptr;
-	FObjectPropertyBase* EdgeRightLaneObj = nullptr;
-	for (int32 i = 0; i < NumCorners && !EdgeLeftLaneObj; ++i)
-	{
-		const uint8* Ptr = ArrayHelper.GetRawPtr(i);
-		UObject* Edge = StartEdgeObj ? StartEdgeObj->GetObjectPropertyValue_InContainer(Ptr) : nullptr;
-		if (Edge)
-		{
-			EdgeLeftLaneObj  = CastField<FObjectPropertyBase>(Edge->GetClass()->FindPropertyByName(TEXT("LeftLane")));
-			EdgeRightLaneObj = CastField<FObjectPropertyBase>(Edge->GetClass()->FindPropertyByName(TEXT("RightLane")));
-		}
-	}
-
-	// Helper: read double/float property value.
-	auto ReadNum = [](FProperty* Prop, const void* Container) -> double
-	{
-		if (!Prop) { return 0.0; }
-		if (FDoubleProperty* D = CastField<FDoubleProperty>(Prop)) { return D->GetPropertyValue_InContainer(Container); }
-		if (FFloatProperty* F = CastField<FFloatProperty>(Prop)) { return static_cast<double>(F->GetPropertyValue_InContainer(Container)); }
-		return 0.0;
-	};
-
-	// Helper: read int32 property value.
-	auto ReadInt = [](FProperty* Prop, const void* Container) -> int32
-	{
-		if (!Prop) { return 0; }
-		if (FIntProperty* I = CastField<FIntProperty>(Prop)) { return I->GetPropertyValue_InContainer(Container); }
-		return 0;
-	};
-
-	// Helper: describe an edge and its lanes.
-	auto DescribeEdge = [&](UObject* Edge, const TCHAR* Label) -> FString
-	{
-		if (!Edge) { return FString::Printf(TEXT("%s=NULL"), Label); }
-
-		FString Result = FString::Printf(TEXT("%s=%s"), Label, *Edge->GetName());
-
-		// Resolve lanes on this edge.
-		UObject* LeftLane  = EdgeLeftLaneObj  ? EdgeLeftLaneObj->GetObjectPropertyValue_InContainer(Edge)  : nullptr;
-		UObject* RightLane = EdgeRightLaneObj ? EdgeRightLaneObj->GetObjectPropertyValue_InContainer(Edge) : nullptr;
-
-		auto DescribeLane = [&](UObject* LaneObj, const TCHAR* Side) -> FString
-		{
-			if (!LaneObj) { return FString::Printf(TEXT("%s=NULL"), Side); }
-			const int32* HandlePtr = LaneToHandleMap.Find(LaneObj);
-			const int32 Handle = HandlePtr ? *HandlePtr : -1;
-			// Find owning road.
-			FString RoadName = TEXT("?");
-			if (Handle >= 0)
-			{
-				if (const int32* RoadH = LaneToRoadHandleMap.Find(Handle))
-				{
-					if (const TWeakObjectPtr<UObject>* RoadPtr = RoadHandleMap.Find(*RoadH))
-					{
-						if (UObject* RoadObj = RoadPtr->Get()) { RoadName = RoadObj->GetName(); }
-					}
-				}
-			}
-			return FString::Printf(TEXT("%s=%s H#%d Road=%s"), Side, *LaneObj->GetName(), Handle, *RoadName);
-		};
-
-		Result += TEXT(" [") + DescribeLane(LeftLane, TEXT("L")) + TEXT(", ") + DescribeLane(RightLane, TEXT("R")) + TEXT("]");
-		return Result;
-	};
-
-	// Dump each corner.
-	for (int32 i = 0; i < NumCorners; ++i)
-	{
-		const uint8* Ptr = ArrayHelper.GetRawPtr(i);
-
-		const bool bStale = bStaleNat ? bStaleNat->GetPropertyValue_InContainer(Ptr) : false;
-
-		// IntersectionPoint
-		FVector IntPt = FVector::ZeroVector;
-		if (IntPointProp)
-		{
-			const FVector* ValPtr = IntPointProp->ContainerPtrToValuePtr<FVector>(Ptr);
-			if (ValPtr) { IntPt = *ValPtr; }
-		}
-
-		const double StartDist   = ReadNum(StartDistProp, Ptr);
-		const double EndDist     = ReadNum(EndDistProp, Ptr);
-		const double StartOffset = ReadNum(StartOffsetProp, Ptr);
-		const double EndOffset   = ReadNum(EndOffsetProp, Ptr);
-		const double Radius      = ReadNum(RadiusProp, Ptr);
-		const int32 DirA         = ReadInt(DirAProp, Ptr);
-		const int32 DirB         = ReadInt(DirBProp, Ptr);
-
-		UObject* StartEdge = StartEdgeObj ? StartEdgeObj->GetObjectPropertyValue_InContainer(Ptr) : nullptr;
-		UObject* EndEdge   = EndEdgeObj   ? EndEdgeObj->GetObjectPropertyValue_InContainer(Ptr)   : nullptr;
-
-		FString StartDesc = DescribeEdge(StartEdge, TEXT("StartEdge"));
-		FString EndDesc   = DescribeEdge(EndEdge,   TEXT("EndEdge"));
-
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("Corner[%d]%s: IntersectionPoint=(%.1f, %.1f, %.1f)"),
-			i, bStale ? TEXT(" [STALE]") : TEXT(""),
-			IntPt.X, IntPt.Y, IntPt.Z);
-
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("  %s"),
-			*StartDesc);
-
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("  %s"),
-			*EndDesc);
-
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("  StartDist=%.1f EndDist=%.1f StartOffset=%.1f EndOffset=%.1f Radius=%.1f DirA=%d DirB=%d"),
-			StartDist, EndDist, StartOffset, EndOffset, Radius, DirA, DirB);
-	}
-
-	UE_LOG(LogAAATraffic, Log, TEXT("===== END CORNER DIAGNOSTIC DUMP ====="));
 }
 
 // ---------------------------------------------------------------------------
@@ -1803,16 +1912,63 @@ void URoadBLDReflectionProvider::CacheLaneEndpoints()
 		TEXT("RoadBLDReflectionProvider: Cached endpoints for %d lanes, road widths for %d roads."),
 		LaneEndpointMap.Num(), RoadTotalWidthMap.Num());
 
-	// ── Build RoadClassifiedSpeedLimits: classify by lane count ──
-	// Speed tiers match TrafficSpawner defaults:
-	//   1-2 lanes = residential (1118 cm/s ≈ 25 mph)
-	//   3-4 lanes = urban (2012 cm/s ≈ 45 mph)
-	//   5+ lanes  = highway (2906 cm/s ≈ 65 mph)
-	static constexpr float ResidentialSpeed = 1118.0f;
-	static constexpr float UrbanSpeed = 2012.0f;
-	static constexpr float HighwaySpeed = 2906.0f;
+	// ── DIAG: Dump per-lane endpoint positions to verify opposing lanes
+	// have distinct center lines (not sharing road centerline). ──
+	for (const int32 HandleId : SortedHandles)
+	{
+		const FLaneEndpointCache* EP = LaneEndpointMap.Find(HandleId);
+		if (!EP) { continue; }
+		const int32* Road = LaneToRoadHandleMap.Find(HandleId);
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("JDIAG LANE-ENDPOINTS: Lane=%d Road=%d Width=%.1f "
+				 "Start=(%.1f,%.1f,%.1f) End=(%.1f,%.1f,%.1f) "
+				 "Dir=(%.3f,%.3f,%.3f)"),
+			HandleId, Road ? *Road : -1, EP->Width,
+			EP->StartPos.X, EP->StartPos.Y, EP->StartPos.Z,
+			EP->EndPos.X, EP->EndPos.Y, EP->EndPos.Z,
+			EP->StartDir.X, EP->StartDir.Y, EP->StartDir.Z);
+	}
 
+	RebuildRoadSpeedClassification();
+}
+
+// ---------------------------------------------------------------------------
+// SetSpeedTiers — update classified speed tiers and rebuild the road speed map.
+// Called by TrafficSpawner after the provider is ready.
+// ---------------------------------------------------------------------------
+
+void URoadBLDReflectionProvider::SetSpeedTiers(float InResidentialSpeed, float InUrbanSpeed, float InHighwaySpeed)
+{
+	ConfiguredResidentialSpeed = InResidentialSpeed;
+	ConfiguredUrbanSpeed = InUrbanSpeed;
+	ConfiguredHighwaySpeed = InHighwaySpeed;
+
+	RebuildRoadSpeedClassification();
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDReflectionProvider: SetSpeedTiers — Residential=%.0f  Urban=%.0f  Highway=%.0f — reclassified %d roads."),
+		ConfiguredResidentialSpeed, ConfiguredUrbanSpeed, ConfiguredHighwaySpeed,
+		RoadClassifiedSpeedLimits.Num());
+}
+
+// ---------------------------------------------------------------------------
+// RebuildRoadSpeedClassification — classify speed by lane count, then cap
+// each road at the physics-safe speed for its tightest curve.
+//
+// Step 1: Assign tier speed based on lane count (residential / urban / highway).
+// Step 2: For each road, walk every lane's cached polyline and measure
+//         curvature in a sliding window.  Compute the minimum safe speed
+//         from v = sqrt(0.3g × R) and cap the road's classified speed.
+//
+// This means a 2-lane residential road with a hairpin gets a LOWER speed
+// than a straight 2-lane road, matching how real speed advisory signs work.
+// ---------------------------------------------------------------------------
+
+void URoadBLDReflectionProvider::RebuildRoadSpeedClassification()
+{
 	RoadClassifiedSpeedLimits.Empty();
+
+	// Step 1: Classify by lane count.
 	for (const auto& RoadEntry : RoadToLaneHandles)
 	{
 		const int32 RoadId = RoadEntry.Key;
@@ -1820,22 +1976,92 @@ void URoadBLDReflectionProvider::CacheLaneEndpoints()
 		float ClassifiedSpeed;
 		if (LaneCount <= 2)
 		{
-			ClassifiedSpeed = ResidentialSpeed;
+			ClassifiedSpeed = ConfiguredResidentialSpeed;
 		}
 		else if (LaneCount <= 4)
 		{
-			ClassifiedSpeed = UrbanSpeed;
+			ClassifiedSpeed = ConfiguredUrbanSpeed;
 		}
 		else
 		{
-			ClassifiedSpeed = HighwaySpeed;
+			ClassifiedSpeed = ConfiguredHighwaySpeed;
 		}
 		RoadClassifiedSpeedLimits.Add(RoadId, ClassifiedSpeed);
 	}
 
+	// Step 2: Cap each road's speed at the geometry-safe limit.
+	// For every lane on this road, walk the cached polyline with a
+	// sliding window, find the tightest turning radius, and compute
+	// the maximum safe speed: v = sqrt(lateralAccelBudget × R).
+	constexpr float LatAccelBudget = 294.0f; // 0.3g in cm/s²
+	constexpr int32 WindowSize = 10;          // ~10m at 100cm samples
+	constexpr float MinRadius = 50.0f;        // 0.5m clamp
+	constexpr float MinAngleDeg = 3.0f;       // ignore nearly-straight windows
+
+	int32 CappedCount = 0;
+	for (auto& SpeedEntry : RoadClassifiedSpeedLimits)
+	{
+		const int32 RoadId = SpeedEntry.Key;
+		float& RoadSpeed = SpeedEntry.Value;
+
+		const TArray<int32>* LaneHandles = RoadToLaneHandles.Find(RoadId);
+		if (!LaneHandles) { continue; }
+
+		float TightestRadius = TNumericLimits<float>::Max();
+
+		for (const int32 LaneId : *LaneHandles)
+		{
+			const FLaneEndpointCache* Cache = LaneEndpointMap.Find(LaneId);
+			if (!Cache || Cache->Polyline.Num() < 3) { continue; }
+
+			const TArray<FVector>& Poly = Cache->Polyline;
+
+			// Sliding window: measure curvature in each window of WindowSize segments.
+			for (int32 WinStart = 0; WinStart < Poly.Num() - 2; ++WinStart)
+			{
+				float WinAngleDeg = 0.0f;
+				float WinArc = 0.0f;
+				const int32 WinEnd = FMath::Min(WinStart + WindowSize, Poly.Num() - 2);
+
+				for (int32 i = WinStart; i < WinEnd; ++i)
+				{
+					const FVector Seg0 = Poly[i + 1] - Poly[i];
+					const FVector Seg1 = (i + 2 < Poly.Num())
+						? (Poly[i + 2] - Poly[i + 1])
+						: Seg0;
+					WinArc += Seg0.Size();
+					const FVector Dir0 = Seg0.GetSafeNormal();
+					const FVector Dir1 = Seg1.GetSafeNormal();
+					if (!Dir0.IsNearlyZero() && !Dir1.IsNearlyZero())
+					{
+						const float Dot = FMath::Clamp(FVector::DotProduct(Dir0, Dir1), -1.0f, 1.0f);
+						WinAngleDeg += FMath::RadiansToDegrees(FMath::Acos(Dot));
+					}
+				}
+
+				if (WinAngleDeg > MinAngleDeg && WinArc > KINDA_SMALL_NUMBER)
+				{
+					const float WinAngleRad = FMath::DegreesToRadians(WinAngleDeg);
+					const float Radius = FMath::Max(WinArc / WinAngleRad, MinRadius);
+					TightestRadius = FMath::Min(TightestRadius, Radius);
+				}
+			}
+		}
+
+		if (TightestRadius < TNumericLimits<float>::Max())
+		{
+			const float GeometrySpeedLimit = FMath::Sqrt(LatAccelBudget * TightestRadius);
+			if (GeometrySpeedLimit < RoadSpeed)
+			{
+				RoadSpeed = GeometrySpeedLimit;
+				++CappedCount;
+			}
+		}
+	}
+
 	UE_LOG(LogAAATraffic, Log,
-		TEXT("RoadBLDReflectionProvider: Classified speed limits for %d roads (by lane count)."),
-		RoadClassifiedSpeedLimits.Num());
+		TEXT("RoadBLDReflectionProvider: Classified speed limits for %d roads (%d capped by curve geometry)."),
+		RoadClassifiedSpeedLimits.Num(), CappedCount);
 }
 
 // ---------------------------------------------------------------------------
@@ -3258,6 +3484,22 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 			TEXT("RoadBLDReflectionProvider: Junction grouping — %d mask junctions, %d proximity connections (%d matched to junctions, %d skipped as road continuations), %d total junctions, %d lanes mapped."),
 			IntersectionGroupCentroids.Num(), ProximityConnectionList.Num(),
 			PCMatched, PCSkipped, JunctionCentroids.Num(), LaneToJunctionMap.Num());
+
+		// Build reverse map: junction ID → list of lane handles.
+		JunctionToLanesMap.Empty();
+		for (const auto& Pair : LaneToJunctionMap)
+		{
+			JunctionToLanesMap.FindOrAdd(Pair.Value).AddUnique(Pair.Key);
+		}
+		// Sort each list for deterministic iteration.
+		for (auto& Pair : JunctionToLanesMap)
+		{
+			Pair.Value.Sort();
+		}
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: Built JunctionToLanesMap — %d junctions."),
+			JunctionToLanesMap.Num());
+
 		return;
 	}
 
@@ -3458,19 +3700,99 @@ bool URoadBLDReflectionProvider::GetJunctionCentroid(int32 JunctionId, FVector& 
 	return false;
 }
 
+TArray<FTrafficLaneHandle> URoadBLDReflectionProvider::GetLanesForJunction(int32 JunctionId)
+{
+	TArray<FTrafficLaneHandle> Result;
+	if (const TArray<int32>* LaneIds = JunctionToLanesMap.Find(JunctionId))
+	{
+		Result.Reserve(LaneIds->Num());
+		for (const int32 Id : *LaneIds)
+		{
+			Result.Emplace(FTrafficLaneHandle(Id));
+		}
+	}
+	return Result;
+}
+
 bool URoadBLDReflectionProvider::GetJunctionPath(
 	const FTrafficLaneHandle& FromLane,
 	const FTrafficLaneHandle& ToLane,
 	TArray<FVector>& OutPath)
 {
-	// BUG-4 FIX: The old implementation produced a 3-point V-shaped path
-	// (entry → centroid → exit) which created sharp turns that vehicles
-	// couldn't follow smoothly. By returning false, we let the controller's
-	// Hermite cubic fallback synthesize a smooth curve from the end of FromLane
-	// to the start of ToLane, using lane tangents for continuity.
-	// Junction conflict detection (DoJunctionPathsConflict) is unaffected
-	// because it independently fetches lane endpoints.
-	return false;
+	// Generate a cubic Hermite curve from the end of FromLane to the start of
+	// ToLane using cached endpoint tangents.  This replaces the old BUG-4 fix
+	// that returned false (forcing the controller to synthesize its own curve).
+	// Generating it here ensures DoJunctionPathsConflict can also use curved
+	// paths for accurate conflict detection.
+	const FLaneEndpointCache* FromCache = LaneEndpointMap.Find(FromLane.HandleId);
+	const FLaneEndpointCache* ToCache = LaneEndpointMap.Find(ToLane.HandleId);
+	if (!FromCache || !ToCache)
+	{
+		return false;
+	}
+
+	const FVector P0 = FromCache->EndPos;
+	const FVector P1 = ToCache->StartPos;
+	const float SpanDist = FVector::Dist(P0, P1);
+
+	if (SpanDist < 50.0f)
+	{
+		// Negligible gap — no junction curve needed.
+		return false;
+	}
+
+	// Angle-aware tangent scaling: sharp turns need shorter tangents to
+	// avoid overshooting into the oncoming lane.  Straight-through keeps
+	// the original 0.5 × SpanDist; a 90° turn uses ~0.35; a U-turn ~0.25.
+	const float DotFactor = FVector::DotProduct(FromCache->EndDir, ToCache->StartDir);
+	// For actual turns (dot < 0.3) raise the floor from 0.25 to 0.35 to
+	// pull the curve outward through the mid-arc — wider clearance at apex.
+	const float AlphaFloor = (DotFactor < 0.3f) ? 0.35f : 0.25f;
+	const float Alpha = FMath::Lerp(AlphaFloor, 0.5f,
+		FMath::Clamp((DotFactor + 1.0f) * 0.5f, 0.0f, 1.0f));
+	const float TangentScale = SpanDist * Alpha;
+
+	// ── Inner-corner offset for turns ──────────────────────────────
+	// Shift the control points outward (away from the inner curb) so the
+	// Hermite curve clears the corner.  Cross-product Z of approach×exit
+	// gives turn direction: positive = left turn, negative = right turn.
+	const float CrossZ = FVector::CrossProduct(FromCache->EndDir, ToCache->StartDir).Z;
+	FVector AdjP0 = P0;
+	FVector AdjP1 = P1;
+	constexpr float InnerCornerOffset = 150.0f; // cm — roughly half a lane width
+	if (FMath::Abs(CrossZ) > 0.26f) // Only for actual turns (>15°)
+	{
+		// Perpendicular in XY: rotate the tangent 90° about Z.
+		// For a right turn (CrossZ < 0): shift LEFT (positive perp).
+		// For a left turn (CrossZ > 0): shift RIGHT (negative perp).
+		const float Sign = (CrossZ < 0.0f) ? 1.0f : -1.0f;
+		const FVector PerpFrom = FVector(-FromCache->EndDir.Y, FromCache->EndDir.X, 0.0f) * Sign;
+		const FVector PerpTo = FVector(-ToCache->StartDir.Y, ToCache->StartDir.X, 0.0f) * Sign;
+		// Scale offset by turn sharpness: 90° turns get full offset, gentle turns less.
+		const float SharpnessFactor = FMath::Clamp(FMath::Abs(CrossZ), 0.0f, 1.0f);
+		AdjP0 += PerpFrom * (InnerCornerOffset * SharpnessFactor);
+		AdjP1 += PerpTo * (InnerCornerOffset * SharpnessFactor);
+	}
+
+	const FVector M0 = FromCache->EndDir * TangentScale;
+	const FVector M1 = ToCache->StartDir * TangentScale;
+
+	// Segment count scales with span distance for consistent resolution.
+	// 200 cm per segment, clamped to [6, 32].
+	const int32 NumSegments = FMath::Clamp(FMath::CeilToInt32(SpanDist / 200.0f), 6, 32);
+	OutPath.Reserve(NumSegments + 1);
+	for (int32 i = 0; i <= NumSegments; ++i)
+	{
+		const float T = static_cast<float>(i) / static_cast<float>(NumSegments);
+		const float T2 = T * T;
+		const float T3 = T2 * T;
+		const float H00 = 2.0f * T3 - 3.0f * T2 + 1.0f;
+		const float H10 = T3 - 2.0f * T2 + T;
+		const float H01 = -2.0f * T3 + 3.0f * T2;
+		const float H11 = T3 - T2;
+		OutPath.Add(H00 * AdjP0 + H10 * M0 + H01 * AdjP1 + H11 * M1);
+	}
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -3507,26 +3829,43 @@ bool URoadBLDReflectionProvider::DoJunctionPathsConflict(
 	// Same approach or same exit → conflict (vehicles would merge).
 	if (FromA == FromB || ToA == ToB) { return true; }
 
-	// Resolve endpoints: approach lane's last point → exit lane's first point.
-	TArray<FVector> PtsA, PtsB;
-	float WA, WB;
+	// Get actual curved junction paths (Hermite curves from GetJunctionPath).
+	TArray<FVector> PathA, PathB;
+	const bool bHasPathA = GetJunctionPath(FromA, ToA, PathA);
+	const bool bHasPathB = GetJunctionPath(FromB, ToB, PathB);
 
-	if (!GetLanePath(FromA, PtsA, WA) || PtsA.Num() == 0) { return true; }
-	const FVector EnterA = PtsA.Last();
-	PtsA.Reset();
+	// Fallback to straight-line if curves unavailable.
+	if (!bHasPathA || PathA.Num() < 2)
+	{
+		PathA.Reset();
+		const FLaneEndpointCache* FromACache = LaneEndpointMap.Find(FromA.HandleId);
+		const FLaneEndpointCache* ToACache = LaneEndpointMap.Find(ToA.HandleId);
+		if (!FromACache || !ToACache) { return true; }
+		PathA.Add(FromACache->EndPos);
+		PathA.Add(ToACache->StartPos);
+	}
+	if (!bHasPathB || PathB.Num() < 2)
+	{
+		PathB.Reset();
+		const FLaneEndpointCache* FromBCache = LaneEndpointMap.Find(FromB.HandleId);
+		const FLaneEndpointCache* ToBCache = LaneEndpointMap.Find(ToB.HandleId);
+		if (!FromBCache || !ToBCache) { return true; }
+		PathB.Add(FromBCache->EndPos);
+		PathB.Add(ToBCache->StartPos);
+	}
 
-	if (!GetLanePath(ToA, PtsA, WA) || PtsA.Num() == 0) { return true; }
-	const FVector ExitA = PtsA[0];
-
-	if (!GetLanePath(FromB, PtsB, WB) || PtsB.Num() == 0) { return true; }
-	const FVector EnterB = PtsB.Last();
-	PtsB.Reset();
-
-	if (!GetLanePath(ToB, PtsB, WB) || PtsB.Num() == 0) { return true; }
-	const FVector ExitB = PtsB[0];
-
-	// Test if the two junction arcs (enter→exit) cross in 2D.
-	return Segments2DIntersect(EnterA, ExitA, EnterB, ExitB);
+	// Test all pairs of segments between PathA and PathB for 2D intersection.
+	for (int32 i = 0; i < PathA.Num() - 1; ++i)
+	{
+		for (int32 j = 0; j < PathB.Num() - 1; ++j)
+		{
+			if (Segments2DIntersect(PathA[i], PathA[i + 1], PathB[j], PathB[j + 1]))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -3619,12 +3958,6 @@ float URoadBLDReflectionProvider::GetLaneSpeedLimit(const FTrafficLaneHandle& La
 // ---------------------------------------------------------------------------
 // Reflection helpers
 // ---------------------------------------------------------------------------
-
-void URoadBLDReflectionProvider::CallReflection(UObject* Target, UFunction* Func, void* Params)
-{
-	check(Target && Func);
-	Target->ProcessEvent(Func, Params);
-}
 
 double URoadBLDReflectionProvider::GetRoadLength(UObject* RoadActor) const
 {
@@ -3998,4 +4331,129 @@ ITrafficRoadProvider::FJunctionScanResult URoadBLDReflectionProvider::GetDistanc
 	Result.DistanceCm = RemainingDistOnCurrentLane + Result.DistanceCm;
 
 	return Result;
+}
+
+// ---------------------------------------------------------------------------
+// ITrafficRoadProvider — positional direction query
+// ---------------------------------------------------------------------------
+
+FVector URoadBLDReflectionProvider::GetLaneDirectionAtDistance(
+	const FTrafficLaneHandle& Lane, float Distance)
+{
+	// Walk the cached polyline to find the segment at the requested distance.
+	const FLaneEndpointCache* Cached = LaneEndpointMap.Find(Lane.HandleId);
+	if (!Cached || Cached->Polyline.Num() < 2)
+	{
+		return GetLaneDirection(Lane);
+	}
+
+	const TArray<FVector>& Pts = Cached->Polyline;
+	float Accumulated = 0.0f;
+	for (int32 i = 0; i < Pts.Num() - 1; ++i)
+	{
+		const float SegLen = FVector::Dist(Pts[i], Pts[i + 1]);
+		if (Accumulated + SegLen >= Distance || i == Pts.Num() - 2)
+		{
+			return (Pts[i + 1] - Pts[i]).GetSafeNormal();
+		}
+		Accumulated += SegLen;
+	}
+	return Cached->EndDir;
+}
+
+// ---------------------------------------------------------------------------
+// ITrafficRoadProvider — positional width query
+// ---------------------------------------------------------------------------
+
+float URoadBLDReflectionProvider::GetLaneWidthAtDistance(
+	const FTrafficLaneHandle& Lane, float Distance)
+{
+	// RoadBLD exposes a single width per lane via reflection.
+	// Variable-width support would require additional reflection calls
+	// to the edge curves.  For now, return the uniform cached width.
+	const FLaneEndpointCache* Cached = LaneEndpointMap.Find(Lane.HandleId);
+	if (Cached)
+	{
+		return Cached->Width;
+	}
+	// Fallback: fetch from lane metadata.
+	const FReflectionLaneData* Data = LaneHandleMap.Find(Lane.HandleId);
+	return Data ? Data->LaneWidth : 350.0f;
+}
+
+// ---------------------------------------------------------------------------
+// ITrafficRoadProvider — positional curvature query (Menger curvature)
+// ---------------------------------------------------------------------------
+
+float URoadBLDReflectionProvider::GetLaneCurvatureAtDistance(
+	const FTrafficLaneHandle& Lane, float Distance)
+{
+	// Compute Menger curvature κ from 3 polyline points surrounding the
+	// requested distance.  κ = 4·Area(triangle) / (|AB|·|BC|·|CA|).
+	// Sign: positive = left turn, negative = right turn (Z-up right-hand).
+	const FLaneEndpointCache* Cached = LaneEndpointMap.Find(Lane.HandleId);
+	if (!Cached || Cached->Polyline.Num() < 3)
+	{
+		return 0.0f;
+	}
+
+	const TArray<FVector>& Pts = Cached->Polyline;
+
+	// Find the index closest to the requested distance.
+	float Accumulated = 0.0f;
+	int32 MidIdx = 0;
+	for (int32 i = 0; i < Pts.Num() - 1; ++i)
+	{
+		const float SegLen = FVector::Dist(Pts[i], Pts[i + 1]);
+		if (Accumulated + SegLen >= Distance)
+		{
+			MidIdx = i;
+			break;
+		}
+		Accumulated += SegLen;
+		MidIdx = i + 1;
+	}
+
+	// Widen the point spacing to suppress 100cm sampling noise.
+	// Use half CurveScanWindowSize equivalent (≈2-3 points spread).
+	constexpr int32 Spread = 2;
+	const int32 IdxA = FMath::Max(0, MidIdx - Spread);
+	const int32 IdxC = FMath::Min(Pts.Num() - 1, MidIdx + Spread);
+	const int32 IdxB = (IdxA + IdxC) / 2;
+
+	if (IdxA == IdxB || IdxB == IdxC)
+	{
+		return 0.0f;
+	}
+
+	const FVector& A = Pts[IdxA];
+	const FVector& B = Pts[IdxB];
+	const FVector& C = Pts[IdxC];
+
+	const float AB = FVector::Dist2D(A, B);
+	const float BC = FVector::Dist2D(B, C);
+	const float CA = FVector::Dist2D(C, A);
+	const float Denom = AB * BC * CA;
+
+	if (Denom < KINDA_SMALL_NUMBER)
+	{
+		return 0.0f;
+	}
+
+	// Signed area of triangle (2D cross product / 2).
+	const float SignedArea2 = (B.X - A.X) * (C.Y - A.Y) - (B.Y - A.Y) * (C.X - A.X);
+	return (2.0f * SignedArea2) / Denom;
+}
+
+// ---------------------------------------------------------------------------
+// ITrafficRoadProvider — arc length from polyline
+// ---------------------------------------------------------------------------
+
+float URoadBLDReflectionProvider::GetLaneArcLength(const FTrafficLaneHandle& Lane)
+{
+	// Polyline arc length — same as GetLaneLength since our polylines are
+	// the highest-resolution data we cache (100cm segments).  Native RoadBLD
+	// GetCurveLength via reflection could yield slightly different values
+	// but would require additional reflection setup.
+	return GetLaneLength(Lane);
 }

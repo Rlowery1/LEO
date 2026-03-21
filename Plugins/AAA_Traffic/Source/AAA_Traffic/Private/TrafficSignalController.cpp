@@ -19,6 +19,7 @@ ATrafficSignalController::ATrafficSignalController()
 	, YellowDuration(3.0f)
 	, RedDuration(15.0f)
 	, PhaseOffset(0.0f)
+	, AllRedClearanceSec(2.0f)
 	, StopSignWaitTimeSec(2.0f)
 	, CurrentPhase(ETrafficSignalPhase::Red)
 	, PhaseTimer(0.0f)
@@ -181,11 +182,12 @@ void ATrafficSignalController::AdvancePhase()
 
 	case ETrafficSignalPhase::Yellow:
 		CurrentPhase = ETrafficSignalPhase::Red;
-		// Multi-group signals: use a brief all-red clearance interval (2s)
-		// instead of the full RedDuration. The "red" for one group IS the
-		// green for the next group. Legacy (single-group) keeps full RedDuration.
+		// Multi-group signals: use the designer-tunable all-red clearance
+		// interval instead of the full RedDuration. The "red" for one group
+		// IS the green for the next group. Legacy (single-group) keeps
+		// full RedDuration.
 		PhaseTimer += (PhaseGroups.Num() > 1)
-			? FMath::Min(RedDuration, 2.0f)
+			? FMath::Min(RedDuration, AllRedClearanceSec)
 			: RedDuration;
 		break;
 
@@ -196,7 +198,16 @@ void ATrafficSignalController::AdvancePhase()
 			CurrentGroupIndex = (CurrentGroupIndex + 1) % PhaseGroups.Num();
 		}
 		CurrentPhase = ETrafficSignalPhase::Green;
-		PhaseTimer += GreenDuration;
+		// Use per-group duration if set, otherwise fall back to controller default.
+		{
+			float GroupGreen = GreenDuration;
+			if (PhaseGroups.IsValidIndex(CurrentGroupIndex)
+				&& PhaseGroups[CurrentGroupIndex].GroupGreenDuration > 0.0f)
+			{
+				GroupGreen = PhaseGroups[CurrentGroupIndex].GroupGreenDuration;
+			}
+			PhaseTimer += GroupGreen;
+		}
 		break;
 	}
 
@@ -289,6 +300,24 @@ bool ATrafficSignalController::IsLaneGreen(const FTrafficLaneHandle& Lane) const
 		UE_LOG(LogAAATraffic, Log,
 				TEXT("SIGNAL IsLaneGreen: Signal='%s' Lane=%d GroupIndex=%d GreenLaneCount=%d — NOT in green group"),
 			*GetName(), Lane.HandleId, CurrentGroupIndex, ActiveGroup.GreenLanes.Num());
+	}
+	return false;
+}
+
+bool ATrafficSignalController::IsLaneProtectedGreen(const FTrafficLaneHandle& Lane) const
+{
+	// Must be in Signal mode with phase groups and currently Green.
+	if (ControlMode != EJunctionControlMode::Signal) { return false; }
+	if (PhaseGroups.Num() == 0) { return false; }
+	if (CurrentPhase != ETrafficSignalPhase::Green) { return false; }
+	if (!PhaseGroups.IsValidIndex(CurrentGroupIndex)) { return false; }
+
+	const FSignalPhaseGroup& ActiveGroup = PhaseGroups[CurrentGroupIndex];
+	if (!ActiveGroup.bIsProtectedArrow) { return false; }
+
+	for (const FTrafficLaneHandle& GreenLane : ActiveGroup.GreenLanes)
+	{
+		if (GreenLane == Lane) { return true; }
 	}
 	return false;
 }

@@ -13,6 +13,9 @@ class ATrafficVehicleController;
 class ATrafficSignalController;
 class UTrafficVehiclePool;
 
+// Forward-declare ETurnSignalState (defined in TrafficVehicleController.h).
+enum class ETurnSignalState : uint8;
+
 /**
  * LOD tier for distance-based vehicle simulation detail.
  */
@@ -34,6 +37,26 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FOnProviderRegistered, ITrafficRoadProvider*
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnVehicleDespawned, ATrafficVehicleController* /*Controller*/, const FTrafficLaneHandle& /*Lane*/);
 
 /**
+ * Surveyed legal exit from a junction approach lane.
+ * Produced once at startup by BuildJunctionSurvey(); consumed by vehicles
+ * instead of per-tick ad-hoc filtering.
+ */
+struct FJunctionExitRule
+{
+	/** The exit lane (post-junction free-flow lane). */
+	FTrafficLaneHandle ExitLane;
+
+	/** Turn direction relative to the approach lane (set by BuildJunctionSurvey). */
+	ETurnSignalState TurnDirection;
+
+	/** Selection weight (higher = more desirable). 0 = should-not-pick. */
+	float Weight = 1.0f;
+
+	/** False if the vehicle physically cannot make this turn (too tight for lane width). */
+	bool bPhysicallyFeasible = true;
+};
+
+/**
  * Record of a vehicle currently traversing a junction.
  * Stores the approach and exit lanes so the conflict test can determine
  * whether two simultaneous movements would geometrically cross.
@@ -43,6 +66,22 @@ struct FJunctionOccupant
 	TWeakObjectPtr<ATrafficVehicleController> Controller;
 	FTrafficLaneHandle FromLane;
 	FTrafficLaneHandle ToLane;
+
+	/** Wall-clock time when occupancy was granted (FPlatformTime::Seconds()).
+	 *  Used to evict stuck vehicles that never released their occupancy. */
+	double OccupiedAtTime = 0.0;
+};
+
+/**
+ * Record of a vehicle waiting at a stop-sign/flashing-red junction.
+ * Used for FIFO ordering: first to complete their mandatory stop,
+ * first to proceed. Tracks arrival time for deterministic tie-break.
+ */
+struct FStopSignArrival
+{
+	TWeakObjectPtr<ATrafficVehicleController> Controller;
+	/** Wall-clock time when the vehicle completed its mandatory stop. */
+	double ArrivalTime = 0.0;
 };
 
 /**
@@ -97,7 +136,7 @@ public:
 	TArray<TWeakObjectPtr<ATrafficVehicleController>> GetVehiclesOnLane(const FTrafficLaneHandle& Lane) const;
 
 	/** Get the set of all currently active vehicle controllers. */
-	const TSet<TWeakObjectPtr<ATrafficVehicleController>>& GetActiveVehicles() const { return ActiveVehicles; }
+	const TArray<TWeakObjectPtr<ATrafficVehicleController>>& GetActiveVehicles() const { return ActiveVehicles; }
 
 	// --- Spatial Grid ---
 
@@ -147,6 +186,50 @@ public:
 	/** Release junction occupancy for the given vehicle. */
 	void ReleaseJunction(int32 JunctionId, ATrafficVehicleController* Controller);
 
+	/**
+	 * Check whether any other vehicle approaching the same junction has a
+	 * conflicting path AND is going straight (higher priority than a turner).
+	 * Used by left-turning vehicles at signalized intersections to yield to
+	 * oncoming straight-through traffic.
+	 *
+	 * @return true if a higher-priority conflicting approach exists (caller should yield).
+	 */
+	bool HasConflictingApproach(int32 JunctionId, ATrafficVehicleController* Self,
+		const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane) const;
+
+	/**
+	 * Check if any vehicle approaching this junction from a conflicting direction
+	 * is close enough and fast enough to make entry unsafe (gap acceptance).
+	 * Used at yield signs for ALL movements (not just left turns).
+	 *
+	 * @param GapThresholdSec  Minimum acceptable time-gap (seconds). Default 4.0s.
+	 * @return true if cross-traffic is too close (caller should wait).
+	 */
+	bool HasApproachingCrossTraffic(int32 JunctionId, ATrafficVehicleController* Self,
+		const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane,
+		float GapThresholdSec = 4.0f) const;
+
+	// --- Junction Exit Survey ---
+
+	/**
+	 * Get the pre-computed legal exits for an approach lane.
+	 * Returns an empty array if the lane was not surveyed (e.g. not an approach lane).
+	 */
+	const TArray<FJunctionExitRule>& GetLegalExits(int32 ApproachLaneId) const;
+
+	// --- Stop-Sign FIFO Queue ---
+
+	/** Record that a vehicle has completed its mandatory stop at a stop-sign junction.
+	 *  Entries are time-ordered; first to arrive = first to proceed. */
+	void RecordStopSignArrival(int32 JunctionId, ATrafficVehicleController* Controller);
+
+	/** Check if this vehicle is at the front of the stop-sign arrival queue.
+	 *  Returns true if the vehicle may proceed (first-arrived-first-served). */
+	bool IsStopSignTurnToGo(int32 JunctionId, ATrafficVehicleController* Controller) const;
+
+	/** Remove a vehicle from the stop-sign arrival queue (called when occupancy is granted). */
+	void RemoveStopSignArrival(int32 JunctionId, ATrafficVehicleController* Controller);
+
 	// --- Road Speed Limits ---
 
 	/** Set a speed limit for a specific road (pushed by the spawner during setup). */
@@ -183,6 +266,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Lifecycle")
 	bool bDespawnDeadEndVehicles;
 
+	/** Empty array returned by GetLegalExits when no data exists. */
+	static const TArray<FJunctionExitRule> EmptyExitRules;
+
 private:
 	/** Periodic lifecycle sweep: destroy vehicles out of range or stopped at dead end. */
 	void PerformDespawnSweep();
@@ -200,23 +286,16 @@ private:
 
 	/**
 	 * Registry of all active traffic vehicle controllers in the world.
+	 * Stored as TArray ordered by DeterministicSpawnIndex for stable iteration.
 	 *
-	 * NOTE:
-	 * - The proximity detection system currently relies on direct physics sweeps and does not
-	 *   query this registry for neighbor detection.
-	 * - This registry exists to support future despawn / lifecycle management and potential
-	 *   debugging / analytics features.
-	 *
-	 * Per System.md Section 8 (minimalism), this is treated as bounded technical debt:
-	 * - Keep registration / unregistration overhead minimal and free of heavy per-tick work.
-	 * - If this set becomes a performance hotspot or remains unused by concrete features,
-	 *   either wire it into those features or remove it instead of growing its responsibilities.
-	 *
-	 * Not marked UPROPERTY: TSet<TWeakObjectPtr<T>> is not supported by UHT reflection.
+	 * Not marked UPROPERTY: TArray<TWeakObjectPtr<T>> is not supported by UHT reflection.
 	 * GC safety is already guaranteed by TWeakObjectPtr, which nullifies automatically
 	 * when the referenced UObject is collected.
 	 */
-	TSet<TWeakObjectPtr<ATrafficVehicleController>> ActiveVehicles;
+	TArray<TWeakObjectPtr<ATrafficVehicleController>> ActiveVehicles;
+
+	/** Monotonically increasing counter for deterministic vehicle ordering. */
+	int32 NextSpawnIndex = 0;
 
 	/**
 	 * Per-lane vehicle registry: lane handle ID → controllers currently on that lane.
@@ -256,8 +335,22 @@ private:
 	/** Junction ID → vehicles currently traversing it (multi-vehicle). */
 	TMap<int32, TArray<FJunctionOccupant>> JunctionOccupancy;
 
+	// --- Stop-sign FIFO queues ---
+
+	/** Junction ID → ordered list of vehicles that completed their mandatory stop.
+	 *  First entry = first to arrive = first to proceed. */
+	TMap<int32, TArray<FStopSignArrival>> StopSignQueues;
+
 	// --- Road speed limits ---
 
 	/** Road handle ID → speed limit (cm/s), pushed by the spawner. */
 	TMap<int32, float> RoadSpeedLimits;
+
+	// --- Junction exit survey ---
+
+	/** Approach lane HandleId → array of legal exits (built once at provider registration). */
+	TMap<int32, TArray<FJunctionExitRule>> JunctionExitRules;
+
+	/** One-time analysis: build the junction exit table from road provider data. */
+	void BuildJunctionSurvey();
 };

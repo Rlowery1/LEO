@@ -46,4 +46,7 @@ public:
 private:
 	/** Per-class pool of inactive pawns. */
 	TMap<UClass*, TArray<TWeakObjectPtr<APawn>>> Pool;
+
+	/** Maximum pooled pawns per class. Excess releases are destroyed. */
+	static constexpr int32 MaxPoolSizePerClass = 20;
 };

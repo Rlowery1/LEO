@@ -34,7 +34,9 @@ APawn* UTrafficVehiclePool::AcquireVehicle(UWorld* World, TSubclassOf<APawn> Veh
 	Pawn->SetActorEnableCollision(true);
 	Pawn->SetActorTickEnabled(true);
 
-	// Re-enable component ticking.
+	// Re-enable component ticking and zero residual physics velocity.
+	// TeleportPhysics repositions the body but does NOT clear momentum —
+	// without this the reused pawn launches at its pre-pool speed.
 	TArray<UActorComponent*> Components;
 	Pawn->GetComponents(Components);
 	for (UActorComponent* Comp : Components)
@@ -42,6 +44,8 @@ APawn* UTrafficVehiclePool::AcquireVehicle(UWorld* World, TSubclassOf<APawn> Veh
 		Comp->SetComponentTickEnabled(true);
 		if (UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(Comp))
 		{
+			Prim->SetPhysicsLinearVelocity(FVector::ZeroVector);
+			Prim->SetPhysicsAngularVelocityInDegrees(FVector::ZeroVector);
 			Prim->SetSimulatePhysics(true);
 		}
 	}
@@ -82,8 +86,18 @@ void UTrafficVehiclePool::ReleaseVehicle(APawn* Vehicle)
 	// Move to a far-away location to prevent any residual interactions.
 	Vehicle->SetActorLocation(FVector(0.0, 0.0, -100000.0), /*bSweep=*/ false, /*OutSweepHitResult=*/ nullptr, ETeleportType::TeleportPhysics);
 
-	// Add to pool.
-	Pool.FindOrAdd(Vehicle->GetClass()).Add(Vehicle);
+	// Add to pool (cap per-class size to prevent unbounded memory growth).
+	TArray<TWeakObjectPtr<APawn>>& ClassPool = Pool.FindOrAdd(Vehicle->GetClass());
+	if (ClassPool.Num() >= MaxPoolSizePerClass)
+	{
+		// Pool full — destroy instead of caching.
+		Vehicle->Destroy();
+		UE_LOG(LogAAATraffic, Verbose,
+			TEXT("TrafficVehiclePool: Pool full (%d/%d) for %s — destroyed instead of pooling."),
+			ClassPool.Num(), MaxPoolSizePerClass, *Vehicle->GetClass()->GetName());
+		return;
+	}
+	ClassPool.Add(Vehicle);
 
 	UE_LOG(LogAAATraffic, Verbose,
 		TEXT("TrafficVehiclePool: Released %s to pool."), *Vehicle->GetClass()->GetName());

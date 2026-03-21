@@ -95,3 +95,42 @@ ITrafficRoadProvider::FJunctionScanResult ITrafficRoadProvider::GetDistanceToNex
 
 	return Result;
 }
+
+// ---------------------------------------------------------------------------
+// Default: derive tangent direction from polyline at a given distance
+// ---------------------------------------------------------------------------
+FVector ITrafficRoadProvider::GetLaneDirectionAtDistance(
+	const FTrafficLaneHandle& Lane, float Distance)
+{
+	TArray<FVector> Points;
+	float Width;
+	if (!GetLanePath(Lane, Points, Width) || Points.Num() < 2)
+	{
+		return GetLaneDirection(Lane);
+	}
+
+	// Walk the polyline to find the segment containing 'Distance'.
+	float Accumulated = 0.0f;
+	for (int32 i = 0; i < Points.Num() - 1; ++i)
+	{
+		const float SegLen = FVector::Dist(Points[i], Points[i + 1]);
+		if (Accumulated + SegLen >= Distance || i == Points.Num() - 2)
+		{
+			return (Points[i + 1] - Points[i]).GetSafeNormal();
+		}
+		Accumulated += SegLen;
+	}
+	return (Points.Last() - Points[Points.Num() - 2]).GetSafeNormal();
+}
+
+// ---------------------------------------------------------------------------
+// Default: return uniform width from GetLanePath
+// ---------------------------------------------------------------------------
+float ITrafficRoadProvider::GetLaneWidthAtDistance(
+	const FTrafficLaneHandle& Lane, float Distance)
+{
+	TArray<FVector> Points;
+	float Width = 0.0f;
+	GetLanePath(Lane, Points, Width);
+	return Width;
+}

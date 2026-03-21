@@ -62,6 +62,21 @@ struct FSignalPhaseGroup
 	/** Lanes that receive green during this group's phase. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal")
 	TArray<FTrafficLaneHandle> GreenLanes;
+
+	/**
+	 * Per-group green duration override (seconds).
+	 * 0 = use the controller's default GreenDuration.
+	 * Set shorter (e.g. 8-12s) for protected left-turn phases.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal", meta = (ClampMin = "0"))
+	float GroupGreenDuration = 0.0f;
+
+	/**
+	 * True when this phase group is a protected arrow (e.g. left-turn arrow).
+	 * Vehicles in a protected-arrow phase do NOT yield to oncoming traffic.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal")
+	bool bIsProtectedArrow = false;
 };
 
 /**
@@ -108,6 +123,13 @@ public:
 	bool IsLaneGreen(const FTrafficLaneHandle& Lane) const;
 
 	/**
+	 * Check if a given lane has a protected green arrow right now.
+	 * Returns true only when the lane is green AND its phase group has bIsProtectedArrow set.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Traffic|Signal")
+	bool IsLaneProtectedGreen(const FTrafficLaneHandle& Lane) const;
+
+	/**
 	 * Get the control mode for this junction controller.
 	 * Vehicles use this to decide stop-sign vs yield vs signal behavior.
 	 */
@@ -148,6 +170,16 @@ public:
 	/** Initial phase offset (seconds) — stagger signals at nearby junctions. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal", meta = (ClampMin = "0"))
 	float PhaseOffset;
+
+	/**
+	 * All-red clearance interval (seconds) for multi-group signals.
+	 * After Yellow, ALL directions stay Red for this duration before the
+	 * next group gets Green. Must be long enough for vehicles already in
+	 * the intersection to clear. Auto-placed signals derive this from
+	 * junction crossing distance; manual overrides are respected.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal", meta = (ClampMin = "1.0", ClampMax = "10.0"))
+	float AllRedClearanceSec;
 
 	/**
 	 * Optional multi-phase groups. Each group defines a set of lanes that get green
