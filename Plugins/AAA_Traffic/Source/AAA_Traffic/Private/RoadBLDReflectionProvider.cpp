@@ -1046,10 +1046,10 @@ void URoadBLDReflectionProvider::TriggerRoadBLDRebuildAndDiagnostics(UWorld* Wor
 		}
 	}
 
-	// ── UNCONDITIONAL post-rebuild array inventory ─────────────
-	// Always log the count of every corner-related array so we know
-	// exactly where CornerBuilder stored its data.  This is the single
-	// source of truth for diagnosing "0 cross-road connections."
+	// ── Post-rebuild array inventory (gated behind CVar) ─────────
+	// Log the count of every corner-related array so we know
+	// exactly where CornerBuilder stored its data.
+	if (GEnableDiagnosticDumps)
 	{
 		UE_LOG(LogAAATraffic, Log, TEXT("===== POST-REBUILD CORNER ARRAY INVENTORY ====="));
 
@@ -1845,19 +1845,25 @@ void URoadBLDReflectionProvider::BuildLaneConnectivityFromCornersArray(
 			}
 		}
 
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("  TArray Corner[%d]: StartEdge=%s EndEdge=%s StartLanes=[%s] EndLanes=[%s]"),
-			i,
-			*StartEdge->GetName(), *EndEdge->GetName(),
-			*FString::JoinBy(StartHandles, TEXT(","),
-				[](int32 H) { return FString::FromInt(H); }),
-			*FString::JoinBy(EndHandles, TEXT(","),
-				[](int32 H) { return FString::FromInt(H); }));
+		if (GEnableDiagnosticDumps)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("  TArray Corner[%d]: StartEdge=%s EndEdge=%s StartLanes=[%s] EndLanes=[%s]"),
+				i,
+				*StartEdge->GetName(), *EndEdge->GetName(),
+				*FString::JoinBy(StartHandles, TEXT(","),
+					[](int32 H) { return FString::FromInt(H); }),
+				*FString::JoinBy(EndHandles, TEXT(","),
+					[](int32 H) { return FString::FromInt(H); }));
+		}
 	}
 
-	UE_LOG(LogAAATraffic, Log,
-		TEXT("RoadBLDReflectionProvider: TArray corner connectivity added %d links from %d corners."),
-		CornerConnections, NumCorners);
+	if (GEnableDiagnosticDumps)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: TArray corner connectivity added %d links from %d corners."),
+			CornerConnections, NumCorners);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1914,12 +1920,14 @@ void URoadBLDReflectionProvider::CacheLaneEndpoints()
 
 	// ── DIAG: Dump per-lane endpoint positions to verify opposing lanes
 	// have distinct center lines (not sharing road centerline). ──
+	if (GEnableDiagnosticDumps)
+	{
 	for (const int32 HandleId : SortedHandles)
 	{
 		const FLaneEndpointCache* EP = LaneEndpointMap.Find(HandleId);
 		if (!EP) { continue; }
 		const int32* Road = LaneToRoadHandleMap.Find(HandleId);
-		UE_LOG(LogAAATraffic, Warning,
+		UE_LOG(LogAAATraffic, Log,
 			TEXT("JDIAG LANE-ENDPOINTS: Lane=%d Road=%d Width=%.1f "
 				 "Start=(%.1f,%.1f,%.1f) End=(%.1f,%.1f,%.1f) "
 				 "Dir=(%.3f,%.3f,%.3f)"),
@@ -1928,6 +1936,7 @@ void URoadBLDReflectionProvider::CacheLaneEndpoints()
 			EP->EndPos.X, EP->EndPos.Y, EP->EndPos.Z,
 			EP->StartDir.X, EP->StartDir.Y, EP->StartDir.Z);
 	}
+	} // GEnableDiagnosticDumps
 
 	RebuildRoadSpeedClassification();
 }

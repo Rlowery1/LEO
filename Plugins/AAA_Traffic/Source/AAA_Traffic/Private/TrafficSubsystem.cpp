@@ -12,6 +12,8 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PawnMovementComponent.h"
 
+extern int32 GTrafficJunctionDiagnostics;
+
 DEFINE_LOG_CATEGORY(LogAAATraffic);
 
 const TArray<FJunctionExitRule> UTrafficSubsystem::EmptyExitRules;
@@ -323,6 +325,9 @@ void UTrafficSubsystem::RequestDespawn(ATrafficVehicleController* Controller, co
 {
 	if (!Controller) return;
 
+	UWorld* World = GetWorld();
+	if (!World) return;
+
 	// Capture everything we need before deferring. The controller may be
 	// garbage-collected between now and next tick, so use a weak pointer.
 	TWeakObjectPtr<ATrafficVehicleController> WeakController(Controller);
@@ -330,7 +335,7 @@ void UTrafficSubsystem::RequestDespawn(ATrafficVehicleController* Controller, co
 
 	// Defer actual destruction to next tick to avoid invalidating iterators
 	// or destroying objects during another object's Tick.
-	GetWorld()->GetTimerManager().SetTimerForNextTick(
+	World->GetTimerManager().SetTimerForNextTick(
 		FTimerDelegate::CreateWeakLambda(this, [this, WeakController, CapturedReason]()
 		{
 			ATrafficVehicleController* Ctrl = WeakController.Get();
@@ -568,7 +573,8 @@ bool UTrafficSubsystem::TryOccupyJunction(int32 JunctionId,
 	// all traffic behind it.  Evicting cleans the occupancy so
 	// waiting vehicles can proceed via normal TryOccupy.
 	constexpr double MaxJunctionOccupancyTimeSec = 20.0;
-	const double NowSec = FPlatformTime::Seconds();
+	const UWorld* World = GetWorld();
+	const double NowSec = World ? World->GetTimeSeconds() : 0.0;
 	Occupants.RemoveAll([NowSec, JunctionId](const FJunctionOccupant& O)
 	{
 		if (O.OccupiedAtTime > 0.0 && (NowSec - O.OccupiedAtTime) > MaxJunctionOccupancyTimeSec)
@@ -669,7 +675,10 @@ bool UTrafficSubsystem::TryOccupyJunction(int32 JunctionId,
 	NewOccupant.Controller = Controller;
 	NewOccupant.FromLane = FromLane;
 	NewOccupant.ToLane = ToLane;
-	NewOccupant.OccupiedAtTime = FPlatformTime::Seconds();
+	{
+		const UWorld* W = GetWorld();
+		NewOccupant.OccupiedAtTime = W ? W->GetTimeSeconds() : 0.0;
+	}
 	Occupants.Add(NewOccupant);
 
 	UE_LOG(LogAAATraffic, Warning,
@@ -702,7 +711,10 @@ void UTrafficSubsystem::ForceOccupyJunction(int32 JunctionId,
 	NewOccupant.Controller = Controller;
 	NewOccupant.FromLane = FromLane;
 	NewOccupant.ToLane = ToLane;
-	NewOccupant.OccupiedAtTime = FPlatformTime::Seconds();
+	{
+		const UWorld* W = GetWorld();
+		NewOccupant.OccupiedAtTime = W ? W->GetTimeSeconds() : 0.0;
+	}
 	Occupants.Add(NewOccupant);
 
 	UE_LOG(LogAAATraffic, Warning,
@@ -905,7 +917,10 @@ void UTrafficSubsystem::RecordStopSignArrival(int32 JunctionId, ATrafficVehicleC
 
 	FStopSignArrival Entry;
 	Entry.Controller = Controller;
-	Entry.ArrivalTime = FPlatformTime::Seconds();
+	{
+		const UWorld* W = GetWorld();
+		Entry.ArrivalTime = W ? W->GetTimeSeconds() : 0.0;
+	}
 	Queue.Add(Entry);
 }
 
@@ -983,6 +998,31 @@ void UTrafficSubsystem::BuildJunctionSurvey()
 
 	UE_LOG(LogAAATraffic, Log, TEXT("SURVEY: Starting junction survey — %d junctions found."), JunctionIds.Num());
 
+	// Build a one-time map: JunctionId → approach lanes.
+	// Single pass over all roads/lanes instead of rescanning per junction.
+	TMap<int32, TArray<FTrafficLaneHandle>> JunctionToApproachLanes;
+	for (const FTrafficRoadHandle& Road : AllRoads)
+	{
+		TArray<FTrafficLaneHandle> RoadLanes = Provider->GetLanesForRoad(Road);
+		for (const FTrafficLaneHandle& Lane : RoadLanes)
+		{
+			if (Provider->GetJunctionForLane(Lane) != 0) { continue; }
+			TArray<FTrafficLaneHandle> LaneConnected = Provider->GetConnectedLanes(Lane);
+			for (const FTrafficLaneHandle& LC : LaneConnected)
+			{
+				const int32 ConnJId = Provider->GetJunctionForLane(LC);
+				if (ConnJId == 0) { continue; }
+				TArray<FTrafficLaneHandle>& ForJunction = JunctionToApproachLanes.FindOrAdd(ConnJId);
+				bool bDup = false;
+				for (const FTrafficLaneHandle& A : ForJunction)
+				{
+					if (A.HandleId == Lane.HandleId) { bDup = true; break; }
+				}
+				if (!bDup) { ForJunction.Add(Lane); }
+			}
+		}
+	}
+
 	int32 TotalRules = 0;
 
 	for (const int32 JunctionId : JunctionIds)
@@ -1008,37 +1048,12 @@ void UTrafficSubsystem::BuildJunctionSurvey()
 			}
 		}
 
-		// Find approach lanes: non-junction lanes that connect INTO this junction.
-		// An approach lane is any lane whose GetConnectedLanes output includes a
-		// junction lane belonging to this junction.
+		// Approach lanes from the precomputed map.
+		const TArray<FTrafficLaneHandle>* PrecomputedApproach = JunctionToApproachLanes.Find(JunctionId);
 		TArray<FTrafficLaneHandle> ApproachLanes;
-		for (const FTrafficRoadHandle& Road : AllRoads)
+		if (PrecomputedApproach)
 		{
-			TArray<FTrafficLaneHandle> RoadLanes = Provider->GetLanesForRoad(Road);
-			for (const FTrafficLaneHandle& Lane : RoadLanes)
-			{
-				if (Provider->GetJunctionForLane(Lane) != 0) { continue; } // Skip junction lanes.
-				TArray<FTrafficLaneHandle> LaneConnected = Provider->GetConnectedLanes(Lane);
-				for (const FTrafficLaneHandle& LC : LaneConnected)
-				{
-					// Does this connected lane belong to our junction?
-					bool bIsJunctionLane = false;
-					for (const FTrafficLaneHandle& JL : JunctionLanes)
-					{
-						if (JL.HandleId == LC.HandleId) { bIsJunctionLane = true; break; }
-					}
-					if (bIsJunctionLane)
-					{
-						bool bDup = false;
-						for (const FTrafficLaneHandle& A : ApproachLanes)
-						{
-							if (A.HandleId == Lane.HandleId) { bDup = true; break; }
-						}
-						if (!bDup) { ApproachLanes.Add(Lane); }
-						break;
-					}
-				}
-			}
+			ApproachLanes = *PrecomputedApproach;
 		}
 
 		UE_LOG(LogAAATraffic, Log,
@@ -1179,9 +1194,12 @@ void UTrafficSubsystem::BuildJunctionSurvey()
 							if (TurnRadius < MinRadius && LaneWidth > 0.0f && TurnRadius < LaneWidth * 0.5f)
 							{
 								bPhysicallyFeasible = false;
-								UE_LOG(LogAAATraffic, Log,
-									TEXT("SURVEY:   Approach=%d Exit=%d INFEASIBLE (TurnRadius=%.0f < MinRadius=%.0f, LaneWidth=%.0f)"),
-									Approach.HandleId, Exit.HandleId, TurnRadius, MinRadius, LaneWidth);
+								if (GTrafficJunctionDiagnostics >= 1)
+								{
+									UE_LOG(LogAAATraffic, Log,
+										TEXT("SURVEY:   Approach=%d Exit=%d INFEASIBLE (TurnRadius=%.0f < MinRadius=%.0f, LaneWidth=%.0f)"),
+										Approach.HandleId, Exit.HandleId, TurnRadius, MinRadius, LaneWidth);
+								}
 							}
 						}
 					}
@@ -1197,11 +1215,14 @@ void UTrafficSubsystem::BuildJunctionSurvey()
 				Rule.bPhysicallyFeasible = bPhysicallyFeasible;
 				Rules.Add(Rule);
 
-				UE_LOG(LogAAATraffic, Log,
-					TEXT("SURVEY:   Approach=%d Exit=%d Turn=%s Dot=%.3f W=%.3f Feasible=%s"),
-					Approach.HandleId, Exit.HandleId,
-					TurnDir == ETurnSignalState::Left ? TEXT("L") : (TurnDir == ETurnSignalState::Right ? TEXT("R") : TEXT("S")),
-					Dot, Rule.Weight, bPhysicallyFeasible ? TEXT("Y") : TEXT("N"));
+				if (GTrafficJunctionDiagnostics >= 1)
+				{
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("SURVEY:   Approach=%d Exit=%d Turn=%s Dot=%.3f W=%.3f Feasible=%s"),
+						Approach.HandleId, Exit.HandleId,
+						TurnDir == ETurnSignalState::Left ? TEXT("L") : (TurnDir == ETurnSignalState::Right ? TEXT("R") : TEXT("S")),
+						Dot, Rule.Weight, bPhysicallyFeasible ? TEXT("Y") : TEXT("N"));
+				}
 			}
 
 			// Safety: if all rules ended up with Weight=0, give them minimal weight

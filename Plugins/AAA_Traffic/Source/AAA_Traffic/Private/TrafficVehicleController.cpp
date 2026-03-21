@@ -1380,12 +1380,18 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 			FlipTimeAccumulator += EffectiveDeltaSeconds;
 			if (FlipTimeAccumulator >= FlipDespawnTimeSec)
 			{
-				bPendingRecoveryDespawn = true;
 				if (TrafficSub)
 				{
+					bPendingRecoveryDespawn = true;
 					TrafficSub->RequestDespawn(this,
 						FString::Printf(TEXT("flipped/airborne for %.1fs (UpZ=%.2f)"),
 							FlipTimeAccumulator, UpZ));
+				}
+				else
+				{
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("Safety: flipped vehicle has no subsystem for despawn — resetting accumulator."));
+					FlipTimeAccumulator = 0.0f;
 				}
 				return;
 			}
@@ -1408,12 +1414,18 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 			StuckTimeAccumulator += EffectiveDeltaSeconds;
 			if (StuckTimeAccumulator >= StuckDespawnTimeSec)
 			{
-				bPendingRecoveryDespawn = true;
 				if (TrafficSub)
 				{
+					bPendingRecoveryDespawn = true;
 					TrafficSub->RequestDespawn(this,
-						FString::Printf(TEXT("stuck for %.1fs (moved %.1f cm)"),
+						FString::Printf(TEXT("stuck for %.1fs (moved %.1f cm this tick)"),
 							StuckTimeAccumulator, MovedDist));
+				}
+				else
+				{
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("Safety: stuck vehicle has no subsystem for despawn — resetting accumulator."));
+					StuckTimeAccumulator = 0.0f;
 				}
 				return;
 			}

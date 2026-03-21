@@ -67,7 +67,7 @@ struct FJunctionOccupant
 	FTrafficLaneHandle FromLane;
 	FTrafficLaneHandle ToLane;
 
-	/** Wall-clock time when occupancy was granted (FPlatformTime::Seconds()).
+	/** Simulation time when occupancy was granted (UWorld::GetTimeSeconds()).
 	 *  Used to evict stuck vehicles that never released their occupancy. */
 	double OccupiedAtTime = 0.0;
 };
@@ -80,7 +80,8 @@ struct FJunctionOccupant
 struct FStopSignArrival
 {
 	TWeakObjectPtr<ATrafficVehicleController> Controller;
-	/** Wall-clock time when the vehicle completed its mandatory stop. */
+	/** Simulation time when the vehicle completed its mandatory stop.
+	 *  Deterministic: sourced from UWorld::GetTimeSeconds(). */
 	double ArrivalTime = 0.0;
 };
 

@@ -710,9 +710,9 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 
 	// Curvature-aware spawn: avoid placing vehicles on tight curves where
 	// they'd immediately need emergency braking. If the spawn point is on
-	// a curve with radius < 25m (κ > 0.0004), walk forward to find a
-	// straighter segment. This prevents freshly spawned vehicles from
-	// immediately departing their lane on sharp curves.
+	// a curve with radius < 25m (κ > 0.0004), skip this spawn slot.
+	// This prevents freshly spawned vehicles from immediately departing
+	// their lane on sharp curves.
 	{
 		// Find the polyline index closest to the spawn position.
 		int32 SpawnIdx = 0;
@@ -766,23 +766,14 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 		UTrafficSubsystem* OverlapSub = World->GetSubsystem<UTrafficSubsystem>();
 		if (OverlapSub)
 		{
-			const float MinSeparationSq = SpawnSpacing * SpawnSpacing;
-			for (const TWeakObjectPtr<ATrafficVehicleController>& WeakVC : OverlapSub->GetActiveVehicles())
+			TArray<ATrafficVehicleController*> Nearby = OverlapSub->GetNearbyVehicles(SpawnLocation, SpawnSpacing);
+			if (Nearby.Num() > 0)
 			{
-				ATrafficVehicleController* VC = WeakVC.Get();
-				if (!VC) { continue; }
-				const APawn* ExistingPawn = VC->GetPawn();
-				if (!ExistingPawn) { continue; }
-
-				if (FVector::DistSquared(SpawnLocation, ExistingPawn->GetActorLocation()) < MinSeparationSq)
-				{
-					UE_LOG(LogAAATraffic, Log,
-						TEXT("TrafficSpawner: Skipping vehicle %d on lane %d — "
-							 "existing vehicle '%s' too close (within %.0f cm)."),
-						VehicleIndex, Lane.HandleId,
-						*ExistingPawn->GetName(), SpawnSpacing);
-					return;
-				}
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("TrafficSpawner: Skipping vehicle %d on lane %d — "
+						 "existing vehicle too close (within %.0f cm)."),
+					VehicleIndex, Lane.HandleId, SpawnSpacing);
+				return;
 			}
 		}
 	}
