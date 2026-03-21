@@ -1,4 +1,4 @@
-﻿// TrafficVehicleController_Diagnostics.cpp — Diagnostic logging and decision tracing.
+// TrafficVehicleController_Diagnostics.cpp -- Diagnostic logging and decision tracing.
 // Split from TrafficVehicleController.cpp for maintainability.
 
 #include "TrafficVehicleController.h"
@@ -91,7 +91,7 @@ void ATrafficVehicleController::TickDiagnostics(float DeltaSeconds)
 					bRawHandbrake ? TEXT("HANDBRAKE-ON") : TEXT("handbrake-off"),
 					(DistMoved > 100.0f) ? TEXT("DRIVING OK") : TEXT("NOT DRIVING"));
 
-				// Per-wheel diagnostics â€” are wheels touching the ground?
+				// Per-wheel diagnostics -- are wheels touching the ground?
 				for (int32 WIdx = 0; WIdx < NumWheelInstances; ++WIdx)
 				{
 					const FWheelStatus& WS = DiagMC->GetWheelState(WIdx);
@@ -108,7 +108,7 @@ void ATrafficVehicleController::TickDiagnostics(float DeltaSeconds)
 			else
 			{
 				UE_LOG(LogAAATraffic, Warning,
-					TEXT("DEEP DIAG (2s): Pawn='%s' DistFromSpawn=%.1f â€” "
+					TEXT("DEEP DIAG (2s): Pawn='%s' DistFromSpawn=%.1f -- "
 						 "No ChaosWheeledVehicleMovementComponent"),
 					*GetPawn()->GetName(), DistMoved);
 			}
@@ -344,6 +344,6 @@ void ATrafficVehicleController::FlushLaneDecisionTrace(const TCHAR* Reason, bool
 }
 
 // ---------------------------------------------------------------------------
-// Curvature computation â€” Menger curvature from polyline points
+// Curvature computation -- Menger curvature from polyline points
 // ---------------------------------------------------------------------------
 

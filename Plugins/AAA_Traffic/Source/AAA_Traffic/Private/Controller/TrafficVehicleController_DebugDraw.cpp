@@ -1,4 +1,4 @@
-﻿// TrafficVehicleController_DebugDraw.cpp — In-world debug visualization.
+// TrafficVehicleController_DebugDraw.cpp -- In-world debug visualization.
 // Split from TrafficVehicleController.cpp for maintainability.
 
 #include "TrafficVehicleController.h"
@@ -89,7 +89,7 @@ void ATrafficVehicleController::DrawVehicleDebug()
 		if (JnctState.bHasEntryPos)
 		{
 			DrawDebugSphere(DbgWorld, JnctState.EntryWorldPos, 60.0f, 8, FColor::Red, false, -1.0f, 0, 3.0f);
-			// Yellow line from car to entry point â€” shows actual stopping gap.
+			// Yellow line from car to entry point -- shows actual stopping gap.
 			DrawDebugLine(DbgWorld, VehicleLoc, JnctState.EntryWorldPos, FColor::Yellow, false, -1.0f, 0, 2.5f);
 
 			// Blue sphere: where the decel curve predicts the car WILL stop

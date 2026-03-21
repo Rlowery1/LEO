@@ -1,4 +1,4 @@
-﻿// Copyright AAA_Traffic Contributors. All Rights Reserved.
+// Copyright AAA_Traffic Contributors. All Rights Reserved.
 
 #include "TrafficVehicleController.h"
 #include "TrafficSubsystem.h"
@@ -74,7 +74,7 @@ static FAutoConsoleVariableRef CVarTrafficJunctionDiagnostics(
 	ECVF_Default);
 
 // IsVehicleTraceEnabled moved to TrafficVehicleController_Diagnostics.cpp
-// â”€â”€ FVehicleJunctionState phase transitions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// -- FVehicleJunctionState phase transitions ----------------
 
 void FVehicleJunctionState::BeginApproach(int32 InJunctionId)
 {
@@ -82,7 +82,7 @@ void FVehicleJunctionState::BeginApproach(int32 InJunctionId)
 		TEXT("BeginApproach: expected Idle, got %d"), (int32)Phase);
 	Phase = EJunctionPhase::Approaching;
 	JunctionId = InJunctionId;
-	LastReleasedId = 0; // New engagement â€” clear stale release marker.
+	LastReleasedId = 0; // New engagement -- clear stale release marker.
 }
 
 void FVehicleJunctionState::BeginWaiting()
@@ -290,8 +290,8 @@ ETurnSignalState ATrafficVehicleController::ComputeTurnDirection(
 	// Cross product Z: positive = left turn, negative = right turn.
 	const float CrossZ = FVector::CrossProduct(ApproachDir, ExitDir).Z;
 
-	// Threshold: ~15Â° deviation from straight â€” below this, treat as straight-through.
-	constexpr float StraightThreshold = 0.26f; // sin(15Â°) â‰ˆ 0.259
+	// Threshold: ~15 deg deviation from straight -- below this, treat as straight-through.
+	constexpr float StraightThreshold = 0.26f; // sin(15 deg) ~= 0.259
 	if (FMath::Abs(CrossZ) < StraightThreshold)
 	{
 		return ETurnSignalState::Off;
@@ -424,7 +424,7 @@ void ATrafficVehicleController::OnUnPossess()
 			else
 			{
 				UE_LOG(LogAAATraffic, Warning,
-					TEXT("JNCT RELEASE-UNPOSSESS: Pawn='%s' unpossess â€” Phase=%d, nothing to release"),
+					TEXT("JNCT RELEASE-UNPOSSESS: Pawn='%s' unpossess -- Phase=%d, nothing to release"),
 					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 					(int32)JnctState.Phase);
 			}
@@ -448,7 +448,7 @@ void ATrafficVehicleController::HandleActorHit(
 	CollisionBrakeTimer = FMath::Max(CollisionBrakeTimer, 1.0f);
 
 	UE_LOG(LogAAATraffic, Warning,
-		TEXT("COLLISION: Pawn='%s' hit '%s' impulse=%.0f â€” braking for 1s"),
+		TEXT("COLLISION: Pawn='%s' hit '%s' impulse=%.0f -- braking for 1s"),
 		SelfActor ? *SelfActor->GetName() : TEXT("NULL"),
 		*OtherActor->GetName(),
 		NormalImpulse.Size());
@@ -482,7 +482,7 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 		{
 			bDiagLoggedTickSkip = true;
 			UE_LOG(LogAAATraffic, Warning,
-				TEXT("VehicleController::Tick: Skipping â€” bLaneDataReady=%s, Pawn=%s. "
+				TEXT("VehicleController::Tick: Skipping -- bLaneDataReady=%s, Pawn=%s. "
 					 "Lane will not be followed until both are valid."),
 				bLaneDataReady ? TEXT("true") : TEXT("false"),
 				GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"));
@@ -503,7 +503,7 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 	// Reduced: tick every 4 frames. Minimal: tick every 10 frames.
 	//
 	// FIX (was MAJOR): Previously skipped frames entirely with bare `return`,
-	// so DeltaTime was lost â€” vehicle behavior became frame-rate dependent.
+	// so DeltaTime was lost -- vehicle behavior became frame-rate dependent.
 	// Now we accumulate DeltaTime across skipped frames and pass the total
 	// to UpdateVehicleInput on the tick that fires, making the update
 	// frame-rate independent.
@@ -575,7 +575,7 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 	const float EffectiveDeltaSeconds = DeltaSeconds + LODAccumulatedDeltaTime;
 	LODAccumulatedDeltaTime = 0.0f;
 
-	// â”€â”€ Physics Safety Net â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	// -- Physics Safety Net ----------------------------------
 	// Detect vehicles that are flipped, airborne, or stuck and despawn them
 	// to prevent physics explosions, traffic jams, and visual artifacts.
 	{
@@ -601,7 +601,7 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 				else
 				{
 					UE_LOG(LogAAATraffic, Warning,
-						TEXT("Safety: flipped vehicle has no subsystem for despawn â€” resetting accumulator."));
+						TEXT("Safety: flipped vehicle has no subsystem for despawn -- resetting accumulator."));
 					FlipTimeAccumulator = 0.0f;
 				}
 				return;
@@ -635,7 +635,7 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 				else
 				{
 					UE_LOG(LogAAATraffic, Warning,
-						TEXT("Safety: stuck vehicle has no subsystem for despawn â€” resetting accumulator."));
+						TEXT("Safety: stuck vehicle has no subsystem for despawn -- resetting accumulator."));
 					StuckTimeAccumulator = 0.0f;
 				}
 				return;
@@ -732,7 +732,7 @@ FVector ATrafficVehicleController::GetLookAheadPoint(
 
 	// If the look-ahead extends beyond the lane, extrapolate along the
 	// final segment direction. Returning LanePoints.Last() would make
-	// Ldâ†’0 as the vehicle approaches, causing a steering spike.
+	// Ld->0 as the vehicle approaches, causing a steering spike.
 	if (LanePoints.Num() >= 2)
 	{
 		const int32 Last = LanePoints.Num() - 1;

@@ -1,4 +1,4 @@
-﻿// TrafficVehicleController_UpdateInput.cpp — Per-tick driving AI and leader detection.
+// TrafficVehicleController_UpdateInput.cpp -- Per-tick driving AI and leader detection.
 // Split from TrafficVehicleController.cpp for maintainability.
 
 #include "TrafficVehicleController.h"
@@ -47,7 +47,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	// --- Safety net: undo unexpected parking/sleep if detected ---
 	// PRIMARY FIX is in OnPossess: we set the parent BP's 'Optimized' variable
 	// to false via reflection, which disables the entire Physics optimization
-	// â†’ Optimization Unpossessed â†’ CE_StopCar â†’ CE Set Parked(true) chain.
+	// -> Optimization Unpossessed -> CE_StopCar -> CE Set Parked(true) chain.
 	// These conditional checks remain as a cheap safety net in case a future
 	// marketplace pack update re-introduces parking through a different path.
 	if (VehicleMovement->IsParked())
@@ -58,7 +58,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	{
 		VehicleMovement->SetHandbrakeInput(false);
 	}
-	// SetSleeping(false) calls WakeAllEnabledRigidBodies â€” only invoke when actually sleeping.
+	// SetSleeping(false) calls WakeAllEnabledRigidBodies -- only invoke when actually sleeping.
 	{
 		UPrimitiveComponent* WakePrim = VehicleMovement->UpdatedPrimitive;
 		if (WakePrim)
@@ -75,8 +75,8 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	const FVector VehicleForward = ControlledPawn->GetActorForwardVector();
 	const float CurrentSpeed = VehicleMovement->GetForwardSpeed();
 
-	// â”€â”€ Compute adaptive distances from time-based parameters â”€â”€
-	// Each distance = |CurrentSpeed| Ã— TimeSec, clamped to a floor so
+	// -- Compute adaptive distances from time-based parameters --
+	// Each distance = |CurrentSpeed| * TimeSec, clamped to a floor so
 	// behaviour remains stable even when the vehicle is nearly stopped.
 	const float AbsSpeed = FMath::Abs(CurrentSpeed);
 	LookAheadDistance  = FMath::Max(AbsSpeed * LookAheadTimeSec,  MinLookAheadDistanceCm);
@@ -89,7 +89,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	bool bApproachBraking = false;
 
 #if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
-	// Initialize debug cache each tick â€” will be overwritten by decision branches.
+	// Initialize debug cache each tick -- will be overwritten by decision branches.
 	DbgCurrentSpeed = CurrentSpeed;
 	DbgStateName = TEXT("CRUISING");
 	DbgThrottle = 0.0f;
@@ -121,9 +121,9 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		FLaneChangeEvalContext LCCtx;
 		LCCtx.VehicleLocation   = VehicleLocation;
 		LCCtx.EgoForward        = ControlledPawn->GetActorForwardVector();
-		LCCtx.CurrentSpeed      = CurrentSpeed;
+		LCCtx.CurrentSpeed      = FMath::Abs(CurrentSpeed);
 		LCCtx.TargetSpeed       = TargetSpeed;
-		LCCtx.EgoForwardSpeed   = CurrentSpeed; // already Abs of forward speed
+		LCCtx.EgoForwardSpeed   = FMath::Abs(CurrentSpeed);
 		LCCtx.VehicleFrontExtent = VehicleFrontExtent;
 		LCCtx.VehicleRearExtent  = VehicleRearExtent;
 		LCCtx.DetectionDistance   = DetectionDistance;
@@ -153,7 +153,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	// Find where we are on the lane and where to aim
 	const int32 ClosestIndex = FindClosestPointIndex(VehicleLocation);
 
-	// â”€â”€ PERIODIC JUNCTION DIAGNOSTIC DUMP (every ~2s per vehicle) â”€â”€
+	// -- PERIODIC JUNCTION DIAGNOSTIC DUMP (every ~2s per vehicle) --
 	// Provides a full status snapshot so you can see at a glance which vehicles
 	// are aware of junctions and which are "blind."
 	if (GTrafficJunctionDiagnostics >= 1)
@@ -193,7 +193,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	}
 
 
-	// â”€â”€ Junction approach scan (delegated to FJunctionNegotiator) â”€â”€
+	// -- Junction approach scan (delegated to FJunctionNegotiator) --
 	bApproachBraking = JunctionNeg_.TickApproach(ClosestIndex, AbsSpeed, CurrentSpeed);
 
 	// --- Lane-end detection + intersection right-of-way ---
@@ -205,8 +205,8 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		const float RemainingDist = GetRemainingDistance(ClosestIndex);
 		// Use physics-based stopping-distance threshold so fast vehicles get
 		// enough advance warning to actually stop before the intersection.
-		// Old formula: max(LookAhead, |Speed| * 1.0s) â€” only 1s of reaction time.
-		// New formula: max(LookAhead, vÂ²/(2*decel) + margin) â€” matches actual braking physics.
+		// Old formula: max(LookAhead, |Speed| * 1.0s) -- only 1s of reaction time.
+		// New formula: max(LookAhead, v^2/(2*decel) + margin) -- matches actual braking physics.
 		// AbsSpeed already computed at the top of UpdateVehicleInput.
 		const float StoppingDist = (AbsSpeed * AbsSpeed) / (2.0f * ApproachDecelCmPerSec2);
 		const float TransitionThreshold = FMath::Max(LookAheadDistance, StoppingDist + ApproachSafetyMarginCm);
@@ -217,7 +217,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		// MinTransitionGuard: small constant to prevent re-triggering on the
 		// same frame, but low enough that short virtual segments (created by
 		// through-road splitting) still trigger intersection detection.
-		constexpr float MinTransitionGuard = 50.0f; // cm â€” ~1 polyline sample
+		constexpr float MinTransitionGuard = 50.0f; // cm -- ~1 polyline sample
 
 		// DIAGNOSTIC: Log why the detection gate doesn't fire.
 		const bool bLaneEndClose = (RemainingDist < TransitionThreshold);
@@ -247,7 +247,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 					TEXT("JDIAG GATE-NOT-FIRING: Pawn='%s' Lane=%d RemainingDist=%.1f "
 						 "TransitionThreshold=%.1f DistTraveled=%.1f MinGuard=%.1f "
 						 "Speed=%.1f bApproaching=%s ApproachDist=%.1f ApproachJnct=%d "
-						 "â€” Vehicle is NOT close enough to lane end for junction detection."),
+						 "-- Vehicle is NOT close enough to lane end for junction detection."),
 					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 					CurrentLane.HandleId,
 					RemainingDist,
@@ -337,7 +337,7 @@ return;
 	// --- Determine target point (junction transition, lane-change blended, or normal) ---
 	FVector TargetPoint;
 
-	// Junction transition takes priority â€” follow synthesized curve first.
+	// Junction transition takes priority -- follow synthesized curve first.
 	if (JunctionNeg_.TickTraverse(VehicleLocation, ClosestIndex, TargetPoint))
 	{
 		// TargetPoint set by junction traversal.
@@ -361,7 +361,7 @@ return;
 		{
 			if (LaneChangeCoord_.TickSettle(DeltaSeconds))
 			{
-				// Settle timer expired â€” finalize.
+				// Settle timer expired -- finalize.
 				FLaneChangeFinalizeResult FinalResult =
 					LaneChangeCoord_.Finalize(CachedProvider, DefaultSpeedLimit, BaseTargetSpeed);
 				CurrentLane           = FinalResult.NewLane;
@@ -383,7 +383,7 @@ return;
 			}
 			else
 			{
-				// Still settling â€” keep blending toward target lane.
+				// Still settling -- keep blending toward target lane.
 				const FLaneChangeBlendResult BR = LaneChangeCoord_.Blend(BlendCtx);
 				TargetPoint = BR.Point;
 			}
@@ -450,7 +450,7 @@ return;
 			? (FMath::Abs(SteerOut.SignedCTE) / SteerOut.HalfLaneWidth * 100.0f) : 0.0f;
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("STEER DIAG: Pawn='%s' Lane=%d CTE=%.1fcm (%.0f%%) "
-				 "FF=%.3f P=%.3f CTE=%.3f D=%.3f Total=%.3f Speed=%.0f LookAhead=%.0f Îº=%.6f"),
+				 "FF=%.3f P=%.3f CTE=%.3f D=%.3f Total=%.3f Speed=%.0f LookAhead=%.0f k=%.6f"),
 			GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 			CurrentLane.HandleId,
 			SteerOut.SignedCTE, CTEpct,
@@ -472,14 +472,14 @@ return;
 			CurrentSpeed, SteeringInput);
 	}
 
-	// --- Throttle / Brake (IDM â€” Intelligent Driver Model) ---
+	// --- Throttle / Brake (IDM -- Intelligent Driver Model) ---
 	// Step 1: Detect leader vehicle (LOD-dependent method).
-	// Step 2: Compute desired speed vâ‚€ (road limit + junction/curve caps).
-	// Step 3: IDM acceleration: áº = a[1 - (v/vâ‚€)â´ - (s*/s)Â²],
-	//         s* = sâ‚€ + max(0, vT + vÎ”v/(2âˆš(ab))).
+// Step 2: Compute desired speed v0 (road limit + junction/curve caps).
+	// Step 3: IDM acceleration: a_idm = a[1 - (v/v0)^4 - (s*/s)^2],
+	//         s* = s0 + max(0, vT + v*dv/(2*sqrt(ab))).
 	// Step 4: Map acceleration to throttle/brake inputs.
 
-	// â”€â”€ Step 1: Leader detection (delegated to LeaderDetector) â”€â”€
+	// -- Step 1: Leader detection (delegated to LeaderDetector) --
 	FLeaderDetectorInput LdrIn;
 	LdrIn.VehicleLocation        = VehicleLocation;
 	LdrIn.VehicleForward         = ControlledPawn->GetActorForwardVector();
@@ -515,7 +515,7 @@ return;
 	float LeaderSpeed = LdrOut.LeaderSpeed;
 	bool bLeaderBrakeLightsVisible = LdrOut.bLeaderBrakeLightsVisible;
 
-	// â”€â”€ Step 2: Desired speed (IDM vâ‚€) â€” delegated to SpeedEnvelope â”€â”€
+	// -- Step 2: Desired speed (IDM v0) -- delegated to SpeedEnvelope --
 	FSpeedEnvelopeInput SpeedIn;
 	SpeedIn.TargetSpeed                    = TargetSpeed;
 	SpeedIn.CurrentSpeed                   = AbsSpeed;
@@ -555,7 +555,7 @@ return;
 	}
 #endif
 
-	// â”€â”€ Merge cooperation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	// -- Merge cooperation ------------------------------------
 	// If a vehicle on an adjacent lane is actively lane-changing toward
 	// this vehicle's lane AND is alongside (within detection range),
 	// reduce effective speed to create a merge gap.
@@ -579,13 +579,13 @@ return;
 					// Is the adjacent vehicle merging toward our lane?
 					if (Adj->LaneChangeCoord_.State != ELaneChangeState::Executing) { continue; }
 					if (Adj->LaneChangeCoord_.TargetLane != CurrentLane) { continue; }
-					// Is it alongside us (within Â±DetectionDistance)?
+					// Is it alongside us (within +/-DetectionDistance)?
 					const APawn* AdjPawn = Adj->GetPawn();
 					if (!AdjPawn) { continue; }
 					const float LongDist = FVector::DotProduct(
 						AdjPawn->GetActorLocation() - VehicleLocation,
 						ControlledPawn->GetActorForwardVector());
-					// Adjacent vehicle is ahead but close â€” slow down to create gap.
+					// Adjacent vehicle is ahead but close -- slow down to create gap.
 					if (LongDist > -200.0f && LongDist < DetectionDistance * 0.5f)
 					{
 						// Cooperative decel: reduce target by 15%.
@@ -606,7 +606,7 @@ return;
 		return;
 	}
 
-	// â”€â”€ Step 3+4: IDM acceleration â†’ throttle/brake (delegated) â”€â”€
+	// -- Step 3+4: IDM acceleration -> throttle/brake (delegated) --
 	FAccelerationInput AccelIn;
 	AccelIn.CurrentSpeed             = CurrentSpeed;
 	AccelIn.DesiredSpeed             = EffectiveTargetSpeed;
@@ -631,7 +631,7 @@ return;
 	if (AccelOut.bAEBActive)
 	{
 		UE_LOG(LogAAATraffic, Warning,
-			TEXT("AEB ACTIVE: Pawn='%s' Gap=%.0fcm â€” EMERGENCY BRAKE"),
+			TEXT("AEB ACTIVE: Pawn='%s' Gap=%.0fcm -- EMERGENCY BRAKE"),
 			GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 			LeaderDist);
 	}
@@ -658,7 +658,7 @@ return;
 		VehicleMovement->SetHandbrakeInput(false);
 	}
 
-	// Reactive collision handler â€” if we physically collided, override to
+	// Reactive collision handler -- if we physically collided, override to
 	// full braking for the duration of CollisionBrakeTimer.
 	if (CollisionBrakeTimer > 0.0f)
 	{
@@ -674,7 +674,7 @@ return;
 	// --- Velocity sanity clamp ---
 	// If the physics body somehow exceeds MaxAllowedSpeedCmPerSec (e.g. from
 	// a collision penetration-resolution impulse), zero the velocity entirely.
-	// This is a last-resort safety net â€” normal driving never reaches this.
+	// This is a last-resort safety net -- normal driving never reaches this.
 	if (UPrimitiveComponent* Prim = VehicleMovement->UpdatedPrimitive)
 	{
 		if (FBodyInstance* BI = Prim->GetBodyInstance())
@@ -685,7 +685,7 @@ return;
 				BI->SetLinearVelocity(FVector::ZeroVector, false);
 				BI->SetAngularVelocityInRadians(FVector::ZeroVector, false);
 				UE_LOG(LogAAATraffic, Warning,
-					TEXT("SAFETY VELOCITY-CLAMP: Pawn='%s' had runaway speed %.0f cm/s (max %.0f) â€” zeroed"),
+					TEXT("SAFETY VELOCITY-CLAMP: Pawn='%s' had runaway speed %.0f cm/s (max %.0f) -- zeroed"),
 					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 					LinearVel.Size(), MaxAllowedSpeedCmPerSec);
 			}
@@ -810,7 +810,7 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 		return HitResult.Distance;
 	}
 
-	// â”€â”€ Polyline-following sweep â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	// -- Polyline-following sweep -----------------------------
 	// Walk segments from StartIdx forward, firing a sphere sweep
 	// along each segment. Accumulate distance and return total
 	// on first hit.
@@ -867,12 +867,12 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 		bFirstSeg = false;
 	}
 
-	// â”€â”€ Straight-line extension past polyline end â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	// -- Straight-line extension past polyline end ------------
 	// If we exhausted the polyline but still have detection budget,
 	// fire one more sweep from the last polyline point in the direction
 	// of the last segment.  Without this, vehicles just past the lane
 	// end (e.g., entering a junction) are invisible to following vehicles
-	// â€” the leading cause of rear-end collisions at junction entries.
+	// -- the leading cause of rear-end collisions at junction entries.
 	{
 		const float ExtBudget = DetectionDistance - AccumDist;
 		if (ExtBudget > 0.0f && Pts.Num() >= 2)

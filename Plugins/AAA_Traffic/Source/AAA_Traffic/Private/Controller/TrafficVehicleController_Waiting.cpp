@@ -1,4 +1,4 @@
-﻿// TrafficVehicleController_Waiting.cpp — Intersection waiting and right-of-way logic.
+// TrafficVehicleController_Waiting.cpp -- Intersection waiting and right-of-way logic.
 // Split from TrafficVehicleController.cpp for maintainability.
 
 #include "TrafficVehicleController.h"
@@ -38,14 +38,14 @@ return false;
 						 "Root cause: InitializeLaneFollowing erased the ID while waiting."),
 					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"));
 				JnctState.Reset();
-				// Fall through â€” vehicle will resume normal lane following.
+				// Fall through -- vehicle will resume normal lane following.
 			}
 			else if (TrafficSub)
 			{
 				// Accumulate wait time for timeout detection.
 				JnctState.WaitElapsed += DeltaSeconds;
 
-				// â”€â”€ Stop-sign elapsed timer (every frame, not just on retry) â”€â”€
+				// -- Stop-sign elapsed timer (every frame, not just on retry) --
 				// Accumulate real DeltaSeconds so the required-wait comparison
 				// is frame-rate independent.  The old code added a hardcoded
 				// 0.25 s per retry tick, coupling the timer to retry cadence.
@@ -65,10 +65,10 @@ return false;
 							if (JnctState.StopSignStopElapsed >= RequiredWait)
 							{
 								JnctState.bStopSignWaitComplete = true;
-								// Register in FIFO queue â€” first to complete mandatory stop = first to go.
+								// Register in FIFO queue -- first to complete mandatory stop = first to go.
 								TrafficSub->RecordStopSignArrival(JnctState.JunctionId, this);
 								UE_LOG(LogAAATraffic, Warning,
-									TEXT("JNCT STOPSIGN-WAIT-DONE: Pawn='%s' JunctionId=%d â€” "
+									TEXT("JNCT STOPSIGN-WAIT-DONE: Pawn='%s' JunctionId=%d -- "
 										 "waited %.1fs at stop, now checking occupancy (FIFO queued)"),
 									GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 									JnctState.JunctionId, JnctState.StopSignStopElapsed);
@@ -115,7 +115,7 @@ return false;
 						{
 							bSignalAllows = true;
 							UE_LOG(LogAAATraffic, Log,
-								TEXT("JNCT RIGHT-ON-RED: Pawn='%s' JunctionId=%d â€” "
+								TEXT("JNCT RIGHT-ON-RED: Pawn='%s' JunctionId=%d -- "
 									 "stopped + no conflicts, proceeding with right turn on red"),
 								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 								JnctState.JunctionId);
@@ -132,7 +132,7 @@ return false;
 						}
 						else if (!TrafficSub->IsStopSignTurnToGo(JnctState.JunctionId, this))
 						{
-							// FIFO ordering: another vehicle arrived first â€” must wait our turn.
+							// FIFO ordering: another vehicle arrived first -- must wait our turn.
 							bSignalAllows = false;
 						}
 					}
@@ -175,7 +175,7 @@ return false;
 
 						JnctState.bHasEntryPos = false;
 						UE_LOG(LogAAATraffic, Warning,
-							TEXT("JNCT RETRY-GRANTED: Pawn='%s' JunctionId=%d â€” CLEARED to proceed (was waiting, elapsed %.1fs)"),
+							TEXT("JNCT RETRY-GRANTED: Pawn='%s' JunctionId=%d -- CLEARED to proceed (was waiting, elapsed %.1fs)"),
 							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 							JnctState.JunctionId,
 							JnctState.WaitElapsed);
@@ -183,7 +183,7 @@ return false;
 					}
 				}
 
-				// FIX (was MAJOR): Timeout â€” if the vehicle has been waiting
+				// FIX (was MAJOR): Timeout -- if the vehicle has been waiting
 				// longer than MaxIntersectionWaitTimeSec, force-proceed to
 				// prevent permanent deadlocks. The junction may be blocked by
 				// a stuck vehicle, broken signal, or mutual denial cycle.
@@ -194,7 +194,7 @@ return false;
 				if (JnctState.bWaiting && MaxIntersectionWaitTimeSec > 0.0f && JnctState.WaitElapsed >= MaxIntersectionWaitTimeSec)
 				{
 					UE_LOG(LogAAATraffic, Warning,
-						TEXT("JNCT TIMEOUT-FORCE-PROCEED: Pawn='%s' JunctionId=%d â€” "
+						TEXT("JNCT TIMEOUT-FORCE-PROCEED: Pawn='%s' JunctionId=%d -- "
 							 "waited %.1fs (max %.1fs). Retrying TryOccupy (stale occupants auto-evicted)."),
 						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 						JnctState.JunctionId,
@@ -244,7 +244,7 @@ return false;
 				// Decel-curve brake toward intersection entry point.
 				// Compute distance to entry, checking for overshoot.
 				// Prefer polyline-based approach distance (arc) over Euclidean
-				// when available â€” Euclidean is too short on curved roads.
+				// when available -- Euclidean is too short on curved roads.
 				//
 				// C3 FIX: Also detect any vehicle stopped between ego and
 				// the entry point. If a leader is closer than the entry point,
@@ -259,7 +259,7 @@ return false;
 						WaitLeaderDist = FMath::Max(WaitLeaderDist - VehicleFrontExtent, 1.0f);
 						if (WaitLeaderDist < DistToEntry)
 						{
-							// Leader is closer than the intersection entry â€” stop behind leader.
+							// Leader is closer than the intersection entry -- stop behind leader.
 							DistToEntry = WaitLeaderDist;
 						}
 					}
@@ -270,7 +270,7 @@ return false;
 					const float DotFwd = FVector::DotProduct(ToEntry, VehicleForward);
 					if (DotFwd <= 0.0f)
 					{
-						DistToEntry = 0.0f; // Overshot â€” treat as zero.
+						DistToEntry = 0.0f; // Overshot -- treat as zero.
 					}
 					else
 					{
@@ -282,11 +282,11 @@ return false;
 						// made the decel curve think the vehicle was much
 						// farther from the stop line than it actually was,
 						// producing a high DesiredStopSpeed and near-zero
-						// brake input â€” causing consistent overshoot.
+						// brake input -- causing consistent overshoot.
 						// Euclidean updates every frame and at junction-approach
 						// distances (< ~7000 cm) the arc vs Euclidean gap is
 						// negligible, always erring on the safe side (shorter
-						// distance â†’ more conservative braking).
+						// distance -> more conservative braking).
 						DistToEntry = FVector::Dist(VehicleLocation, JnctState.EntryWorldPos);
 					}
 				}
@@ -327,7 +327,7 @@ return false;
 				float WaitBrake = 0.0f;
 				if (DistToEntry < 50.0f || DesiredStopSpeed <= KINDA_SMALL_NUMBER)
 				{
-					// At or past entry â€” full stop.
+					// At or past entry -- full stop.
 					WaitBrake = 1.0f;
 					VehicleMovement->SetThrottleInput(0.0f);
 					VehicleMovement->SetSteeringInput(0.0f);
@@ -335,7 +335,7 @@ return false;
 				}
 				else if (FMath::Abs(CurrentSpeed) > DesiredStopSpeed)
 				{
-					// Over the decel envelope â€” brake proportionally.
+					// Over the decel envelope -- brake proportionally.
 					WaitBrake = FMath::Clamp(
 						(FMath::Abs(CurrentSpeed) - DesiredStopSpeed) /
 						FMath::Max(DesiredStopSpeed, 100.0f),
@@ -346,7 +346,7 @@ return false;
 				}
 				else
 				{
-					// Under envelope â€” coast if still rolling, hold brake if stopped.
+					// Under envelope -- coast if still rolling, hold brake if stopped.
 					// Without holding brake a stopped vehicle on a slope rolls freely
 					// (Throttle=0, Brake=0 = no forces).
 					const bool bEffectivelyStopped = FMath::Abs(CurrentSpeed) < 10.0f;

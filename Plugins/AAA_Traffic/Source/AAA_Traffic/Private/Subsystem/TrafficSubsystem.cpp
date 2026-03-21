@@ -429,6 +429,19 @@ TArray<ATrafficVehicleController*> UTrafficSubsystem::GetNearbyVehicles(const FV
 			}
 		}
 	}
+
+	// §4.4 Determinism: sort by stable key so callers never depend on
+	// spatial-grid traversal order.  DeterministicSpawnIndex is unique
+	// per vehicle; fall back to pointer value as a final tie-break.
+	Result.Sort([](ATrafficVehicleController& A, ATrafficVehicleController& B)
+	{
+		if (A.DeterministicSpawnIndex != B.DeterministicSpawnIndex)
+		{
+			return A.DeterministicSpawnIndex < B.DeterministicSpawnIndex;
+		}
+		return &A < &B;
+	});
+
 	return Result;
 }
 

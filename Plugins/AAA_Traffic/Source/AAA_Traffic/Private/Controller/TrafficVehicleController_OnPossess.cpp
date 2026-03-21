@@ -1,4 +1,4 @@
-﻿// TrafficVehicleController_OnPossess.cpp — Vehicle initialization and physics setup.
+// TrafficVehicleController_OnPossess.cpp -- Vehicle initialization and physics setup.
 // Split from TrafficVehicleController.cpp for maintainability.
 
 #include "TrafficVehicleController.h"
@@ -30,12 +30,12 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("VehicleController::OnPossess: Pawn='%s' Class='%s' MovementComponent='%s' ChaosWheeledCast=%s"),
 			*InPawn->GetName(), *PawnClass, *MCClass,
-			ChaosMC ? TEXT("OK") : TEXT("FAILED â€” vehicles will NOT move"));
+			ChaosMC ? TEXT("OK") : TEXT("FAILED -- vehicles will NOT move"));
 
 		if (!ChaosMC)
 		{
 			UE_LOG(LogAAATraffic, Error,
-				TEXT("VehicleController::OnPossess: CRITICAL â€” Pawn '%s' (class '%s') does not have a UChaosWheeledVehicleMovementComponent. "
+				TEXT("VehicleController::OnPossess: CRITICAL -- Pawn '%s' (class '%s') does not have a UChaosWheeledVehicleMovementComponent. "
 					 "GetMovementComponent() returned '%s'. The vehicle controller requires ChaosWheeledVehicleMovementComponent to set throttle/steering/brake. "
 					 "Ensure the vehicle Blueprint inherits from AWheeledVehiclePawn or has this component added."),
 				*InPawn->GetName(), *PawnClass, *MCClass);
@@ -74,7 +74,7 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 			//    tolerance and keeps the body awake.
 			//
 			// 2) SleepThreshold = 0: the speed-based sleep path requires
-			//    speedÂ² < thresholdÂ². With threshold=0 this is never true,
+			//    speed^2 < threshold^2. With threshold=0 this is never true,
 			//    so ProcessSleeping's sleep counter never increments even if
 			//    the vehicle is momentarily stationary.
 			ChaosMC->SetRequiresControllerForInputs(false);
@@ -119,7 +119,7 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 			}
 
 			UE_LOG(LogAAATraffic, Log,
-				TEXT("VehicleController::OnPossess: Vehicle '%s' initialized â€” "
+				TEXT("VehicleController::OnPossess: Vehicle '%s' initialized -- "
 					 "Parked=false, Sleeping=false, Handbrake=false, Gear=1, AutoGears=true, "
 					 "HandbrakeTorque zeroed on %d wheels, "
 					 "RequiresControllerForInputs=false, SleepThreshold=0"),
@@ -127,7 +127,7 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 
 			// I3 FIX: Compute vehicle-specific max braking deceleration from
 			// the Chaos wheel setup so emergency braking maps to reality.
-			// Formula: TotalBrakeTorque / (avgWheelRadius * vehicleMass) â†’ cm/sÂ².
+			// Formula: TotalBrakeTorque / (avgWheelRadius * vehicleMass) -> cm/s^2.
 			{
 				float TotalBrakeTorque = 0.0f;  // Nm across all wheels
 				float RadiusSum = 0.0f;         // accumulate wheel radii (cm)
@@ -162,13 +162,13 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 						VehicleMassKg = FMath::Max(BI->GetBodyMass(), 100.0f);
 					}
 				}
-				// Torque(Nm) / Radius(m) = Force(N), Force/Mass = accel(m/sÂ²) â†’ *100 for cm/sÂ²
+				// Torque(Nm) / Radius(m) = Force(N), Force/Mass = accel(m/s^2) -> *100 for cm/s^2
 				const float RadiusM = FMath::Max(AvgWheelRadius * 0.01f, 0.1f);
 				MaxBrakeDecelCmPerSec2 = FMath::Clamp(
 					(TotalBrakeTorque / RadiusM / VehicleMassKg) * 100.0f,
 					300.0f, 2000.0f); // clamp to sane range
 				UE_LOG(LogAAATraffic, Log,
-					TEXT("VehicleController::OnPossess: Vehicle '%s' MaxBrakeDecel=%.0f cm/sÂ² "
+					TEXT("VehicleController::OnPossess: Vehicle '%s' MaxBrakeDecel=%.0f cm/s^2 "
 						 "(TotalBrakeTorque=%.0f Nm, AvgWheelRadius=%.1f cm, Mass=%.0f kg)"),
 					*InPawn->GetName(), MaxBrakeDecelCmPerSec2,
 					TotalBrakeTorque, AvgWheelRadius, VehicleMassKg);
@@ -235,7 +235,7 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 					VehicleMaxSteerAngleRad = FMath::DegreesToRadians(FMath::Clamp(MaxSteerDeg, 15.0f, 55.0f));
 				}
 				UE_LOG(LogAAATraffic, Log,
-					TEXT("VehicleController::OnPossess: Vehicle '%s' Wheelbase=%.1f cm, MaxSteerAngle=%.1fÂ°"),
+					TEXT("VehicleController::OnPossess: Vehicle '%s' Wheelbase=%.1f cm, MaxSteerAngle=%.1f deg"),
 					*InPawn->GetName(), VehicleWheelbaseCm,
 					FMath::RadiansToDegrees(VehicleMaxSteerAngleRad));
 			}
@@ -296,11 +296,11 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 
 		// --- Neutralize marketplace BP physics-optimization parking ---
 		// PROVEN ROOT CAUSE: The parent vehicle Blueprint (DD_Vehicles_Advanced)
-		// runs "Physics optimization" every tick via EventTick â†’ Sequence Then 0.
+		// runs "Physics optimization" every tick via EventTick -> Sequence Then 0.
 		// Entry gate: (Base Vehicle Initialized AND Optimized AND GameTime > BeginPlayMargin)
 		// Once this gate opens (~2s), the Optimization Unpossessed block detects
 		// that the vehicle has no PlayerController (only our AIController), treats
-		// it as "unpossessed", and calls CE_StopCar â†’ CE Set Parked (Parked=true),
+		// it as "unpossessed", and calls CE_StopCar -> CE Set Parked (Parked=true),
 		// killing the drivetrain every frame.
 		//
 		// Fix: use UE reflection to set the BP's "Optimized" variable to false.
@@ -309,7 +309,7 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 		// effects, smoke VFX, crash impacts, lights) continues unaffected because
 		// those are on Sequence Then 1-4, which do not check 'Optimized'.
 		//
-		// Also set "Can Sleep" to false as a secondary safety net â€” this is the
+		// Also set "Can Sleep" to false as a secondary safety net -- this is the
 		// inner gate checked by CE_CheckVehicleSleep before evaluating wake/sleep.
 		{
 			UClass* VehicleBPClass = InPawn->GetClass();
@@ -324,7 +324,7 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 
 			// Disable the 'Can Sleep' inner gate (prevents CE_CheckVehicleSleep from
 			// evaluating wake/sleep even if the Optimized gate is bypassed).
-			// BP variable names with spaces use the space-free internal FName â€” search
+			// BP variable names with spaces use the space-free internal FName -- search
 			// by both common internal names and DisplayName metadata for robustness.
 			FBoolProperty* CanSleepProp = FindFProperty<FBoolProperty>(VehicleBPClass, TEXT("CanSleep"));
 			if (!CanSleepProp)
@@ -364,7 +364,7 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 			{
 				UE_LOG(LogAAATraffic, Log,
 					TEXT("VehicleController::OnPossess: Neutralized %d BP optimization properties on '%s' "
-						 "(Optimized=false, CanSleep=false) â€” parent BP parking chain disabled."),
+						 "(Optimized=false, CanSleep=false) -- parent BP parking chain disabled."),
 					PropertiesNeutralized, *InPawn->GetName());
 			}
 			else
@@ -383,6 +383,16 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 				}
 			}
 		}
+
+		// --- Sync lane-change UPROPERTY overrides into coordinator ---
+		// If a derived Blueprint overrides the individual lane-change knobs
+		// (LaneChangeDistance, etc.) but SetLaneChangeAggression is never called,
+		// the coordinator would silently use its hardcoded defaults. Push the
+		// serialized UPROPERTY values into the coordinator so BP overrides take effect.
+		LaneChangeCoord_.Distance       = LaneChangeDistance;
+		LaneChangeCoord_.CooldownTime   = LaneChangeCooldownTime;
+		LaneChangeCoord_.SpeedThreshold = LaneChangeSpeedThreshold;
+		LaneChangeCoord_.GapRequired    = LaneChangeGapRequired;
 
 		// --- Bind collision response ---
 		// When the pawn physically hits another actor, start a brief
