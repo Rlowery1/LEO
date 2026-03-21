@@ -1,0 +1,309 @@
+// LeaderDetector.cpp — Leader vehicle detection implementation.
+
+#include "LeaderDetector.h"
+#include "TrafficSubsystem.h"
+#include "TrafficVehicleController.h"
+#include "TrafficLog.h"
+#include "GameFramework/PawnMovementComponent.h"
+#include "Engine/World.h"
+
+// ─────────────────────────────────────────────────────────────
+// Public entry point
+// ─────────────────────────────────────────────────────────────
+
+FLeaderDetectorOutput FLeaderDetector::Detect(const FLeaderDetectorInput& In) const
+{
+	FLeaderDetectorOutput Out;
+
+	if (In.TickLOD == ETrafficLOD::Full)
+	{
+		// Full-LOD: polyline-following physics sweep.
+		float Speed = 0.0f;
+		float Dist = -1.0f;
+
+		// Choose sweep strategy.
+		if (In.LaneChangeState != ELaneChangeState::None)
+		{
+			Dist = SweepStraight(In, Speed);
+		}
+		else if (In.JunctionId != 0 && In.JunctionTransitionPoints.Num() >= 2)
+		{
+			Dist = SweepPolyline(In, Speed);
+		}
+		else if (In.LanePoints.Num() >= 2)
+		{
+			Dist = SweepPolyline(In, Speed);
+		}
+		else
+		{
+			Dist = SweepStraight(In, Speed);
+		}
+
+		// Bumper-to-bumper correction.
+		if (Dist >= 0.0f)
+		{
+			Dist = FMath::Max(Dist - In.VehicleFrontExtent, 1.0f);
+		}
+		Out.LeaderDist = Dist;
+		Out.LeaderSpeed = Speed;
+	}
+	else if (In.TickLOD == ETrafficLOD::Reduced)
+	{
+		// Reduced-LOD: analytical detection via spatial grid.
+		if (In.TrafficSubsystem)
+		{
+			TArray<ATrafficVehicleController*> Nearby =
+				In.TrafficSubsystem->GetNearbyVehicles(In.VehicleLocation, In.DetectionDistance);
+
+			float BestDist = MAX_FLT;
+			float BestSpeed = 0.0f;
+
+			for (const ATrafficVehicleController* Other : Nearby)
+			{
+				if (!Other || Other->GetPawn() == In.ControlledPawn) { continue; }
+				const APawn* OP = Other->GetPawn();
+				if (!OP) { continue; }
+
+				// Lane affinity filter.
+				if (In.RoadProvider && In.CurrentLane.IsValid())
+				{
+					const FTrafficLaneHandle OtherLane = Other->GetCurrentLane();
+					if (OtherLane.IsValid()
+						&& OtherLane != In.CurrentLane
+						&& OtherLane != In.RoadProvider->GetAdjacentLane(In.CurrentLane, ETrafficLaneSide::Left)
+						&& OtherLane != In.RoadProvider->GetAdjacentLane(In.CurrentLane, ETrafficLaneSide::Right))
+					{
+						bool bConnected = false;
+						TArray<FTrafficLaneHandle> Connected =
+							In.RoadProvider->GetConnectedLanes(In.CurrentLane);
+						for (const FTrafficLaneHandle& CL : Connected)
+						{
+							if (CL == OtherLane) { bConnected = true; break; }
+						}
+						if (!bConnected) { continue; }
+					}
+				}
+
+				const FVector Delta = OP->GetActorLocation() - In.VehicleLocation;
+				const float Dist = Delta.Size();
+				if (Dist < KINDA_SMALL_NUMBER
+					|| FVector::DotProduct(Delta / Dist, In.VehicleForward) < 0.5f)
+				{
+					continue;
+				}
+				if (Dist < BestDist)
+				{
+					BestDist = Dist;
+					if (const UPawnMovementComponent* OtherMC = OP->GetMovementComponent())
+					{
+						BestSpeed = FVector::DotProduct(OtherMC->Velocity, In.VehicleForward);
+					}
+					else
+					{
+						BestSpeed = 0.0f;
+					}
+				}
+			}
+
+			if (BestDist < In.DetectionDistance)
+			{
+				Out.LeaderDist = FMath::Max(BestDist - In.VehicleFrontExtent, 1.0f);
+				Out.LeaderSpeed = BestSpeed;
+			}
+		}
+	}
+
+	// Brake-light perception.
+	DetectBrakeLights(In, Out.LeaderDist, Out);
+
+	return Out;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Polyline-following sweep (full LOD)
+// ─────────────────────────────────────────────────────────────
+
+float FLeaderDetector::SweepPolyline(const FLeaderDetectorInput& In, float& OutSpeed) const
+{
+	OutSpeed = 0.0f;
+	if (!In.World || !In.ControlledPawn) { return -1.0f; }
+
+	const float SweepRadius = FMath::Max(In.LaneWidth * 0.4f, 50.0f);
+	const float SelfBuffer = 10.0f;
+
+	FCollisionQueryParams QP;
+	QP.AddIgnoredActor(In.ControlledPawn);
+	QP.bTraceComplex = false;
+
+	// Select polyline.
+	TArrayView<const FVector> Pts;
+	int32 StartIdx = 0;
+	if (In.JunctionId != 0 && In.JunctionTransitionPoints.Num() >= 2)
+	{
+		Pts = In.JunctionTransitionPoints;
+		StartIdx = FMath::Clamp(In.JunctionTransitionIndex, 0, Pts.Num() - 1);
+	}
+	else
+	{
+		Pts = In.LanePoints;
+		StartIdx = FMath::Clamp(In.ClosestIndex, 0, Pts.Num() - 1);
+	}
+	if (Pts.Num() < 2) { return -1.0f; }
+
+	float AccumDist = 0.0f;
+	FVector SegStart = In.VehicleLocation;
+	bool bFirst = true;
+
+	for (int32 i = StartIdx; i < Pts.Num() - 1; ++i)
+	{
+		const FVector& SegEnd = Pts[i + 1];
+		FVector SegDir = (SegEnd - SegStart).GetSafeNormal();
+		if (SegDir.IsNearlyZero()) { SegStart = SegEnd; continue; }
+
+		const float SegLen = FVector::Dist(SegStart, SegEnd);
+		const float Budget = In.DetectionDistance - AccumDist;
+		if (Budget <= 0.0f) { break; }
+
+		const FVector SwStart = bFirst
+			? (SegStart + SegDir * (SweepRadius + SelfBuffer))
+			: SegStart;
+		const float SweepLen = FMath::Min(SegLen, Budget);
+		const FVector SwEnd = SwStart + SegDir * SweepLen;
+
+		FHitResult Hit;
+		if (In.World->SweepSingleByChannel(
+				Hit, SwStart, SwEnd, FQuat::Identity,
+				ECC_Pawn, FCollisionShape::MakeSphere(SweepRadius), QP)
+			&& Hit.GetActor())
+		{
+			const APawn* HP = Cast<APawn>(Hit.GetActor());
+			if (HP && FVector::DotProduct(HP->GetActorForwardVector(), SegDir) >= -0.3f)
+			{
+				if (const UPawnMovementComponent* LM = HP->GetMovementComponent())
+				{
+					OutSpeed = FVector::DotProduct(LM->Velocity, SegDir);
+				}
+				return AccumDist + Hit.Distance;
+			}
+		}
+
+		AccumDist += SweepLen;
+		SegStart = SegEnd;
+		bFirst = false;
+	}
+
+	// Extension past polyline end.
+	const float ExtBudget = In.DetectionDistance - AccumDist;
+	if (ExtBudget > 0.0f && Pts.Num() >= 2)
+	{
+		const FVector LastDir = (Pts[Pts.Num() - 1] - Pts[Pts.Num() - 2]).GetSafeNormal();
+		if (!LastDir.IsNearlyZero())
+		{
+			const FVector ExtEnd = SegStart + LastDir * ExtBudget;
+			FHitResult Hit;
+			if (In.World->SweepSingleByChannel(
+					Hit, SegStart, ExtEnd, FQuat::Identity,
+					ECC_Pawn, FCollisionShape::MakeSphere(SweepRadius), QP)
+				&& Hit.GetActor())
+			{
+				const APawn* HP = Cast<APawn>(Hit.GetActor());
+				if (HP && FVector::DotProduct(HP->GetActorForwardVector(), LastDir) >= -0.3f)
+				{
+					if (const UPawnMovementComponent* LM = HP->GetMovementComponent())
+					{
+						OutSpeed = FVector::DotProduct(LM->Velocity, LastDir);
+					}
+					return AccumDist + Hit.Distance;
+				}
+			}
+		}
+	}
+
+	return -1.0f;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Straight-line sweep fallback
+// ─────────────────────────────────────────────────────────────
+
+float FLeaderDetector::SweepStraight(const FLeaderDetectorInput& In, float& OutSpeed) const
+{
+	OutSpeed = 0.0f;
+	if (!In.World || !In.ControlledPawn) { return -1.0f; }
+
+	const float SweepRadius = FMath::Max(In.LaneWidth * 0.4f, 50.0f);
+	const float SelfBuffer = 10.0f;
+
+	FCollisionQueryParams QP;
+	QP.AddIgnoredActor(In.ControlledPawn);
+	QP.bTraceComplex = false;
+
+	const FVector Dir   = In.VehicleForward;
+	const FVector Start = In.VehicleLocation + Dir * (SweepRadius + SelfBuffer);
+	const FVector End   = Start + Dir * In.DetectionDistance;
+
+	FHitResult Hit;
+	if (!In.World->SweepSingleByChannel(
+			Hit, Start, End, FQuat::Identity,
+			ECC_Pawn, FCollisionShape::MakeSphere(SweepRadius), QP)
+		|| !Hit.GetActor())
+	{
+		return -1.0f;
+	}
+
+	const APawn* HP = Cast<APawn>(Hit.GetActor());
+	if (!HP) { return -1.0f; }
+	if (FVector::DotProduct(HP->GetActorForwardVector(), Dir) < -0.3f) { return -1.0f; }
+
+	if (const UPawnMovementComponent* LM = HP->GetMovementComponent())
+	{
+		OutSpeed = FVector::DotProduct(LM->Velocity, Dir);
+	}
+	return Hit.Distance;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Brake-light perception
+// ─────────────────────────────────────────────────────────────
+
+void FLeaderDetector::DetectBrakeLights(
+	const FLeaderDetectorInput& In, float LeaderDist,
+	FLeaderDetectorOutput& Out) const
+{
+	Out.bLeaderBrakeLightsVisible = false;
+
+	if (LeaderDist < 0.0f || In.IDMReactionDelaySec <= KINDA_SMALL_NUMBER)
+	{
+		return;
+	}
+	if (!In.TrafficSubsystem || !In.CurrentLane.IsValid()) { return; }
+
+	TArray<TWeakObjectPtr<ATrafficVehicleController>> LaneVehicles =
+		In.TrafficSubsystem->GetVehiclesOnLane(In.CurrentLane);
+
+	float NearestAheadDist = MAX_FLT;
+	const ATrafficVehicleController* NearestLeader = nullptr;
+
+	for (const TWeakObjectPtr<ATrafficVehicleController>& WeakOther : LaneVehicles)
+	{
+		const ATrafficVehicleController* Other = WeakOther.Get();
+		if (!Other || Other->GetPawn() == In.ControlledPawn) { continue; }
+		const APawn* OP = Other->GetPawn();
+		if (!OP) { continue; }
+
+		const FVector Delta = OP->GetActorLocation() - In.VehicleLocation;
+		const float Dist = Delta.Size();
+		if (Dist < KINDA_SMALL_NUMBER) { continue; }
+		if (FVector::DotProduct(Delta / Dist, In.VehicleForward) < 0.5f) { continue; }
+		if (Dist < NearestAheadDist)
+		{
+			NearestAheadDist = Dist;
+			NearestLeader = Other;
+		}
+	}
+
+	if (NearestLeader && NearestLeader->AreBrakeLightsOn())
+	{
+		Out.bLeaderBrakeLightsVisible = true;
+	}
+}
