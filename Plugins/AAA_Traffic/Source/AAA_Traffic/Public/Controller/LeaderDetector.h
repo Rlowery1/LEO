@@ -18,6 +18,7 @@ struct AAA_TRAFFIC_API FLeaderDetectorInput
 	FVector VehicleLocation   = FVector::ZeroVector;
 	FVector VehicleForward    = FVector::ForwardVector;
 	float   VehicleFrontExtent = 0.0f;
+	float   VehicleRearExtent  = 0.0f;
 	float   DetectionDistance  = 0.0f;
 	float   LaneWidth         = 0.0f;
 

@@ -103,7 +103,11 @@ struct AAA_TRAFFIC_API FLaneChangeCoordinator
 	TArray<FVector>    TargetLanePoints;
 	float              TargetLaneWidth = 0.0f;
 
-	// Navigation pre-positioning (shared with junction approach logic)
+	// Navigation pre-positioning (shared with junction approach logic).
+	// NOTE: These fields are set by JunctionNegotiator to reuse lane-change
+	// blend machinery for junction pre-positioning. This is an intentional
+	// coupling — the negotiator sets bNavigationalLaneChange + target lane,
+	// and the coordinator's Evaluate() prioritizes it over comfort changes.
 	bool               bNavigationalLaneChange = false;
 	FTrafficLaneHandle NavigationalTargetLane;
 

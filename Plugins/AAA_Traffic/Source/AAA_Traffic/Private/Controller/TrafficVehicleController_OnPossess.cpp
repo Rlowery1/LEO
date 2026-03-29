@@ -15,6 +15,19 @@
 void ATrafficVehicleController::OnPossess(APawn* InPawn)
 {
 	Super::OnPossess(InPawn);
+	if (JnctState.Phase != EJunctionPhase::Idle
+		|| JnctState.ToLane.IsValid()
+		|| JnctState.CanonicalMovementId != 0)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("JNCT POSSESS-RESET: Pawn='%s' inherited stale junction state Phase=%d JunctionId=%d ToLane=%d Movement=%d -- resetting before initialization"),
+			InPawn ? *InPawn->GetName() : TEXT("NULL"),
+			static_cast<int32>(JnctState.Phase),
+			JnctState.JunctionId,
+			JnctState.ToLane.HandleId,
+			JnctState.CanonicalMovementId);
+	}
+	JnctState.Reset();
 	RandomStream.Initialize(RandomSeed);
 
 	// --- Diagnostic: log pawn class and movement component details ---

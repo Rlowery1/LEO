@@ -280,6 +280,9 @@ The assistant must not:
 - Leave old implementations alongside new ones
 - Keep unused modules compiled into the plugin
 - Leave stub methods that always return false/0 and are never overridden
+- Keep fallback branches, comparison modes, compatibility shims, or feature-flagged duplicate authority when a runtime authority or semantic path has been replaced
+- Preserve old logic alongside the new authority "for migration safety" inside the plugin
+- Leave multiple semantic paths active after an architectural cutover
 
 10.3 Module Inventory (Enforced)
 

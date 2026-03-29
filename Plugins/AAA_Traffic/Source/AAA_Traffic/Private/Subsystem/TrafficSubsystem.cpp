@@ -17,6 +17,7 @@ extern int32 GTrafficJunctionDiagnostics;
 DEFINE_LOG_CATEGORY(LogAAATraffic);
 
 const TArray<FJunctionExitRule> UTrafficSubsystem::EmptyExitRules;
+const TArray<int32> UTrafficSubsystem::EmptyMovementIds;
 
 UTrafficSubsystem::UTrafficSubsystem()
 	: DespawnDistance(50000.f)		// 500m
@@ -44,6 +45,7 @@ void UTrafficSubsystem::Deinitialize()
 	VehicleLODMap.Empty();
 	JunctionOccupancy.Empty();
 	SignalControllerMap.Empty();
+	ResetCanonicalMovementTable();
 	if (VehiclePool)
 	{
 		VehiclePool->DrainPool();
@@ -135,6 +137,12 @@ void UTrafficSubsystem::RegisterVehicle(ATrafficVehicleController* InController)
 void UTrafficSubsystem::UnregisterVehicle(ATrafficVehicleController* InController)
 {
 	if (!InController) return;
+	const bool bWasTraversingJunction =
+		InController->JnctState.Phase == EJunctionPhase::Traversing && InController->JnctState.JunctionId != 0 && InController->JnctState.bOwnsJunctionOccupancy;
+	const int32 TraversingJunctionId = InController->JnctState.JunctionId;
+	const FString ControllerName = (InController->GetPawn() != nullptr)
+		? InController->GetPawn()->GetName()
+		: TEXT("NULL");
 	ActiveVehicles.RemoveSingle(InController);
 
 	// Remove from per-lane registry.
@@ -154,10 +162,16 @@ void UTrafficSubsystem::UnregisterVehicle(ATrafficVehicleController* InControlle
 	}
 	VehicleLODMap.Remove(InController);
 
-	// Release any junction this vehicle may be occupying.
+	if (bWasTraversingJunction)
+	{
+		ReleaseJunction(TraversingJunctionId, InController);
+	}
+
+	// Sweep any residual occupancy entries for this controller.
+	int32 ResidualOccupancyRemovals = 0;
 	for (auto It = JunctionOccupancy.CreateIterator(); It; ++It)
 	{
-		It.Value().RemoveAll([InController](const FJunctionOccupant& Occ)
+		ResidualOccupancyRemovals += It.Value().RemoveAll([InController](const FJunctionOccupant& Occ)
 		{
 			return Occ.Controller.Get() == InController;
 		});
@@ -165,6 +179,13 @@ void UTrafficSubsystem::UnregisterVehicle(ATrafficVehicleController* InControlle
 		{
 			It.RemoveCurrent();
 		}
+	}
+	if (ResidualOccupancyRemovals > 0)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("JNCT UNREGISTER-CLEANUP: Pawn='%s' removed %d residual occupancy entries during unregister"),
+			*ControllerName,
+			ResidualOccupancyRemovals);
 	}
 
 	// Stop the timer when no vehicles remain.
@@ -181,6 +202,17 @@ void UTrafficSubsystem::UpdateVehicleLane(ATrafficVehicleController* InControlle
 {
 	if (!InController) return;
 
+	if (InController->JnctState.bOwnsJunctionOccupancy
+		&& InController->JnctState.JunctionId != 0
+		&& !HasJunctionOccupancy(InController->JnctState.JunctionId, InController))
+	{
+		ensureAlwaysMsgf(false,
+			TEXT("JNCT CONTRACT VIOLATION: Pawn='%s' claims occupancy for junction %d in phase %d, but subsystem has no matching occupant entry"),
+			InController->GetPawn() ? *InController->GetPawn()->GetName() : TEXT("NULL"),
+			InController->JnctState.JunctionId,
+			(int32)InController->JnctState.Phase);
+	}
+
 	// Remove from any previous lane.
 	for (auto& Pair : VehiclesByLane)
 	{
@@ -192,6 +224,27 @@ void UTrafficSubsystem::UpdateVehicleLane(ATrafficVehicleController* InControlle
 	{
 		VehiclesByLane.FindOrAdd(NewLane.HandleId).Add(InController);
 	}
+}
+
+bool UTrafficSubsystem::HasJunctionOccupancy(int32 JunctionId, const ATrafficVehicleController* Controller) const
+{
+	if (JunctionId == 0 || !Controller)
+	{
+		return false;
+	}
+
+	if (const TArray<FJunctionOccupant>* Occupants = JunctionOccupancy.Find(JunctionId))
+	{
+		for (const FJunctionOccupant& Occupant : *Occupants)
+		{
+			if (Occupant.Controller.Get() == Controller)
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
 }
 
 TArray<TWeakObjectPtr<ATrafficVehicleController>> UTrafficSubsystem::GetVehiclesOnLane(const FTrafficLaneHandle& Lane) const
@@ -309,7 +362,9 @@ void UTrafficSubsystem::PerformDespawnSweep()
 		{
 			VehiclePawn->Destroy();
 		}
-		Controller->Destroy();
+		// Defer controller destruction by one frame so the Blueprint
+		// OnUnPossess event graph can complete before PendingKill.
+		Controller->SetLifeSpan(KINDA_SMALL_NUMBER);
 
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("TrafficSubsystem: Despawned vehicle '%s' — reason: %s."),
@@ -358,7 +413,9 @@ void UTrafficSubsystem::RequestDespawn(ATrafficVehicleController* Controller, co
 			{
 				VehiclePawn->Destroy();
 			}
-			Ctrl->Destroy();
+			// Defer controller destruction by one frame so the Blueprint
+			// OnUnPossess event graph can complete before PendingKill.
+			Ctrl->SetLifeSpan(KINDA_SMALL_NUMBER);
 
 			UE_LOG(LogAAATraffic, Warning,
 				TEXT("TrafficSubsystem: SAFETY despawned '%s' — %s"),
@@ -439,7 +496,7 @@ TArray<ATrafficVehicleController*> UTrafficSubsystem::GetNearbyVehicles(const FV
 		{
 			return A.DeterministicSpawnIndex < B.DeterministicSpawnIndex;
 		}
-		return &A < &B;
+		return A.GetUniqueID() < B.GetUniqueID();
 	});
 
 	return Result;
@@ -553,5 +610,37 @@ float UTrafficSubsystem::GetRoadSpeedLimit(int32 RoadHandleId) const
 		return *Found;
 	}
 	return -1.0f;
+}
+
+const FCanonicalMovementRecord* UTrafficSubsystem::GetCanonicalMovement(int32 MovementId) const
+{
+	return CanonicalMovementTable.Find(MovementId);
+}
+
+const TArray<int32>& UTrafficSubsystem::GetCanonicalMovementsForJunction(int32 JunctionId) const
+{
+	if (const TArray<int32>* MovementIds = JunctionToMovementIds.Find(JunctionId))
+	{
+		return *MovementIds;
+	}
+
+	return EmptyMovementIds;
+}
+
+const TArray<int32>& UTrafficSubsystem::GetCanonicalMovementsForApproachLane(int32 ApproachLaneId) const
+{
+	if (const TArray<int32>* MovementIds = ApproachLaneToMovementIds.Find(ApproachLaneId))
+	{
+		return *MovementIds;
+	}
+
+	return EmptyMovementIds;
+}
+
+void UTrafficSubsystem::ResetCanonicalMovementTable()
+{
+	CanonicalMovementTable.Empty();
+	JunctionToMovementIds.Empty();
+	ApproachLaneToMovementIds.Empty();
 }
 

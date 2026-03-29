@@ -3,6 +3,14 @@
 #include "RoadBLDReflectionProvider.h"
 #include "TrafficLog.h"
 
+extern bool GEnableDiagnosticDumps;
+extern int32 GTrafficDiagnosticsLevel;
+extern int32 GTrafficDiagnosticsSampleLimit;
+
+// Defined in RoadBLDReflectionProvider.cpp
+extern bool ShouldLogDiagnostics(int32 Level);
+extern int32 GetDiagnosticsSampleLimit();
+
 
 // ---------------------------------------------------------------------------
 // BuildJunctionGrouping — register mask-based junctions, then assign
@@ -13,6 +21,9 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 {
 	LaneToJunctionMap.Empty();
 	JunctionCentroids.Empty();
+	TArray<FString> GroupingSamples;
+	const bool bSampleDiagnostics = ShouldLogDiagnostics(3);
+	const int32 MaxSamples = GetDiagnosticsSampleLimit();
 
 	// ── Mask-based junctions (primary path) ─────────────────────
 	// When IntersectionGroupCentroids is populated, mask groups define the
@@ -64,6 +75,25 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 			}
 		}
 
+		if (ShouldLogDiagnostics(2))
+		{
+			TArray<int32> SortedGroupIds;
+			GroupToRoadHandles.GetKeys(SortedGroupIds);
+			SortedGroupIds.Sort();
+			for (const int32 GroupId : SortedGroupIds)
+			{
+				TArray<int32> RoadHandles = GroupToRoadHandles.FindRef(GroupId).Array();
+				RoadHandles.Sort();
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("  JunctionGroup %d: Roads=[%s] Centroid=(%.0f,%.0f,%.0f)"),
+					GroupId,
+					*FString::JoinBy(RoadHandles, TEXT(","), [](const int32 Handle) { return FString::FromInt(Handle); }),
+					JunctionCentroids.FindRef(GroupId).X,
+					JunctionCentroids.FindRef(GroupId).Y,
+					JunctionCentroids.FindRef(GroupId).Z);
+			}
+		}
+
 		// Step 3: Map lanes to junctions using road participation.
 		// For through-roads that were split by DetectAndSplitThroughRoads,
 		// each virtual segment already has its group ID in VirtualLaneToGroupId.
@@ -95,6 +125,12 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 								{
 									LaneToJunctionMap.FindOrAdd(VH) = *VGroupId;
 									++LanesMapped;
+									if (bSampleDiagnostics && GroupingSamples.Num() < MaxSamples)
+									{
+										GroupingSamples.Add(FString::Printf(
+											TEXT("MapVirtual Lane=%d Orig=%d Road=%d Group=%d Reason=split-mask-segment"),
+											VH, LaneHandle, RoadHandle, *VGroupId));
+									}
 								}
 								// VGroupId == 0 → free-flow segment, no junction.
 							}
@@ -104,6 +140,12 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 
 					LaneToJunctionMap.Add(LaneHandle, JunctionId);
 					++LanesMapped;
+					if (bSampleDiagnostics && GroupingSamples.Num() < MaxSamples)
+					{
+						GroupingSamples.Add(FString::Printf(
+							TEXT("MapDirect Lane=%d Road=%d Group=%d Reason=road-participates-in-mask-group"),
+							LaneHandle, RoadHandle, JunctionId));
+					}
 				}
 			}
 		}
@@ -166,8 +208,20 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 
 		for (const FProximityConnection& PC : ProximityConnectionList)
 		{
+			auto ResolveRoadHandleForLane = [this](const int32 LaneHandle) -> int32
+			{
+				int32 EffectiveLane = LaneHandle;
+				if (const FVirtualLaneInfo* V = VirtualLaneMap.Find(LaneHandle))
+				{
+					EffectiveLane = V->OriginalLaneHandle;
+				}
+				return LaneToRoadHandleMap.FindRef(EffectiveLane);
+			};
+
 			UObject* RoadA = LaneToRoadActorCache.FindRef(PC.FromLane);
 			UObject* RoadB = LaneToRoadActorCache.FindRef(PC.ToLane);
+			const int32 RoadHandleA = ResolveRoadHandleForLane(PC.FromLane);
+			const int32 RoadHandleB = ResolveRoadHandleForLane(PC.ToLane);
 
 			// Try to find an intersection group that contains both roads.
 			int32 GroupId = 0;
@@ -181,19 +235,42 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 			if (Candidates && Candidates->Num() == 1)
 			{
 				GroupId = (*Candidates)[0];
+				if (bSampleDiagnostics && GroupingSamples.Num() < MaxSamples)
+				{
+					GroupingSamples.Add(FString::Printf(
+						TEXT("MatchProximity From=%d To=%d RoadA=%d RoadB=%d Candidates=[%d] Chosen=%d"),
+						PC.FromLane, PC.ToLane, RoadHandleA, RoadHandleB, GroupId, GroupId));
+				}
 			}
 			else if (Candidates && Candidates->Num() > 1)
 			{
 				// Tiebreak: nearest centroid.
 				float BestDistSq = TNumericLimits<float>::Max();
+				TArray<FString> TieBreakDistances;
 				for (const int32 CandId : *Candidates)
 				{
 					const FVector* C = JunctionCentroids.Find(CandId);
 					if (C)
 					{
 						const float DSq = FVector::DistSquared(PC.Midpoint, *C);
+						if (ShouldLogDiagnostics(2))
+						{
+							TieBreakDistances.Add(FString::Printf(TEXT("%d:%.1f"), CandId, FMath::Sqrt(DSq)));
+						}
 						if (DSq < BestDistSq) { BestDistSq = DSq; GroupId = CandId; }
 					}
+				}
+				if (ShouldLogDiagnostics(2))
+				{
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("  Proximity tie-break FromLane=%d ToLane=%d Candidates=[%s] Mid=(%.0f,%.0f,%.0f) Chosen=%d"),
+						PC.FromLane,
+						PC.ToLane,
+						*FString::Join(TieBreakDistances, TEXT(", ")),
+						PC.Midpoint.X,
+						PC.Midpoint.Y,
+						PC.Midpoint.Z,
+						GroupId);
 				}
 			}
 			else
@@ -209,6 +286,27 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 					PC.FromLane, PC.ToLane,
 					RoadA ? *RoadA->GetName() : TEXT("NULL"),
 					RoadB ? *RoadB->GetName() : TEXT("NULL"));
+				TArray<int32> GroupsA = RoadHandleToGroups.FindRef(RoadHandleA);
+				TArray<int32> GroupsB = RoadHandleToGroups.FindRef(RoadHandleB);
+				GroupsA.Sort();
+				GroupsB.Sort();
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("    ContinuationReason FromLane=%d ToLane=%d RoadHandleA=%d GroupsA=[%s] RoadHandleB=%d GroupsB=[%s] Mid=(%.0f,%.0f,%.0f)"),
+					PC.FromLane,
+					PC.ToLane,
+					RoadHandleA,
+					*FString::JoinBy(GroupsA, TEXT(","), [](const int32 Value) { return FString::FromInt(Value); }),
+					RoadHandleB,
+					*FString::JoinBy(GroupsB, TEXT(","), [](const int32 Value) { return FString::FromInt(Value); }),
+					PC.Midpoint.X,
+					PC.Midpoint.Y,
+					PC.Midpoint.Z);
+				if (bSampleDiagnostics && GroupingSamples.Num() < MaxSamples)
+				{
+					GroupingSamples.Add(FString::Printf(
+						TEXT("SkipContinuation From=%d To=%d RoadA=%d RoadB=%d Reason=no-shared-mask-group"),
+						PC.FromLane, PC.ToLane, RoadHandleA, RoadHandleB));
+				}
 				++PCSkipped;
 				continue;
 			}
@@ -219,6 +317,18 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 				UE_LOG(LogAAATraffic, Log,
 					TEXT("  Connection FromLane=%d -> ToLane=%d -> matched junction %d"),
 					PC.FromLane, PC.ToLane, GroupId);
+				if (ShouldLogDiagnostics(2))
+				{
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("    MatchReason FromLane=%d ToLane=%d RoadHandleA=%d RoadHandleB=%d Mid=(%.0f,%.0f,%.0f)"),
+						PC.FromLane,
+						PC.ToLane,
+						RoadHandleA,
+						RoadHandleB,
+						PC.Midpoint.X,
+						PC.Midpoint.Y,
+						PC.Midpoint.Z);
+				}
 			}
 
 			// DO NOT tag FromLane/ToLane as junction here.
@@ -254,6 +364,14 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("RoadBLDReflectionProvider: Built JunctionToLanesMap — %d junctions."),
 			JunctionToLanesMap.Num());
+
+		if (bSampleDiagnostics)
+		{
+			for (const FString& Line : GroupingSamples)
+			{
+				UE_LOG(LogAAATraffic, Log, TEXT("RoadBLDReflectionProvider: JunctionGroupingSample %s"), *Line);
+			}
+		}
 
 		return;
 	}
@@ -368,35 +486,58 @@ bool URoadBLDReflectionProvider::GetJunctionPath(
 	const float Alpha = FMath::Lerp(AlphaFloor, 0.5f,
 		FMath::Clamp((DotFactor + 1.0f) * 0.5f, 0.0f, 1.0f));
 	const float TangentScale = SpanDist * Alpha;
+	const bool bLogPathDiagnostics = ShouldLogDiagnostics(2);
 
 	// ── Inner-corner offset for turns ──────────────────────────────
-	// Shift the control points outward (away from the inner curb) so the
-	// Hermite curve clears the corner.  Cross-product Z of approach×exit
-	// gives turn direction: positive = left turn, negative = right turn.
+	// Bend the tangents outward (away from the inner curb) so the Hermite
+	// curve clears the corner while still terminating on the actual lane
+	// centerlines. Cross-product Z of approach×exit gives turn direction:
+	// positive = left turn, negative = right turn.
 	const float CrossZ = FVector::CrossProduct(FromCache->EndDir, ToCache->StartDir).Z;
-	FVector AdjP0 = P0;
-	FVector AdjP1 = P1;
-	constexpr float InnerCornerOffset = 150.0f; // cm — roughly half a lane width
-	if (FMath::Abs(CrossZ) > 0.26f) // Only for actual turns (>15°)
-	{
-		// Perpendicular in XY: rotate the tangent 90° about Z.
-		// For a right turn (CrossZ < 0): shift LEFT (positive perp).
-		// For a left turn (CrossZ > 0): shift RIGHT (negative perp).
-		const float Sign = (CrossZ < 0.0f) ? 1.0f : -1.0f;
-		const FVector PerpFrom = FVector(-FromCache->EndDir.Y, FromCache->EndDir.X, 0.0f) * Sign;
-		const FVector PerpTo = FVector(-ToCache->StartDir.Y, ToCache->StartDir.X, 0.0f) * Sign;
-		// Scale offset by turn sharpness: 90° turns get full offset, gentle turns less.
-		const float SharpnessFactor = FMath::Clamp(FMath::Abs(CrossZ), 0.0f, 1.0f);
-		AdjP0 += PerpFrom * (InnerCornerOffset * SharpnessFactor);
-		AdjP1 += PerpTo * (InnerCornerOffset * SharpnessFactor);
-	}
+	float AppliedLateralBend = 0.0f;
+	constexpr float InnerCornerOffset = 150.0f; // cm — fixed perpendicular bend
+	const bool bIsActualTurn = FMath::Abs(CrossZ) > 0.26f; // >15°
 
-	const FVector M0 = FromCache->EndDir * TangentScale;
-	const FVector M1 = ToCache->StartDir * TangentScale;
+	// Perpendicular directions for the inner-corner bend (computed once).
+	const float BendSign = (CrossZ < 0.0f) ? 1.0f : -1.0f;
+	const FVector PerpFrom = FVector(-FromCache->EndDir.Y, FromCache->EndDir.X, 0.0f) * BendSign;
+	const FVector PerpTo = FVector(-ToCache->StartDir.Y, ToCache->StartDir.X, 0.0f) * BendSign;
+	const float SharpnessFactor = FMath::Clamp(FMath::Abs(CrossZ), 0.0f, 1.0f);
 
 	// Segment count scales with span distance for consistent resolution.
 	// 200 cm per segment, clamped to [6, 32].
 	const int32 NumSegments = FMath::Clamp(FMath::CeilToInt32(SpanDist / 200.0f), 6, 32);
+
+	// ── Generate Hermite curve (single pass) ───────────────────────
+	FVector M0 = FromCache->EndDir * TangentScale;
+	FVector M1 = ToCache->StartDir * TangentScale;
+
+	if (bIsActualTurn)
+	{
+		AppliedLateralBend = InnerCornerOffset * SharpnessFactor;
+
+		// Clamp lateral bend to 40% of the narrower lane width so the
+		// curve stays within lane boundaries on narrow roads.
+		const float FromWidth = GetLaneWidthAtDistance(FromLane, GetLaneLength(FromLane));
+		const float ToWidth = GetLaneWidthAtDistance(ToLane, 0.0f);
+		if (FromWidth > 0.0f && ToWidth > 0.0f)
+		{
+			const float MaxSafeBend = FMath::Min(FromWidth, ToWidth) * 0.4f;
+			if (AppliedLateralBend > MaxSafeBend)
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JNCT: InnerCornerOffset clamped from %.0f to %.0f (LaneW From=%.0f To=%.0f) for From=%d To=%d"),
+					AppliedLateralBend, MaxSafeBend, FromWidth, ToWidth,
+					FromLane.HandleId, ToLane.HandleId);
+				AppliedLateralBend = MaxSafeBend;
+			}
+		}
+
+		M0 += PerpFrom * AppliedLateralBend;
+		M1 += PerpTo * AppliedLateralBend;
+	}
+
+	OutPath.Reset();
 	OutPath.Reserve(NumSegments + 1);
 	for (int32 i = 0; i <= NumSegments; ++i)
 	{
@@ -407,7 +548,46 @@ bool URoadBLDReflectionProvider::GetJunctionPath(
 		const float H10 = T3 - 2.0f * T2 + T;
 		const float H01 = -2.0f * T3 + 3.0f * T2;
 		const float H11 = T3 - T2;
-		OutPath.Add(H00 * AdjP0 + H10 * M0 + H01 * AdjP1 + H11 * M1);
+		OutPath.Add(H00 * P0 + H10 * M0 + H01 * P1 + H11 * M1);
+	}
+
+	if (bLogPathDiagnostics && OutPath.Num() >= 2)
+	{
+		float ArcLength = 0.0f;
+		for (int32 PointIdx = 0; PointIdx < OutPath.Num() - 1; ++PointIdx)
+		{
+			ArcLength += FVector::Dist(OutPath[PointIdx], OutPath[PointIdx + 1]);
+		}
+
+		const FVector ExitDir2D = FVector(ToCache->StartDir.X, ToCache->StartDir.Y, 0.0f).GetSafeNormal();
+		const FVector ExitPerp2D = FVector(-ExitDir2D.Y, ExitDir2D.X, 0.0f);
+		const FVector PreEndDelta = OutPath[OutPath.Num() - 2] - P1;
+		const FVector PreEndDelta2D = FVector(PreEndDelta.X, PreEndDelta.Y, 0.0f);
+		const float PreEndLongitudinal = FVector::DotProduct(PreEndDelta2D, ExitDir2D);
+		const float PreEndLateral = FVector::DotProduct(PreEndDelta2D, ExitPerp2D);
+		const FVector FinalSeg2D = FVector(
+			OutPath.Last().X - OutPath[OutPath.Num() - 2].X,
+			OutPath.Last().Y - OutPath[OutPath.Num() - 2].Y,
+			0.0f).GetSafeNormal();
+		const float ExitAlignDot = FVector::DotProduct(FinalSeg2D, ExitDir2D);
+		const float ExitAlignCross = FVector::CrossProduct(FinalSeg2D, ExitDir2D).Z;
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("JNCT PROVIDER-PATH: From=%d To=%d Span=%.1f Arc=%.1f Pts=%d Dot=%.3f Cross=%.3f Alpha=%.3f Tangent=%.1f Bend=%.1f PreEndLat=%.1f PreEndLong=%.1f ExitAlignDot=%.3f ExitAlignCross=%.3f"),
+			FromLane.HandleId,
+			ToLane.HandleId,
+			SpanDist,
+			ArcLength,
+			OutPath.Num(),
+			DotFactor,
+			CrossZ,
+			Alpha,
+			TangentScale,
+			AppliedLateralBend,
+			PreEndLateral,
+			PreEndLongitudinal,
+			ExitAlignDot,
+			ExitAlignCross);
 	}
 	return true;
 }
@@ -534,6 +714,16 @@ void URoadBLDReflectionProvider::PrecomputeJunctionMap()
 
 	for (const int32 StartLaneId : AllLaneIds)
 	{
+		const bool bTraceThisLane = ShouldLogDiagnostics(2);
+		TArray<FString> WalkTrace;
+		auto AppendTrace = [&WalkTrace](const FString& Line)
+		{
+			if (WalkTrace.Num() < 12)
+			{
+				WalkTrace.Add(Line);
+			}
+		};
+
 		// If this lane IS a junction lane, distance = 0.
 		const int32* StartJunction = LaneToJunctionMap.Find(StartLaneId);
 		if (StartJunction && *StartJunction != 0)
@@ -545,6 +735,13 @@ void URoadBLDReflectionProvider::PrecomputeJunctionMap()
 			Result.ApproachLane = FTrafficLaneHandle(StartLaneId);
 			PrecomputedJunctionMap.Add(StartLaneId, Result);
 			++JunctionLaneCount;
+			if (bTraceThisLane)
+			{
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("PrecomputeTrace StartLane=%d RESULT=JUNCTION-SELF JunctionId=%d"),
+					StartLaneId,
+					*StartJunction);
+			}
 			continue;
 		}
 
@@ -579,6 +776,10 @@ void URoadBLDReflectionProvider::PrecomputeJunctionMap()
 						Entry.PreviousLaneId = StartLaneId;
 						Entry.AccumulatedDist = 0.0f;
 						Queue.Add(Entry);
+						if (bTraceThisLane)
+						{
+							AppendTrace(FString::Printf(TEXT("seed next=%d prev=%d dist=0"), Next.HandleId, StartLaneId));
+						}
 					}
 				}
 			}
@@ -588,9 +789,22 @@ void URoadBLDReflectionProvider::PrecomputeJunctionMap()
 		while (QueueIdx < Queue.Num() && QueueIdx < MaxWalkHops)
 		{
 			const FBFSEntry Current = Queue[QueueIdx++];
+			const float CurrentLaneLen = PrecomputedLaneLengths.FindRef(Current.LaneId);
+			const TArray<FTrafficLaneHandle>* NextLanes = LaneConnectionMap.Find(Current.LaneId);
+			const int32* CurJunction = LaneToJunctionMap.Find(Current.LaneId);
+			if (bTraceThisLane)
+			{
+				AppendTrace(FString::Printf(
+					TEXT("visit lane=%d prev=%d dist=%.0f len=%.0f j=%d next=%d"),
+					Current.LaneId,
+					Current.PreviousLaneId,
+					Current.AccumulatedDist,
+					CurrentLaneLen,
+					CurJunction ? *CurJunction : 0,
+					NextLanes ? NextLanes->Num() : 0));
+			}
 
 			// Check if this lane is a junction lane.
-			const int32* CurJunction = LaneToJunctionMap.Find(Current.LaneId);
 			if (CurJunction && *CurJunction != 0)
 			{
 				FJunctionScanResult Result;
@@ -601,18 +815,27 @@ void URoadBLDReflectionProvider::PrecomputeJunctionMap()
 				PrecomputedJunctionMap.Add(StartLaneId, Result);
 				bFound = true;
 				++FreeFlowWithJunctionAhead;
+				if (bTraceThisLane)
+				{
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("PrecomputeTrace StartLane=%d RESULT=FOUND JunctionId=%d Dist=%.0f Approach=%d JunctionLane=%d Trace=%s"),
+						StartLaneId,
+						Result.JunctionId,
+						Result.DistanceCm,
+						Result.ApproachLane.HandleId,
+						Result.JunctionLane.HandleId,
+						*FString::Join(WalkTrace, TEXT(" | ")));
+				}
 				break; // found nearest junction — done for this start lane
 			}
 
 			// Accumulate this lane's length and enqueue its successors.
 			float DistAfterThis = Current.AccumulatedDist;
-			const float* CurLen = PrecomputedLaneLengths.Find(Current.LaneId);
-			if (CurLen)
+			if (CurrentLaneLen > 0.0f)
 			{
-				DistAfterThis += *CurLen;
+				DistAfterThis += CurrentLaneLen;
 			}
 
-			const TArray<FTrafficLaneHandle>* NextLanes = LaneConnectionMap.Find(Current.LaneId);
 			if (NextLanes)
 			{
 				for (const FTrafficLaneHandle& Next : *NextLanes)
@@ -625,6 +848,14 @@ void URoadBLDReflectionProvider::PrecomputeJunctionMap()
 						Entry.PreviousLaneId = Current.LaneId;
 						Entry.AccumulatedDist = DistAfterThis;
 						Queue.Add(Entry);
+						if (bTraceThisLane)
+						{
+							AppendTrace(FString::Printf(
+								TEXT("enqueue next=%d via=%d dist=%.0f"),
+								Next.HandleId,
+								Current.LaneId,
+								DistAfterThis));
+						}
 					}
 				}
 			}
@@ -637,6 +868,12 @@ void URoadBLDReflectionProvider::PrecomputeJunctionMap()
 			// still returns instantly (no junction = JunctionId 0).
 			FJunctionScanResult NoJunction;
 			PrecomputedJunctionMap.Add(StartLaneId, NoJunction);
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("PrecomputeTrace StartLane=%d RESULT=NO-JUNCTION Visited=%d QueueProcessed=%d Trace=%s"),
+				StartLaneId,
+				Visited.Num(),
+				QueueIdx,
+				*FString::Join(WalkTrace, TEXT(" | ")));
 		}
 	}
 

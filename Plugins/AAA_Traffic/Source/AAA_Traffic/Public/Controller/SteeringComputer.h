@@ -33,6 +33,15 @@ struct FSteeringOutput
 
 	/** Half lane width used for CTE normalization (cm). */
 	float HalfLaneWidth = 175.0f;
+
+	/** 2D distance to steering target point (cm). */
+	float TargetDistance2D = 0.0f;
+
+	/** Signed heading cross product vs target direction. */
+	float HeadingCrossZ = 0.0f;
+
+	/** True while steering is following junction transition points. */
+	bool bFollowingJunctionCurve = false;
 };
 
 /**

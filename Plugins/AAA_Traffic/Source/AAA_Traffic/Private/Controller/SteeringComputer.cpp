@@ -35,8 +35,12 @@ FSteeringOutput FSteeringComputer::Compute(const FSteeringInput& In)
 	const FVector ToTargetDir = ToTargetVec.GetSafeNormal2D();
 	const FVector Forward2D = In.VehicleForward.GetSafeNormal2D();
 	const float CrossZ = FVector::CrossProduct(Forward2D, ToTargetDir).Z;
+	Out.TargetDistance2D = Ld;
+	Out.HeadingCrossZ = CrossZ;
 
-	const float PurePursuitAngle = (Ld > KINDA_SMALL_NUMBER)
+	// Guard against noise amplification when target is very close.
+	constexpr float MinLd = 50.0f;
+	const float PurePursuitAngle = (Ld > MinLd)
 		? FMath::Atan(2.0f * In.WheelbaseCm * CrossZ / Ld)
 		: 0.0f;
 	Out.PurePursuitTerm = PurePursuitAngle / In.MaxSteerAngleRad;
@@ -46,6 +50,7 @@ FSteeringOutput FSteeringComputer::Compute(const FSteeringInput& In)
 	// intentionally off the new lane's centerline while executing the turn.
 	const bool bFollowingJunctionCurve = (In.JunctionCurvePoints.Num() > 0
 		&& In.JunctionCurveIndex < In.JunctionCurvePoints.Num() - 1);
+	Out.bFollowingJunctionCurve = bFollowingJunctionCurve;
 
 	if (!bFollowingJunctionCurve && In.LanePoints.Num() >= 2)
 	{
@@ -68,14 +73,16 @@ FSteeringOutput FSteeringComputer::Compute(const FSteeringInput& In)
 		? FMath::Atan(In.CTECorrectionGain * CTENormalized) / In.MaxSteerAngleRad
 		: 0.0f;
 
-	// ── Derivative damping ───────────────────────────────────
-	const float CrossTrackDerivative = (In.DeltaSeconds > KINDA_SMALL_NUMBER)
+	// ── Derivative damping (heading error rate) ─────────────
+	// Dampens the rate of change of the pure-pursuit heading error
+	// (CrossZ), NOT the CTE. This suppresses steering oscillation.
+	const float HeadingErrorDerivative = (In.DeltaSeconds > KINDA_SMALL_NUMBER)
 		? (CrossZ - PreviousHeadingCrossZ) / In.DeltaSeconds
 		: 0.0f;
 	PreviousHeadingCrossZ = CrossZ;
 
 	Out.DerivativeTerm = FMath::Clamp(
-		CrossTrackDerivative * In.SteeringDampingFactor * 0.016f,
+		HeadingErrorDerivative * In.SteeringDampingFactor,
 		-0.3f, 0.3f);
 
 	// ── Combine ──────────────────────────────────────────────

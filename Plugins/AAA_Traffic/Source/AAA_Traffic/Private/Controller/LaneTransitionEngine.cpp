@@ -22,6 +22,13 @@ void FLaneTransitionEngine::InitializeLane(const FTrafficLaneHandle& InLane)
 			Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
 			Owner->JnctState.JunctionId, InLane.HandleId);
 	}
+	else if (Owner->JnctState.Phase == EJunctionPhase::Approaching)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("JNCT INIT-KEEP: Pawn='%s' Phase=Approaching JunctionId=%d NewLane=%d ExitLane=%d — preserving approach state"),
+			Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+			Owner->JnctState.JunctionId, InLane.HandleId, Owner->JnctState.ToLane.HandleId);
+	}
 	else
 	{
 		if (Owner->JnctState.IsActive())
@@ -34,7 +41,7 @@ void FLaneTransitionEngine::InitializeLane(const FTrafficLaneHandle& InLane)
 				Owner->JnctState.TransitionPoints.Num(),
 				InLane.HandleId);
 
-			if (Owner->JnctState.Phase == EJunctionPhase::Waiting && Owner->JnctState.JunctionId != 0)
+			if (Owner->JnctState.Phase == EJunctionPhase::Waiting && Owner->JnctState.JunctionId != 0 && Owner->JnctState.bOwnsJunctionOccupancy)
 			{
 				if (UWorld* W = Owner->GetWorld())
 				{
@@ -84,6 +91,7 @@ void FLaneTransitionEngine::InitializeLane(const FTrafficLaneHandle& InLane)
 	Owner->CachedProvider = Provider;
 
 	Owner->LanePoints.Reset();
+	ITrafficRoadProvider::FJunctionScanResult InitScan;
 	if (Provider->GetLanePath(Owner->CurrentLane, Owner->LanePoints, Owner->LaneWidth) && Owner->LanePoints.Num() >= 2)
 	{
 		Owner->bLaneDataReady = true;
@@ -91,7 +99,7 @@ void FLaneTransitionEngine::InitializeLane(const FTrafficLaneHandle& InLane)
 		// --- JUNCTION DIAGNOSTIC ---
 		{
 			const float TotalLen = Provider->GetLaneLength(Owner->CurrentLane);
-			const ITrafficRoadProvider::FJunctionScanResult InitScan =
+			InitScan =
 				Provider->GetDistanceToNextJunction(Owner->CurrentLane, TotalLen, 50000.0f, 10);
 			const int32 DirectJunction = Provider->GetJunctionForLane(Owner->CurrentLane);
 			TArray<FTrafficLaneHandle> InitConnected = Provider->GetConnectedLanes(Owner->CurrentLane);
@@ -152,6 +160,51 @@ void FLaneTransitionEngine::InitializeLane(const FTrafficLaneHandle& InLane)
 	if (TrafficSub)
 	{
 		TrafficSub->UpdateVehicleLane(Owner, Owner->CurrentLane);
+
+		if (Owner->JnctState.Phase == EJunctionPhase::Idle)
+		{
+			const TArray<int32>& InitCanonicalMovementIds =
+				TrafficSub->GetCanonicalMovementsForApproachLane(Owner->CurrentLane.HandleId);
+			if (!InitCanonicalMovementIds.IsEmpty() && !Owner->GetSelectedCanonicalMovement())
+			{
+				int32 InitialMovementId = 0;
+				const TArray<FTrafficLaneHandle> NoFallbackExits;
+				Owner->JnctState.BeginApproach(InitScan.JunctionId);
+				Owner->JnctState.ApproachJunctionLane = InitScan.JunctionLane;
+				Owner->JnctState.JunctionLane = InitScan.JunctionLane;
+				Owner->JnctState.FromLane = Owner->CurrentLane;
+				Owner->JnctState.ToLane = Owner->PickSurveyedExit(Owner->CurrentLane, NoFallbackExits);
+				InitialMovementId = Owner->JnctState.CanonicalMovementId;
+
+				if (const FCanonicalMovementRecord* InitialMovement = TrafficSub->GetCanonicalMovement(InitialMovementId))
+				{
+					Owner->JnctState.JunctionId = InitialMovement->JunctionId;
+					Owner->JnctState.CanonicalMovementId = InitialMovementId;
+					Owner->JnctState.FromLane = Owner->CurrentLane;
+					Owner->JnctState.JunctionLane = InitialMovement->ApproachJunctionLane;
+					Owner->JnctState.ApproachJunctionLane = InitialMovement->ApproachJunctionLane;
+					Owner->JnctState.ToLane = InitialMovement->ToLane;
+					if (InitScan.IsValid() && InitScan.JunctionId == InitialMovement->JunctionId)
+					{
+						Owner->JnctState.ApproachDistanceCm = InitScan.DistanceCm;
+					}
+
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("JNCT INIT-ARM: Pawn='%s' Movement=%d JunctionId=%d Approach=%d JunctionLane=%d Exit=%d Dist=%.0f"),
+						Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+						InitialMovement->MovementId,
+						InitialMovement->JunctionId,
+						Owner->CurrentLane.HandleId,
+						InitialMovement->ApproachJunctionLane.HandleId,
+						InitialMovement->ToLane.HandleId,
+						Owner->JnctState.ApproachDistanceCm);
+				}
+				else
+				{
+					Owner->JnctState.Reset();
+				}
+			}
+		}
 	}
 }
 
@@ -185,7 +238,7 @@ void FLaneTransitionEngine::CheckTransition()
 	TArray<FTrafficLaneHandle> Connected = Owner->CachedProvider->GetConnectedLanes(Owner->CurrentLane);
 
 	// ── One-way / turn-restriction filter ──
-	if (Connected.Num() > 1)
+	if (Connected.Num() >= 1)
 	{
 		const float CurLaneLen = Owner->CachedProvider->GetLaneLength(Owner->CurrentLane);
 		const FVector ApproachTangent = Owner->CachedProvider->GetLaneDirectionAtDistance(Owner->CurrentLane, CurLaneLen);
@@ -202,6 +255,11 @@ void FLaneTransitionEngine::CheckTransition()
 		if (Filtered.Num() > 0)
 		{
 			Connected = MoveTemp(Filtered);
+		}
+		else
+		{
+			// All connected lanes are oncoming — treat as dead end.
+			Connected.Empty();
 		}
 	}
 
@@ -226,6 +284,100 @@ void FLaneTransitionEngine::CheckTransition()
 	// --- Exit selection ---
 	FTrafficLaneHandle NextLane;
 	bool bUsedPreselected = false;
+	UWorld* World = Owner->GetWorld();
+	UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
+	const FCanonicalMovementRecord* SelectedCanonicalMovement = Owner->GetSelectedCanonicalMovement();
+	const bool bCurrentLaneHasCanonicalApproach = TrafficSub
+		&& !TrafficSub->GetCanonicalMovementsForApproachLane(Owner->CurrentLane.HandleId).IsEmpty();
+	const bool bJunctionRouteAuthorityActive = Owner->JnctState.IsActive() || bCurrentLaneHasCanonicalApproach;
+
+	if (SelectedCanonicalMovement && SelectedCanonicalMovement->IsValid())
+	{
+		if (Owner->JnctState.ToLane.IsValid()
+			&& Owner->JnctState.ToLane.HandleId != SelectedCanonicalMovement->ToLane.HandleId)
+		{
+			UE_LOG(LogAAATraffic, Error,
+				TEXT("JNCT ROUTE-CONTRACT: Pawn='%s' cached exit %d disagrees with canonical exit %d for movement %d -- realigning to canonical authority"),
+				Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+				Owner->JnctState.ToLane.HandleId,
+				SelectedCanonicalMovement->ToLane.HandleId,
+				SelectedCanonicalMovement->MovementId);
+		}
+
+		Owner->JnctState.ToLane = SelectedCanonicalMovement->ToLane;
+	}
+	else if (bJunctionRouteAuthorityActive && Owner->JnctState.ToLane.IsValid())
+	{
+		UE_LOG(LogAAATraffic, Error,
+			TEXT("JNCT ROUTE-CONTRACT: Pawn='%s' cached exit %d exists during active junction routing without canonical movement authority -- discarding stale cached exit"),
+			Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+			Owner->JnctState.ToLane.HandleId);
+		Owner->JnctState.ToLane = FTrafficLaneHandle();
+	}
+
+	if (SelectedCanonicalMovement
+		&& SelectedCanonicalMovement->IsValid()
+		&& SelectedCanonicalMovement->FromLane.HandleId == Owner->CurrentLane.HandleId)
+	{
+		for (const FTrafficLaneHandle& C : Connected)
+		{
+			if (C.HandleId == SelectedCanonicalMovement->ApproachJunctionLane.HandleId)
+			{
+				NextLane = C;
+				bUsedPreselected = true;
+				Owner->AddLaneDecisionTrace(TEXT("TransitionCheck.UsedCanonicalApproachLane"),
+					NextLane.HandleId,
+					static_cast<float>(SelectedCanonicalMovement->MovementId),
+					0.0f,
+					TEXT("Advancing onto canonical approach junction lane"));
+				break;
+			}
+		}
+	}
+
+	// --- Feeder lane advancement ---
+	// Vehicle has canonical authority for a downstream approach lane (FromLane != CurrentLane).
+	// If FromLane is directly connected, advance to it so the vehicle reaches the canonical approach.
+	if (!bUsedPreselected
+		&& SelectedCanonicalMovement
+		&& SelectedCanonicalMovement->IsValid()
+		&& SelectedCanonicalMovement->FromLane.HandleId != Owner->CurrentLane.HandleId)
+	{
+		for (const FTrafficLaneHandle& C : Connected)
+		{
+			if (C.HandleId == SelectedCanonicalMovement->FromLane.HandleId)
+			{
+				NextLane = C;
+				bUsedPreselected = true;
+				Owner->AddLaneDecisionTrace(TEXT("TransitionCheck.FeederToApproach"),
+					NextLane.HandleId,
+					static_cast<float>(SelectedCanonicalMovement->MovementId),
+					0.0f,
+					TEXT("Advancing from feeder lane to canonical approach lane"));
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("JNCT FEEDER-ADVANCE: Pawn='%s' Lane=%d -> Approach=%d Movement=%d"),
+					Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+					Owner->CurrentLane.HandleId,
+					NextLane.HandleId,
+					SelectedCanonicalMovement->MovementId);
+				break;
+			}
+		}
+	}
+
+	if (Owner->JnctState.ToLane.HandleId != 0
+		&& Owner->JnctState.ToLane.HandleId != Owner->CurrentLane.HandleId)
+	{
+		if (!Owner->IsUsableExitLane(Owner->JnctState.ToLane))
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JNCT PRESELECTED-EXIT-REJECTED: Pawn='%s' JunctionId=%d Exit=%d is terminal/invalid; clearing latched exit"),
+				Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+				Owner->JnctState.JunctionId,
+				Owner->JnctState.ToLane.HandleId);
+			Owner->JnctState.ToLane = FTrafficLaneHandle();
+		}
+	}
 
 	if (Owner->JnctState.ToLane.HandleId != 0
 		&& Owner->JnctState.ToLane.HandleId != Owner->CurrentLane.HandleId)
@@ -266,9 +418,13 @@ void FLaneTransitionEngine::CheckTransition()
 			if (bReachableViaDirectJunction) { break; }
 		}
 
-		if (!bReachableViaDirectJunction)
+		if (!bReachableViaDirectJunction && Owner->JnctState.bOwnsJunctionOccupancy)
 		{
-			NextLane = Owner->JnctState.ToLane;
+			// Validate that the bypass target lane actually exists.
+			const float ExitLen = Owner->CachedProvider->GetLaneLength(Owner->JnctState.ToLane);
+			if (ExitLen > 0.0f)
+			{
+				NextLane = Owner->JnctState.ToLane;
 			bUsedPreselected = true;
 			UE_LOG(LogAAATraffic, Warning,
 				TEXT("JNCT TURN-BYPASS: Pawn='%s' Approach=%d -> Exit=%d "
@@ -278,11 +434,84 @@ void FLaneTransitionEngine::CheckTransition()
 			Owner->AddLaneDecisionTrace(TEXT("TransitionCheck.TurnBypass"),
 				NextLane.HandleId, 0.0f, 0.0f,
 				TEXT("Cross-junction turn: bypassed junction lane"));
+			}
+			else
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JNCT TURN-BYPASS-INVALID: Pawn='%s' ToLane=%d has zero length — ignoring bypass"),
+					Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+					Owner->JnctState.ToLane.HandleId);
+			}
+		}
+		else if (!bReachableViaDirectJunction)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JNCT TURN-BYPASS-BLOCKED: Pawn='%s' JunctionId=%d Exit=%d requires occupancy before bypass transition"),
+				Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+				Owner->JnctState.JunctionId,
+				Owner->JnctState.ToLane.HandleId);
 		}
 	}
 
 	if (!bUsedPreselected)
 	{
+		if (bJunctionRouteAuthorityActive)
+		{
+			// Feeder lanes: vehicle has canonical authority but FromLane differs
+			// from CurrentLane — still upstream and needs a normal transition.
+			const bool bFeederLane = SelectedCanonicalMovement
+				&& SelectedCanonicalMovement->IsValid()
+				&& SelectedCanonicalMovement->FromLane.HandleId != Owner->CurrentLane.HandleId;
+			if (!bFeederLane)
+			{
+				// Accumulate stuck timer — if the vehicle has been stuck at
+				// lane-end with no canonical route for too long, request
+				// despawn instead of spamming errors every frame.
+				const float DeltaSec = Owner->GetWorld()
+					? Owner->GetWorld()->GetDeltaSeconds() : 0.016f;
+				Owner->NoRouteStuckTimer += DeltaSec;
+
+				if (Owner->NoRouteStuckTimer >= Owner->NoRouteDespawnDelaySec)
+				{
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT ROUTE-CONTRACT-DESPAWN: Pawn='%s' JunctionId=%d Lane=%d — stuck for %.1fs with no canonical route, requesting despawn"),
+						Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+						Owner->JnctState.JunctionId,
+						Owner->CurrentLane.HandleId,
+						Owner->NoRouteStuckTimer);
+					if (UTrafficSubsystem* DespawnSub = Owner->GetWorld()
+						? Owner->GetWorld()->GetSubsystem<UTrafficSubsystem>() : nullptr)
+					{
+						DespawnSub->RequestDespawn(Owner, TEXT("NoCanonicalRoute"));
+					}
+					Owner->bAtDeadEnd = true;
+					Owner->FlushLaneDecisionTrace(TEXT("RouteContractDespawn"), true);
+					return;
+				}
+
+				UE_LOG(LogAAATraffic, Error,
+					TEXT("JNCT ROUTE-CONTRACT: Pawn='%s' JunctionId=%d reached transition-time selection on lane %d without a consumable canonical route -- blocking transition (stuck %.1fs/%.1fs)"),
+					Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+					Owner->JnctState.JunctionId,
+					Owner->CurrentLane.HandleId,
+					Owner->NoRouteStuckTimer,
+					Owner->NoRouteDespawnDelaySec);
+				Owner->AddLaneDecisionTrace(TEXT("TransitionCheck.RouteContractBlocked"),
+					0,
+					static_cast<float>(Owner->JnctState.JunctionId),
+					0.0f,
+					TEXT("Blocked transition-time repick while canonical route authority is active"));
+				Owner->FlushLaneDecisionTrace(TEXT("RouteContractBlocked"), true);
+				return;
+			}
+
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("JNCT FEEDER-PASSTHROUGH: Pawn='%s' Lane=%d FromLane=%d — allowing normal transition toward approach"),
+				Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+				Owner->CurrentLane.HandleId,
+				SelectedCanonicalMovement->FromLane.HandleId);
+		}
+
 		NextLane = Owner->PickSurveyedExit(Owner->CurrentLane, Connected);
 		Owner->AddLaneDecisionTrace(TEXT("TransitionCheck.SurveyorPick"),
 			NextLane.HandleId, 0.0f, 0.0f, TEXT("Fallback via surveyor"));
@@ -366,25 +595,41 @@ void FLaneTransitionEngine::CheckTransition()
 		TEXT("TrafficVehicleController: Transitioning from lane %d to lane %d (%d candidates)."),
 		Owner->CurrentLane.HandleId, NextLane.HandleId, Connected.Num());
 
+	// Reset stuck timer — a viable transition was found.
+	Owner->NoRouteStuckTimer = 0.0f;
+
+	if (!NextLane.IsValid())
+	{
+		UE_LOG(LogAAATraffic, Error,
+			TEXT("JNCT ROUTE-CONTRACT: Pawn='%s' lane %d produced no valid transition target"),
+			Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+			Owner->CurrentLane.HandleId);
+		Owner->FlushLaneDecisionTrace(TEXT("InvalidTransitionTarget"), true);
+		return;
+	}
+
+	const FCanonicalMovementRecord* CanonicalMovement = SelectedCanonicalMovement;
+	if (TrafficSub && Owner->JnctState.JunctionId != 0)
+	{
+		const bool bRequiresCanonicalMovement = Owner->JnctState.bOwnsJunctionOccupancy || bCurrentLaneHasCanonicalApproach;
+		if (bRequiresCanonicalMovement && (!CanonicalMovement || !CanonicalMovement->IsValid()))
+		{
+			UE_LOG(LogAAATraffic, Error,
+				TEXT("JNCT CANONICAL-MISSING: Pawn='%s' JunctionId=%d transition to lane %d blocked because no canonical movement is selected"),
+				Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+				Owner->JnctState.JunctionId,
+				NextLane.HandleId);
+			Owner->FlushLaneDecisionTrace(TEXT("CanonicalMovementMissing"), true);
+			return;
+		}
+	}
+
 	// --- Junction smoothing ---
 	FVector OldLaneEnd = FVector::ZeroVector;
-	FVector OldLaneTangent = FVector::ZeroVector;
 	if (Owner->LanePoints.Num() >= 2)
 	{
 		OldLaneEnd = Owner->LanePoints.Last();
-		const int32 NumAvgOld = FMath::Min(3, Owner->LanePoints.Num() - 1);
-		FVector AvgOldDir = FVector::ZeroVector;
-		for (int32 k = Owner->LanePoints.Num() - NumAvgOld; k < Owner->LanePoints.Num(); ++k)
-		{
-			AvgOldDir += (Owner->LanePoints[k] - Owner->LanePoints[k - 1]);
-		}
-		OldLaneTangent = AvgOldDir.GetSafeNormal();
 	}
-
-	TArray<FVector> ProviderJunctionPath;
-	const bool bHasProviderPath = Owner->CachedProvider
-		&& Owner->CachedProvider->GetJunctionPath(Owner->CurrentLane, NextLane, ProviderJunctionPath)
-		&& ProviderJunctionPath.Num() >= 2;
 
 	// ── Save old-lane tail for polyline continuity ──
 	TArray<FVector> OldLaneTail;
@@ -451,74 +696,61 @@ void FLaneTransitionEngine::CheckTransition()
 	// Generate junction transition points.
 	Owner->JnctState.TransitionIndex = 0;
 	Owner->JnctState.CurveStartIndex = 0;
-	if (bHasProviderPath)
+	Owner->JnctState.TransitionReleaseIndex = INDEX_NONE;
+	Owner->JnctState.ExitLaneResumeIndex = INDEX_NONE;
+	Owner->JnctState.bTransitionPathFromProvider = false;
+	if (CanonicalMovement && CanonicalMovement->IsValid())
 	{
-		Owner->JnctState.TransitionPoints = MoveTemp(ProviderJunctionPath);
+		Owner->JnctState.TransitionPoints = CanonicalMovement->CorridorPoints;
+		Owner->JnctState.CurveStartIndex = FMath::Clamp(
+			CanonicalMovement->EntryLaneAttachIndex,
+			0,
+			FMath::Max(CanonicalMovement->CorridorPoints.Num() - 1, 0));
+		Owner->JnctState.TransitionReleaseIndex = FMath::Clamp(
+			CanonicalMovement->TraversalReleaseIndex,
+			0,
+			FMath::Max(CanonicalMovement->CorridorPoints.Num() - 1, 0));
+		Owner->JnctState.ExitLaneResumeIndex = FMath::Clamp(
+			CanonicalMovement->ExitLaneResumeIndex,
+			0,
+			FMath::Max(CanonicalMovement->CorridorPoints.Num() - 1, 0));
+		Owner->JnctState.bTransitionPathFromProvider = CanonicalMovement->SourceKind == ECanonicalMovementSourceKind::ProviderDerived;
 	}
-	else if (!OldLaneTangent.IsNearlyZero() && Owner->LanePoints.Num() >= 2)
+
+	if (Owner->JnctState.TransitionPoints.Num() >= 3)
 	{
-		const FVector NewLaneStart = Owner->LanePoints[0];
-		const int32 NumAvgNew = FMath::Min(3, Owner->LanePoints.Num() - 1);
-		FVector AvgNewDir = FVector::ZeroVector;
-		for (int32 k = 0; k < NumAvgNew; ++k)
+		const int32 CurveStart = FMath::Clamp(Owner->JnctState.CurveStartIndex, 0, Owner->JnctState.TransitionPoints.Num() - 3);
+		float TotalAngleDeg = 0.0f;
+		float TotalArcLength = 0.0f;
+		for (int32 i = CurveStart + 1; i < Owner->JnctState.TransitionPoints.Num() - 1; ++i)
 		{
-			AvgNewDir += (Owner->LanePoints[k + 1] - Owner->LanePoints[k]);
-		}
-		const FVector NewLaneTangent = AvgNewDir.GetSafeNormal();
-		const float SpanDist = FVector::Dist(OldLaneEnd, NewLaneStart);
-
-		if (SpanDist > 50.0f)
-		{
-			const float DotFactor = FVector::DotProduct(OldLaneTangent, NewLaneTangent);
-			const float Alpha = FMath::Lerp(0.25f, 0.5f,
-				FMath::Clamp((DotFactor + 1.0f) * 0.5f, 0.0f, 1.0f));
-			const float TangentScale = SpanDist * Alpha;
-			const FVector P0 = OldLaneEnd;
-			const FVector P1 = NewLaneStart;
-			const FVector M0 = OldLaneTangent * TangentScale;
-			const FVector M1 = NewLaneTangent * TangentScale;
-
-			const int32 NumSegments = FMath::Clamp(
-				FMath::CeilToInt32(SpanDist / Owner->JunctionCurveResolutionCm), 6, 32);
-			Owner->JnctState.TransitionPoints.Reserve(NumSegments + 1);
-			for (int32 i = 0; i <= NumSegments; ++i)
+			const FVector Seg0 = Owner->JnctState.TransitionPoints[i] - Owner->JnctState.TransitionPoints[i - 1];
+			const FVector Seg1 = Owner->JnctState.TransitionPoints[i + 1] - Owner->JnctState.TransitionPoints[i];
+			TotalArcLength += Seg0.Size();
+			const FVector Dir0 = Seg0.GetSafeNormal();
+			const FVector Dir1 = Seg1.GetSafeNormal();
+			if (!Dir0.IsNearlyZero() && !Dir1.IsNearlyZero())
 			{
-				const float T = static_cast<float>(i) / static_cast<float>(NumSegments);
-				const float T2 = T * T;
-				const float T3 = T2 * T;
-				const float H00 = 2.0f * T3 - 3.0f * T2 + 1.0f;
-				const float H10 = T3 - 2.0f * T2 + T;
-				const float H01 = -2.0f * T3 + 3.0f * T2;
-				const float H11 = T3 - T2;
-				Owner->JnctState.TransitionPoints.Add(H00 * P0 + H10 * M0 + H01 * P1 + H11 * M1);
+				const float Dot = FMath::Clamp(FVector::DotProduct(Dir0, Dir1), -1.0f, 1.0f);
+				TotalAngleDeg += FMath::RadiansToDegrees(FMath::Acos(Dot));
 			}
 		}
-	}
+		TotalArcLength += (Owner->JnctState.TransitionPoints.Last() - Owner->JnctState.TransitionPoints[Owner->JnctState.TransitionPoints.Num() - 2]).Size();
+		const float TotalAngleRad = FMath::DegreesToRadians(FMath::Max(TotalAngleDeg, 1.0f));
+		const float TurnRadius = FMath::Max(TotalArcLength / TotalAngleRad, 50.0f);
 
-	// ── Junction curve: prepend old-lane tail ──
-	if (Owner->JnctState.TransitionPoints.Num() > 0 && OldLaneTail.Num() > 1)
-	{
-		if (FVector::Dist(OldLaneTail.Last(), Owner->JnctState.TransitionPoints[0]) < 150.0f)
-		{
-			OldLaneTail.Pop();
-		}
-		if (OldLaneTail.Num() > 0)
-		{
-			TArray<FVector> Combined;
-			Combined.Reserve(OldLaneTail.Num() + Owner->JnctState.TransitionPoints.Num());
-			Combined.Append(OldLaneTail);
-			Combined.Append(Owner->JnctState.TransitionPoints);
-			Owner->JnctState.CurveStartIndex = OldLaneTail.Num();
-			Owner->JnctState.TransitionPoints = MoveTemp(Combined);
-
-			UE_LOG(LogAAATraffic, Log,
-				TEXT("JNCT CURVE-PREPEND: Pawn='%s' prepended %d old-tail points "
-					 "to junction curve (%d total, CurveStartIdx=%d)."),
-				Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
-				OldLaneTail.Num(),
-				Owner->JnctState.TransitionPoints.Num(),
-				Owner->JnctState.CurveStartIndex);
-		}
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("JNCT PATH-PROFILE: Pawn='%s' JunctionId=%d Path=%s From=%d To=%d Pts=%d CurveStart=%d Arc=%.0f Angle=%.1f R=%.0f"),
+			Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+			Owner->JnctState.JunctionId,
+			Owner->JnctState.bTransitionPathFromProvider ? TEXT("PROVIDER") : TEXT("SYNTH"),
+			Owner->CurrentLane.HandleId,
+			NextLane.HandleId,
+			Owner->JnctState.TransitionPoints.Num(),
+			Owner->JnctState.CurveStartIndex,
+			TotalArcLength,
+			TotalAngleDeg,
+			TurnRadius);
 	}
 
 	// Transition to Traversing when junction curves are committed.
@@ -526,14 +758,91 @@ void FLaneTransitionEngine::CheckTransition()
 		&& (Owner->JnctState.Phase == EJunctionPhase::Approaching
 			|| Owner->JnctState.Phase == EJunctionPhase::Waiting))
 	{
-		Owner->JnctState.BeginTraversing();
+		ensureAlwaysMsgf(
+			Owner->JnctState.ToLane.IsValid(),
+			TEXT("JNCT CONTRACT VIOLATION [TransitionCommit.ToLane]: Pawn='%s' JunctionId=%d committed transition path without a valid exit lane"),
+			Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+			Owner->JnctState.JunctionId);
+		ensureAlwaysMsgf(
+			Owner->JnctState.TransitionPoints.Num() >= 2,
+			TEXT("JNCT CONTRACT VIOLATION [TransitionCommit.Path]: Pawn='%s' JunctionId=%d committed transition path with %d points"),
+			Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+			Owner->JnctState.JunctionId,
+			Owner->JnctState.TransitionPoints.Num());
+
+		// Degenerate corridor handling: if the junction curve is very short
+		// (< 50cm arc) or has too few points, the curve may commit before
+		// the negotiator grants occupancy. Skip the junction curve for these
+		// degenerate straight-through paths and treat as a direct lane change.
+		const float CurveArc = [&]()
+		{
+			float Arc = 0.0f;
+			for (int32 Idx = 0; Idx + 1 < Owner->JnctState.TransitionPoints.Num(); ++Idx)
+			{
+				Arc += FVector::Dist(Owner->JnctState.TransitionPoints[Idx], Owner->JnctState.TransitionPoints[Idx + 1]);
+			}
+			return Arc;
+		}();
+		if (CurveArc < 50.0f && !Owner->JnctState.bOwnsJunctionOccupancy)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("JNCT DEGENERATE-BYPASS: Pawn='%s' JunctionId=%d Arc=%.0f — "
+					 "skipping degenerate junction curve, treating as direct lane transition"),
+				Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+				Owner->JnctState.JunctionId, CurveArc);
+			Owner->JnctState.TransitionPoints.Empty();
+			Owner->JnctState.TransitionIndex = 0;
+			Owner->JnctState.CurveStartIndex = 0;
+			// Don't block — let the vehicle proceed directly onto the exit lane
+		}
+		else if (Owner->JnctState.Phase == EJunctionPhase::Approaching && !Owner->JnctState.bOwnsJunctionOccupancy)
+		{
+			// Vehicle reached the junction curve entry without occupancy.
+			// Attempt late-acquire before blocking.
+			bool bLateAcquired = false;
+			if (TrafficSub && Owner->JnctState.JunctionId > 0)
+			{
+				if (TrafficSub->TryOccupyJunction(Owner->JnctState.JunctionId, Owner, Owner->JnctState.CanonicalMovementId))
+				{
+					Owner->JnctState.bOwnsJunctionOccupancy = true;
+					bLateAcquired = true;
+					// Transition to Traversing immediately so occupancy token
+					// and phase stay in sync — prevents contract violation
+					// where subsystem evicts a stale Approaching-phase occupant.
+					if (Owner->JnctState.TransitionPoints.Num() > 0)
+					{
+						Owner->JnctState.BeginTraversing();
+					}
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT TRAVERSE-LATE-ACQUIRE: Pawn='%s' JunctionId=%d — late occupancy granted, proceeding"),
+						Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+						Owner->JnctState.JunctionId);
+				}
+			}
+			if (!bLateAcquired)
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JNCT TRAVERSE-NO-OCCUPANCY: Pawn='%s' JunctionId=%d entering bypass curve without occupancy token"),
+					Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+					Owner->JnctState.JunctionId);
+				Owner->JnctState.TransitionPoints.Empty();
+				Owner->JnctState.TransitionIndex = 0;
+				Owner->JnctState.CurveStartIndex = 0;
+				Owner->FlushLaneDecisionTrace(TEXT("TransitionBlockedNoOccupancy"), true);
+				return;
+			}
+		}
+		else if (Owner->JnctState.TransitionPoints.Num() > 0)
+		{
+			Owner->JnctState.BeginTraversing();
+		}
 	}
 
 	// ── Non-junction boundary: prepend old-lane tail ──
 	if (Owner->JnctState.TransitionPoints.Num() == 0
 		&& OldLaneTail.Num() > 1 && Owner->LanePoints.Num() > 0)
 	{
-		if (FVector::Dist(OldLaneTail.Last(), Owner->LanePoints[0]) < 150.0f)
+		if (FVector::Dist2D(OldLaneTail.Last(), Owner->LanePoints[0]) < 150.0f)
 		{
 			OldLaneTail.Pop();
 		}

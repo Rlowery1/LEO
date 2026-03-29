@@ -13,18 +13,9 @@ extern bool GEnableDiagnosticDumps;
 extern int32 GTrafficDiagnosticsLevel;
 extern int32 GTrafficDiagnosticsSampleLimit;
 
-namespace
-{
-	static bool ShouldLogDiagnostics(const int32 Level)
-	{
-		return GEnableDiagnosticDumps || GTrafficDiagnosticsLevel >= Level;
-	}
-
-	static int32 GetDiagnosticsSampleLimit()
-	{
-		return FMath::Max(1, GTrafficDiagnosticsSampleLimit);
-	}
-}
+// Defined in RoadBLDReflectionProvider.cpp
+extern bool ShouldLogDiagnostics(int32 Level);
+extern int32 GetDiagnosticsSampleLimit();
 
 // ---------------------------------------------------------------------------
 // BuildLaneConnectivity — edge-walking corner discovery
@@ -764,9 +755,16 @@ void URoadBLDReflectionProvider::BuildProximityConnections()
 
 				if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
 				{
+					const int32 OriginalA = VirtualLaneMap.Contains(HandleA)
+						? VirtualLaneMap[HandleA].OriginalLaneHandle : HandleA;
+					const int32 OriginalB = VirtualLaneMap.Contains(HandleB)
+						? VirtualLaneMap[HandleB].OriginalLaneHandle : HandleB;
 					SampledAccepts.Add(FString::Printf(
-						TEXT("AcceptForward A=%d B=%d Dist=%.2f Dot=%.3f RoadA=%d RoadB=%d"),
-						HandleA, HandleB, FMath::Sqrt(DistSq), Dot, RoadA, RoadB));
+						TEXT("AcceptForward A=%d(orig=%d) B=%d(orig=%d) Dist=%.2f Dot=%.3f RoadA=%d RoadB=%d Mid=(%.0f,%.0f,%.0f)"),
+						HandleA, OriginalA,
+						HandleB, OriginalB,
+						FMath::Sqrt(DistSq), Dot, RoadA, RoadB,
+						PC.Midpoint.X, PC.Midpoint.Y, PC.Midpoint.Z));
 				}
 			}
 			else
@@ -802,9 +800,16 @@ void URoadBLDReflectionProvider::BuildProximityConnections()
 
 					if (bSampleDiagnostics && SampledAccepts.Num() < MaxSamples)
 					{
+						const int32 OriginalA = VirtualLaneMap.Contains(HandleA)
+							? VirtualLaneMap[HandleA].OriginalLaneHandle : HandleA;
+						const int32 OriginalB = VirtualLaneMap.Contains(HandleB)
+							? VirtualLaneMap[HandleB].OriginalLaneHandle : HandleB;
 						SampledAccepts.Add(FString::Printf(
-							TEXT("AcceptUTurn A=%d B=%d Dist=%.2f Dot=%.3f WidthA=%.1f WidthB=%.1f"),
-							HandleA, HandleB, FMath::Sqrt(DistSq), Dot, WidthA, WidthB));
+							TEXT("AcceptUTurn A=%d(orig=%d) B=%d(orig=%d) Dist=%.2f Dot=%.3f WidthA=%.1f WidthB=%.1f Mid=(%.0f,%.0f,%.0f)"),
+							HandleA, OriginalA,
+							HandleB, OriginalB,
+							FMath::Sqrt(DistSq), Dot, WidthA, WidthB,
+							PC.Midpoint.X, PC.Midpoint.Y, PC.Midpoint.Z));
 					}
 				}
 				else
@@ -812,9 +817,15 @@ void URoadBLDReflectionProvider::BuildProximityConnections()
 					++UTurnRejectedWidth;
 					if (bSampleDiagnostics && SampledRejects.Num() < MaxSamples)
 					{
+						const int32 OriginalA = VirtualLaneMap.Contains(HandleA)
+							? VirtualLaneMap[HandleA].OriginalLaneHandle : HandleA;
+						const int32 OriginalB = VirtualLaneMap.Contains(HandleB)
+							? VirtualLaneMap[HandleB].OriginalLaneHandle : HandleB;
 						SampledRejects.Add(FString::Printf(
-							TEXT("RejectUTurnWidth A=%d B=%d Dist=%.2f Dot=%.3f WidthA=%.1f WidthB=%.1f MinWidth=%.1f"),
-							HandleA, HandleB, FMath::Sqrt(DistSq), Dot, WidthA, WidthB, MinUTurnWidth));
+							TEXT("RejectUTurnWidth A=%d(orig=%d) B=%d(orig=%d) Dist=%.2f Dot=%.3f WidthA=%.1f WidthB=%.1f MinWidth=%.1f"),
+							HandleA, OriginalA,
+							HandleB, OriginalB,
+							FMath::Sqrt(DistSq), Dot, WidthA, WidthB, MinUTurnWidth));
 					}
 				}
 			}

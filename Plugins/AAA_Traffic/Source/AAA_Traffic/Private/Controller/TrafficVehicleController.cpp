@@ -52,6 +52,34 @@ static FAutoConsoleVariableRef CVarTrafficWakeGuardMaxSpeed(
 	TEXT("Maximum absolute speed (cm/s) where anti-sleep wake guard is allowed to trigger."),
 	ECVF_Default);
 
+float GTrafficCTERecoveryThreshold = 0.6f;
+static FAutoConsoleVariableRef CVarTrafficCTERecoveryThreshold(
+	TEXT("traffic.CTERecoveryThreshold"),
+	GTrafficCTERecoveryThreshold,
+	TEXT("CTE fraction (of half-lane) that triggers post-collision throttle reduction (default 0.6)."),
+	ECVF_Default);
+
+float GTrafficCTERecoveryScale = 1.25f;
+static FAutoConsoleVariableRef CVarTrafficCTERecoveryScale(
+	TEXT("traffic.CTERecoveryScale"),
+	GTrafficCTERecoveryScale,
+	TEXT("Throttle reduction per CTE unit above threshold (default 1.25). Higher = more aggressive."),
+	ECVF_Default);
+
+float GTrafficCTERecoveryMinThrottle = 0.4f;
+static FAutoConsoleVariableRef CVarTrafficCTERecoveryMinThrottle(
+	TEXT("traffic.CTERecoveryMinThrottle"),
+	GTrafficCTERecoveryMinThrottle,
+	TEXT("Minimum throttle floor during CTE recovery to preserve steering authority (default 0.4)."),
+	ECVF_Default);
+
+float GTrafficCTERecoveryBrakeFactor = 0.5f;
+static FAutoConsoleVariableRef CVarTrafficCTERecoveryBrakeFactor(
+	TEXT("traffic.CTERecoveryBrakeFactor"),
+	GTrafficCTERecoveryBrakeFactor,
+	TEXT("Supplemental brake multiplier during CTE recovery (default 0.5). brake = (1-recoveryScale)*factor."),
+	ECVF_Default);
+
 int32 GTrafficVehicleDiagnostics = 0;
 static FAutoConsoleVariableRef CVarTrafficVehicleDiagnostics(
 	TEXT("traffic.VehicleDiagnostics"),
@@ -82,7 +110,17 @@ void FVehicleJunctionState::BeginApproach(int32 InJunctionId)
 		TEXT("BeginApproach: expected Idle, got %d"), (int32)Phase);
 	Phase = EJunctionPhase::Approaching;
 	JunctionId = InJunctionId;
-	LastReleasedId = 0; // New engagement -- clear stale release marker.
+	CanonicalMovementId = 0;
+	bOwnsJunctionOccupancy = false;
+	bTransitionPathFromProvider = false;
+	// Only clear stale release marker when engaging a DIFFERENT junction.
+	// If the vehicle just released this junction (e.g. it is still on a
+	// junction lane), preserving LastReleasedId prevents TickDetectAndOccupy
+	// from re-acquiring the same junction as a new encounter.
+	if (InJunctionId != LastReleasedId)
+	{
+		LastReleasedId = 0;
+	}
 }
 
 void FVehicleJunctionState::BeginWaiting()
@@ -101,6 +139,7 @@ void FVehicleJunctionState::BeginTraversing()
 	bWaiting = false;
 	RetryTimer = 0.0f;
 	WaitElapsed = 0.0f;
+	TimeoutRetryCount = 0;
 	StopSignStopElapsed = 0.0f;
 	bStopSignWaitComplete = false;
 }
@@ -115,17 +154,23 @@ void FVehicleJunctionState::Release()
 	JunctionLane = FTrafficLaneHandle();
 	FromLane = FTrafficLaneHandle();
 	ToLane = FTrafficLaneHandle();
+	CanonicalMovementId = 0;
 	EntryWorldPos = FVector::ZeroVector;
 	bHasEntryPos = false;
 	bWaiting = false;
+	bOwnsJunctionOccupancy = false;
 	RetryTimer = 0.0f;
 	WaitElapsed = 0.0f;
+	TimeoutRetryCount = 0;
 	ApproachDistanceCm = 0.0f;
 	ApproachSpeedLimitCmPerSec = 0.0f;
 	ApproachJunctionLane = FTrafficLaneHandle();
 	TransitionPoints.Empty();
 	TransitionIndex = 0;
 	CurveStartIndex = 0;
+	TransitionReleaseIndex = INDEX_NONE;
+	ExitLaneResumeIndex = INDEX_NONE;
+	bTransitionPathFromProvider = false;
 	StopSignStopElapsed = 0.0f;
 	bStopSignWaitComplete = false;
 }
@@ -137,11 +182,14 @@ void FVehicleJunctionState::Reset()
 	JunctionLane = FTrafficLaneHandle();
 	FromLane = FTrafficLaneHandle();
 	ToLane = FTrafficLaneHandle();
+	CanonicalMovementId = 0;
 	EntryWorldPos = FVector::ZeroVector;
 	bHasEntryPos = false;
 	bWaiting = false;
+	bOwnsJunctionOccupancy = false;
 	RetryTimer = 0.0f;
 	WaitElapsed = 0.0f;
+	TimeoutRetryCount = 0;
 	LastReleasedId = 0;
 	ApproachDistanceCm = 0.0f;
 	ApproachSpeedLimitCmPerSec = 0.0f;
@@ -149,6 +197,9 @@ void FVehicleJunctionState::Reset()
 	TransitionPoints.Empty();
 	TransitionIndex = 0;
 	CurveStartIndex = 0;
+	TransitionReleaseIndex = INDEX_NONE;
+	ExitLaneResumeIndex = INDEX_NONE;
+	bTransitionPathFromProvider = false;
 	StopSignStopElapsed = 0.0f;
 	bStopSignWaitComplete = false;
 }
@@ -196,7 +247,7 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, ApproachDecelCmPerSec2(300.0f)
 	, JunctionCurveResolutionCm(200.0f)
 	, IntersectionSpeedLimitCmPerSec(2000.0f)
-	, MaxIntersectionWaitTimeSec(90.0f)
+	, MaxIntersectionWaitTimeSec(30.0f)
 	, VehicleFrontExtent(0.0f)
 	, MaxAllowedSpeedCmPerSec(8000.0f) // ~180 mph, well above any traffic speed
 	, RandomSeed(0)
@@ -272,32 +323,24 @@ void ATrafficVehicleController::SetBrakeLights(bool bNewState)
 	OnBrakeLightChanged.Broadcast(bNewState);
 }
 
-ETurnSignalState ATrafficVehicleController::ComputeTurnDirection(
-	const FTrafficLaneHandle& FromLane,
-	const FTrafficLaneHandle& ToLane) const
+ETurnSignalState ATrafficVehicleController::GetSelectedTurnDirection() const
 {
-	if (!CachedProvider || !FromLane.IsValid() || !ToLane.IsValid())
+	if (const FCanonicalMovementRecord* Movement = GetSelectedCanonicalMovement())
 	{
-		return ETurnSignalState::Off;
+		return Movement->TurnDirection;
 	}
 
-	// Use end-of-lane tangent for approach (where the junction is) and
-	// start-of-lane tangent for exit (where the lane begins).
-	const float FromLength = CachedProvider->GetLaneLength(FromLane);
-	const FVector ApproachDir = CachedProvider->GetLaneDirectionAtDistance(FromLane, FromLength);
-	const FVector ExitDir = CachedProvider->GetLaneDirection(ToLane);
+	return ETurnSignalState::Off;
+}
 
-	// Cross product Z: positive = left turn, negative = right turn.
-	const float CrossZ = FVector::CrossProduct(ApproachDir, ExitDir).Z;
 
-	// Threshold: ~15 deg deviation from straight -- below this, treat as straight-through.
-	constexpr float StraightThreshold = 0.26f; // sin(15 deg) ~= 0.259
-	if (FMath::Abs(CrossZ) < StraightThreshold)
-	{
-		return ETurnSignalState::Off;
-	}
-
-	return (CrossZ > 0.0f) ? ETurnSignalState::Left : ETurnSignalState::Right;
+bool ATrafficVehicleController::IsUsableExitLane(const FTrafficLaneHandle& Lane) const
+{
+	// Any valid lane is a usable exit.  Dead-end lanes (those without
+	// downstream connectivity to another junction) are explicitly included:
+	// vehicles that reach the end of a dead-end road are recycled by the
+	// dead-end despawn system.
+	return Lane.IsValid();
 }
 
 
@@ -308,15 +351,123 @@ FTrafficLaneHandle ATrafficVehicleController::PickSurveyedExit(
 	// Query the centralized surveyor table.
 	UWorld* World = GetWorld();
 	const UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
+	const TArray<int32>& CanonicalMovementIds = TrafficSub
+		? TrafficSub->GetCanonicalMovementsForApproachLane(ApproachLane.HandleId)
+		: UTrafficSubsystem::EmptyMovementIds;
 	const TArray<FJunctionExitRule>& Rules = TrafficSub
 		? TrafficSub->GetLegalExits(ApproachLane.HandleId)
 		: UTrafficSubsystem::EmptyExitRules;
+	auto IsAllowedCandidate = [this, &FallbackExits](const FTrafficLaneHandle& CandidateLane)
+	{
+		if (!CandidateLane.IsValid())
+		{
+			return false;
+		}
+
+		if (!FallbackExits.IsEmpty())
+		{
+			bool bFoundInFallback = false;
+			for (const FTrafficLaneHandle& FallbackLane : FallbackExits)
+			{
+				if (FallbackLane.HandleId == CandidateLane.HandleId)
+				{
+					bFoundInFallback = true;
+					break;
+				}
+			}
+
+			if (!bFoundInFallback)
+			{
+				return false;
+			}
+		}
+
+		return IsUsableExitLane(CandidateLane);
+	};
+
+	if (!CanonicalMovementIds.IsEmpty() && TrafficSub)
+	{
+		if (const FCanonicalMovementRecord* ExistingMovement = GetSelectedCanonicalMovement())
+		{
+			if (ExistingMovement->FromLane.HandleId == ApproachLane.HandleId
+				&& IsAllowedCandidate(ExistingMovement->ToLane))
+			{
+				JnctState.CanonicalMovementId = ExistingMovement->MovementId;
+				return ExistingMovement->ToLane;
+			}
+		}
+
+		TArray<const FCanonicalMovementRecord*> ValidMovements;
+		for (const int32 MovementId : CanonicalMovementIds)
+		{
+			const FCanonicalMovementRecord* Movement = TrafficSub->GetCanonicalMovement(MovementId);
+			if (!Movement
+				|| !Movement->IsValid()
+				|| Movement->SelectionWeight <= 0.0f
+				|| !Movement->bLegallyAllowed
+				|| !Movement->bPhysicallyFeasible
+				|| !IsAllowedCandidate(Movement->ToLane))
+			{
+				continue;
+			}
+			ValidMovements.Add(Movement);
+		}
+
+		if (!ValidMovements.IsEmpty())
+		{
+			ValidMovements.Sort([](const FCanonicalMovementRecord& A, const FCanonicalMovementRecord& B)
+			{
+				return A.MovementId < B.MovementId;
+			});
+
+			float TotalWeight = 0.0f;
+			for (const FCanonicalMovementRecord* Movement : ValidMovements)
+			{
+				TotalWeight += Movement->SelectionWeight;
+			}
+
+			const float Roll = RandomStream.FRandRange(0.0f, TotalWeight);
+			float Cumulative = 0.0f;
+			for (const FCanonicalMovementRecord* Movement : ValidMovements)
+			{
+				Cumulative += Movement->SelectionWeight;
+				if (Roll <= Cumulative)
+				{
+					JnctState.CanonicalMovementId = Movement->MovementId;
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("CANONICAL-PICK: Pawn='%s' Movement=%d Approach=%d Exit=%d Turn=%s W=%.3f (roll=%.3f/%.3f)"),
+						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+						Movement->MovementId,
+						ApproachLane.HandleId,
+						Movement->ToLane.HandleId,
+						Movement->TurnDirection == ETurnSignalState::Left ? TEXT("L") : (Movement->TurnDirection == ETurnSignalState::Right ? TEXT("R") : TEXT("S")),
+						Movement->SelectionWeight,
+						Roll,
+						TotalWeight);
+					return Movement->ToLane;
+				}
+			}
+
+			const FCanonicalMovementRecord* Movement = ValidMovements.Last();
+			JnctState.CanonicalMovementId = Movement->MovementId;
+			return Movement->ToLane;
+		}
+
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("CANONICAL-PICK-EMPTY: Pawn='%s' Approach=%d has canonical movements but none survived runtime filtering"),
+			GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+			ApproachLane.HandleId);
+		JnctState.CanonicalMovementId = 0;
+		return FTrafficLaneHandle();
+	}
+
+	JnctState.CanonicalMovementId = 0;
 
 	// Build a list of exits with positive weight from the survey.
 	TArray<FJunctionExitRule> ValidRules;
 	for (const FJunctionExitRule& R : Rules)
 	{
-		if (R.Weight > 0.0f)
+		if (R.Weight > 0.0f && IsAllowedCandidate(R.ExitLane))
 		{
 			ValidRules.Add(R);
 		}
@@ -326,13 +477,27 @@ FTrafficLaneHandle ATrafficVehicleController::PickSurveyedExit(
 	// with the same direction-weighted formula (e.g. lanes without a junction scan).
 	if (ValidRules.IsEmpty() && FallbackExits.Num() > 0)
 	{
-		if (FallbackExits.Num() == 1)
+		TArray<FTrafficLaneHandle> Sorted;
+		Sorted.Reserve(FallbackExits.Num());
+		for (const FTrafficLaneHandle& ExitLane : FallbackExits)
 		{
-			return FallbackExits[0];
+			if (IsAllowedCandidate(ExitLane))
+			{
+				Sorted.Add(ExitLane);
+			}
+		}
+
+		if (Sorted.Num() == 1)
+		{
+			return Sorted[0];
+		}
+
+		if (Sorted.IsEmpty())
+		{
+			return FTrafficLaneHandle();
 		}
 
 		// Ad-hoc weighted selection for unsurveyed lanes.
-		TArray<FTrafficLaneHandle> Sorted = FallbackExits;
 		Sorted.Sort([](const FTrafficLaneHandle& A, const FTrafficLaneHandle& B)
 		{ return A.HandleId < B.HandleId; });
 
@@ -398,6 +563,23 @@ FTrafficLaneHandle ATrafficVehicleController::PickSurveyedExit(
 	return ValidRules.Last().ExitLane;
 }
 
+const FCanonicalMovementRecord* ATrafficVehicleController::GetSelectedCanonicalMovement() const
+{
+	if (JnctState.CanonicalMovementId <= 0)
+	{
+		return nullptr;
+	}
+
+	const UWorld* World = GetWorld();
+	const UTrafficSubsystem* TrafficSub = World ? World->GetSubsystem<UTrafficSubsystem>() : nullptr;
+	if (!TrafficSub)
+	{
+		return nullptr;
+	}
+
+	return TrafficSub->GetCanonicalMovement(JnctState.CanonicalMovementId);
+}
+
 
 void ATrafficVehicleController::InitializeLaneFollowing(const FTrafficLaneHandle& InLane)
 {
@@ -411,15 +593,20 @@ void ATrafficVehicleController::OnUnPossess()
 	{
 		if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
 		{
-			// Release any junction occupancy before unregistering.
-			if (JnctState.IsEngaged())
+			if (JnctState.Phase == EJunctionPhase::Traversing)
 			{
 				UE_LOG(LogAAATraffic, Warning,
-					TEXT("JNCT RELEASE-UNPOSSESS: Pawn='%s' releasing junction %d (phase=%d) on unpossess/destroy"),
+					TEXT("JNCT RELEASE-UNPOSSESS: Pawn='%s' preserving traversing junction %d (phase=%d) until unregister cleanup"),
 					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 					JnctState.JunctionId, (int32)JnctState.Phase);
-				TrafficSub->ReleaseJunction(JnctState.JunctionId, this);
-				JnctState.Reset();
+			}
+			else if (JnctState.IsActive())
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JNCT RELEASE-UNPOSSESS: Pawn='%s' preserving phase=%d junction %d until unregister cleanup"),
+					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+					(int32)JnctState.Phase,
+					JnctState.JunctionId);
 			}
 			else
 			{
@@ -429,6 +616,10 @@ void ATrafficVehicleController::OnUnPossess()
 					(int32)JnctState.Phase);
 			}
 			TrafficSub->UnregisterVehicle(this);
+			if (JnctState.IsActive())
+			{
+				JnctState.Reset();
+			}
 		}
 	}
 	Super::OnUnPossess();
@@ -441,17 +632,49 @@ void ATrafficVehicleController::HandleActorHit(
 	// Ignore trivial or self-hits.
 	if (!OtherActor || OtherActor == SelfActor) return;
 
+	// Ignore physics debris (destructible pieces from vehicle damage).
+	// These are not traffic-relevant obstacles.
+	if (OtherActor->GetName().Contains(TEXT("DestructiblePiece"))) return;
+
 	// Only react to meaningful impacts (impulse > 5 kN).
 	if (NormalImpulse.SizeSquared() < 5000.0f * 5000.0f) return;
 
-	// Set the collision brake timer (seconds of full braking).
-	CollisionBrakeTimer = FMath::Max(CollisionBrakeTimer, 1.0f);
+	// Proportional brake: low-impulse queue bumps get minimal brake to
+	// prevent bump→brake→resume→bump oscillation.  Real crashes still
+	// receive the full 1 s emergency brake.
+	const float Impulse = NormalImpulse.Size();
+	const float BrakeTime = FMath::GetMappedRangeValueClamped(
+		FVector2f(5000.0f, 50000.0f),
+		FVector2f(0.1f, 1.0f),
+		Impulse);
+	CollisionBrakeTimer = FMath::Max(CollisionBrakeTimer, BrakeTime);
 
 	UE_LOG(LogAAATraffic, Warning,
-		TEXT("COLLISION: Pawn='%s' hit '%s' impulse=%.0f -- braking for 1s"),
+		TEXT("COLLISION: Pawn='%s' hit '%s' impulse=%.0f Lane=%d Jnct=%d Phase=%d Path=%s CurvePts=%d CurveIdx=%d CTE=%.1f/%.1f HeadCross=%.3f TargetDist=%.0f SpeedCap=%.0f Steer=%.3f JCurveR=%.0f JCurveCap=%.0f PredR=%.0f PredDist=%.0f PredCap=%.0f LeaderDist=%.0f BrakeTime=%.2f"),
 		SelfActor ? *SelfActor->GetName() : TEXT("NULL"),
 		*OtherActor->GetName(),
-		NormalImpulse.Size());
+		NormalImpulse.Size(),
+		CurrentLane.HandleId,
+		JnctState.JunctionId,
+		(int32)JnctState.Phase,
+		JnctState.TransitionPoints.Num() > 0
+			? (JnctState.bTransitionPathFromProvider ? TEXT("PROVIDER-JNCT") : TEXT("SYNTH-JNCT"))
+			: TEXT("LANE"),
+		JnctState.TransitionPoints.Num(),
+		JnctState.TransitionIndex,
+		LastDiagSignedCTE,
+		LastDiagHalfLaneWidth,
+		LastDiagHeadingCrossZ,
+		LastDiagTargetDistance2D,
+		LastDiagEffectiveTargetSpeed,
+		LastDiagSteeringInput,
+		LastDiagJunctionCurveRadiusCm,
+		LastDiagJunctionCurveCapCmPerSec,
+		LastDiagPredictiveCurveRadiusCm,
+		LastDiagPredictiveCurveDistCm,
+		LastDiagPredictiveCurveSpeedCmPerSec,
+		DbgLeaderDist,
+		BrakeTime);
 }
 
 
@@ -618,8 +841,18 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 		// geometry or a collision deadlock. Despawn to clear the blockage.
 		const FVector CurrentLoc = SafetyPawn->GetActorLocation();
 		const float MovedDist = FVector::Dist(CurrentLoc, PreviousVehicleLocation);
-		// Only count stuck frames when the vehicle SHOULD be moving.
-		const bool bShouldBeMoving = (TargetSpeed > 10.0f) && !JnctState.bWaiting && !bAtDeadEnd;
+		// Cars in any junction phase (approaching, waiting, traversing) are
+		// legitimately stopped or slow — don't count them as stuck.
+		// Also exempt cars that have a detected leader ahead (queued behind
+		// another vehicle and correctly car-following at near-zero speed).
+		const bool bInJunction = (JnctState.Phase != EJunctionPhase::Idle);
+		const bool bHasLeader = (LastLeaderDist > 0.0f);
+		// Only exempt vehicles actively traversing the junction curve.
+		// Approaching-phase vehicles that aren't moving should still be
+		// caught — bWaiting already covers signal waits separately.
+		const bool bTraversingJunction = (JnctState.Phase == EJunctionPhase::Traversing);
+		const bool bShouldBeMoving = (TargetSpeed > 10.0f) && !JnctState.bWaiting
+			&& !bAtDeadEnd && !bTraversingJunction && !bHasLeader;
 		if (bShouldBeMoving && MovedDist < 5.0f)
 		{
 			StuckTimeAccumulator += EffectiveDeltaSeconds;
@@ -645,6 +878,47 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 		{
 			StuckTimeAccumulator = 0.0f;
 		}
+
+		// --- Off-road stuck detection (CTE safety net) ---
+		// The normal stuck detector exempts vehicles in junction phases,
+		// but a vehicle can end up 5+ meters off-road after a bad junction
+		// exit and immediately enter Approaching phase for the next junction,
+		// bypassing the stuck detector forever. This secondary check fires
+		// regardless of junction phase.
+		if (bLaneDataReady && LastDiagHalfLaneWidth > 0.0f)
+		{
+			const float CTEFraction = FMath::Abs(LastDiagSignedCTE) / LastDiagHalfLaneWidth;
+			const float CurrentSpeed = SafetyPawn->GetVelocity().Size();
+			if (CTEFraction > 1.5f && CurrentSpeed < 10.0f)
+			{
+				OffRoadStuckTimer += EffectiveDeltaSeconds;
+				if (OffRoadStuckTimer >= StuckDespawnTimeSec)
+				{
+					if (TrafficSub && !bPendingRecoveryDespawn)
+					{
+						bPendingRecoveryDespawn = true;
+						UE_LOG(LogAAATraffic, Warning,
+							TEXT("Safety: off-road stuck vehicle '%s' Lane=%d CTE=%.1fcm (%.0f%% of half-lane) "
+							     "Speed=%.1f — despawning after %.1fs"),
+							SafetyPawn ? *SafetyPawn->GetName() : TEXT("NULL"),
+							CurrentLane.HandleId,
+							LastDiagSignedCTE, CTEFraction * 100.0f,
+							CurrentSpeed, OffRoadStuckTimer);
+						TrafficSub->RequestDespawn(this,
+							FString::Printf(TEXT("off-road stuck for %.1fs (CTE=%.0f%% of half-lane)"),
+								OffRoadStuckTimer, CTEFraction * 100.0f));
+					}
+					return;
+				}
+			}
+			else if (CTEFraction < 1.2f || CurrentSpeed >= 10.0f)
+			{
+				// Hysteresis: once timer starts counting (CTE > 150%),
+				// don't reset until vehicle definitively recovers
+				// (CTE < 120% OR regains meaningful speed).
+				OffRoadStuckTimer = 0.0f;
+			}
+		}
 	}
 
 	UpdateVehicleInput(EffectiveDeltaSeconds);
@@ -653,9 +927,27 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 	DrawVehicleDebug();
 }
 
-int32 ATrafficVehicleController::FindClosestPointIndex(const FVector& VehicleLocation)
+int32 ATrafficVehicleController::FindClosestPointIndex(const FVector& VehicleLocation, bool bForceFullScan)
 {
 	if (LanePoints.Num() == 0) { return 0; }
+
+	if (bForceFullScan)
+	{
+		int32 BestIndex = 0;
+		float BestDistSq = FVector::DistSquared(VehicleLocation, LanePoints[0]);
+		for (int32 i = 1; i < LanePoints.Num(); ++i)
+		{
+			const float DistSq = FVector::DistSquared(VehicleLocation, LanePoints[i]);
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				BestIndex = i;
+			}
+		}
+
+		LastClosestIndex = BestIndex;
+		return BestIndex;
+	}
 
 	// Forward-only monotonic search: the index can only advance.
 	// This prevents snapping to the wrong side of a hairpin curve
@@ -705,26 +997,125 @@ int32 ATrafficVehicleController::FindClosestPointIndex(const FVector& VehicleLoc
 }
 
 
+bool ATrafficVehicleController::ProjectOntoLaneAtIndex(
+	const FVector& ReferenceLocation,
+	int32 ClosestIndex,
+	FVector& OutProjectedPoint,
+	int32& OutSegmentStartIndex) const
+{
+	if (LanePoints.Num() == 0)
+	{
+		OutProjectedPoint = FVector::ZeroVector;
+		OutSegmentStartIndex = 0;
+		return false;
+	}
+
+	if (LanePoints.Num() == 1)
+	{
+		OutProjectedPoint = LanePoints[0];
+		OutSegmentStartIndex = 0;
+		return true;
+	}
+
+	const int32 ClampedIndex = FMath::Clamp(ClosestIndex, 0, LanePoints.Num() - 1);
+	const FVector Reference2D(ReferenceLocation.X, ReferenceLocation.Y, 0.0f);
+
+	bool bFoundProjection = false;
+	float BestDistSq2D = TNumericLimits<float>::Max();
+	FVector BestProjectedPoint = LanePoints[ClampedIndex];
+	int32 BestSegmentStartIndex = FMath::Clamp(ClampedIndex, 0, LanePoints.Num() - 2);
+
+	auto ConsiderSegment = [&](int32 SegmentStartIndex)
+	{
+		if (SegmentStartIndex < 0 || SegmentStartIndex >= LanePoints.Num() - 1)
+		{
+			return;
+		}
+
+		const FVector SegmentStart = LanePoints[SegmentStartIndex];
+		const FVector SegmentEnd = LanePoints[SegmentStartIndex + 1];
+		const FVector SegmentStart2D(SegmentStart.X, SegmentStart.Y, 0.0f);
+		const FVector SegmentEnd2D(SegmentEnd.X, SegmentEnd.Y, 0.0f);
+		const FVector SegmentDelta2D = SegmentEnd2D - SegmentStart2D;
+		const float SegmentLenSq2D = SegmentDelta2D.SizeSquared();
+
+		FVector CandidateProjectedPoint = SegmentStart;
+		if (SegmentLenSq2D > KINDA_SMALL_NUMBER)
+		{
+			const float Alpha = FMath::Clamp(
+				FVector::DotProduct(Reference2D - SegmentStart2D, SegmentDelta2D) / SegmentLenSq2D,
+				0.0f,
+				1.0f);
+			CandidateProjectedPoint = FMath::Lerp(SegmentStart, SegmentEnd, Alpha);
+		}
+
+		const FVector CandidateProjectedPoint2D(
+			CandidateProjectedPoint.X,
+			CandidateProjectedPoint.Y,
+			0.0f);
+		const float CandidateDistSq2D = FVector::DistSquared(Reference2D, CandidateProjectedPoint2D);
+		if (!bFoundProjection || CandidateDistSq2D < BestDistSq2D)
+		{
+			bFoundProjection = true;
+			BestDistSq2D = CandidateDistSq2D;
+			BestProjectedPoint = CandidateProjectedPoint;
+			BestSegmentStartIndex = SegmentStartIndex;
+		}
+	};
+
+	ConsiderSegment(ClampedIndex - 1);
+	ConsiderSegment(ClampedIndex);
+
+	if (!bFoundProjection)
+	{
+		BestProjectedPoint = LanePoints[ClampedIndex];
+		BestSegmentStartIndex = FMath::Clamp(ClampedIndex, 0, LanePoints.Num() - 2);
+	}
+
+	OutProjectedPoint = BestProjectedPoint;
+	OutSegmentStartIndex = BestSegmentStartIndex;
+	return true;
+}
+
+
 FVector ATrafficVehicleController::GetLookAheadPoint(
 	const FVector& VehicleLocation, int32 ClosestIndex) const
 {
-	// Walk forward along lane points until LookAheadDistance is reached.
+	if (LanePoints.Num() == 0)
+	{
+		return FVector::ZeroVector;
+	}
+
+	if (LanePoints.Num() == 1)
+	{
+		return LanePoints[0];
+	}
+
+	FVector ProjectedStartPoint = VehicleLocation;
+	int32 SegmentStartIndex = FMath::Clamp(ClosestIndex, 0, LanePoints.Num() - 2);
+	ProjectOntoLaneAtIndex(VehicleLocation, ClosestIndex, ProjectedStartPoint, SegmentStartIndex);
+
+	// Walk forward from the projected lane position until LookAheadDistance is reached.
 	float AccumulatedDist = 0.0f;
-	int32 Index = ClosestIndex;
+	int32 Index = SegmentStartIndex;
 
 	while (Index < LanePoints.Num() - 1)
 	{
+		const FVector SegmentStart = (Index == SegmentStartIndex)
+			? ProjectedStartPoint
+			: LanePoints[Index];
+
 		// Use 2D distance so look-ahead accumulation matches the 2D
 		// steering computation. On hills, 3D distance is longer than
 		// 2D, causing the look-ahead point to be closer than intended.
-		const float SegmentDist = FVector::Dist2D(LanePoints[Index], LanePoints[Index + 1]);
+		const float SegmentDist = FVector::Dist2D(SegmentStart, LanePoints[Index + 1]);
 		AccumulatedDist += SegmentDist;
 
 		if (AccumulatedDist >= LookAheadDistance)
 		{
 			const float Overshoot = AccumulatedDist - LookAheadDistance;
 			const float Alpha = 1.0f - (Overshoot / FMath::Max(SegmentDist, KINDA_SMALL_NUMBER));
-			return FMath::Lerp(LanePoints[Index], LanePoints[Index + 1], Alpha);
+			return FMath::Lerp(SegmentStart, LanePoints[Index + 1], Alpha);
 		}
 
 		++Index;
@@ -736,7 +1127,10 @@ FVector ATrafficVehicleController::GetLookAheadPoint(
 	if (LanePoints.Num() >= 2)
 	{
 		const int32 Last = LanePoints.Num() - 1;
-		const FVector FinalDir = (LanePoints[Last] - LanePoints[Last - 1]).GetSafeNormal();
+		const FVector FinalSegmentStart = (SegmentStartIndex == Last - 1)
+			? ProjectedStartPoint
+			: LanePoints[Last - 1];
+		const FVector FinalDir = (LanePoints[Last] - FinalSegmentStart).GetSafeNormal();
 		const float Remaining = LookAheadDistance - AccumulatedDist;
 		return LanePoints[Last] + FinalDir * Remaining;
 	}

@@ -15,6 +15,8 @@
 #include "JunctionNegotiator.h"
 #include "TrafficVehicleController.generated.h"
 
+struct FCanonicalMovementRecord;
+
 /**
  * State of in-progress lane change.
  */
@@ -94,6 +96,9 @@ struct FVehicleJunctionState
 	/** Exit lane (to). Valid when Phase >= Waiting. */
 	FTrafficLaneHandle ToLane;
 
+	/** Stable canonical movement ID for this junction engagement. */
+	int32 CanonicalMovementId = 0;
+
 	/** World position of junction entry boundary. */
 	FVector EntryWorldPos = FVector::ZeroVector;
 
@@ -103,11 +108,17 @@ struct FVehicleJunctionState
 	/** True when waiting for right-of-way (Phase == Waiting). */
 	bool bWaiting = false;
 
+	/** True only after a successful TryOccupyJunction (or via late-acquire ownership path). */
+	bool bOwnsJunctionOccupancy = false;
+
 	/** Cooldown timer for retry attempts (seconds, Phase == Waiting). */
 	float RetryTimer = 0.0f;
 
 	/** Elapsed wait time at junction (seconds, Phase == Waiting). */
 	float WaitElapsed = 0.0f;
+
+	/** Counter for throttling timeout-retry logs (~1/sec vs 4/sec). */
+	int32 TimeoutRetryCount = 0;
 
 	/** Last released junction ID — prevents re-detection on same lane. */
 	int32 LastReleasedId = 0;
@@ -129,6 +140,15 @@ struct FVehicleJunctionState
 
 	/** Index where actual junction curve begins (after prepended tail points). */
 	int32 CurveStartIndex = 0;
+
+	/** Index in TransitionPoints where occupancy may be released. */
+	int32 TransitionReleaseIndex = INDEX_NONE;
+
+	/** Preferred re-entry anchor in TransitionPoints when handing back to lane-following. */
+	int32 ExitLaneResumeIndex = INDEX_NONE;
+
+	/** True when TransitionPoints came directly from provider geometry instead of synthesis. */
+	bool bTransitionPathFromProvider = false;
 
 	/** Stop-sign mandatory wait elapsed (seconds, Phase == Waiting). */
 	float StopSignStopElapsed = 0.0f;
@@ -276,7 +296,11 @@ private:
 	 * Find the index of the closest lane point to the given world position.
 	 * Uses a cached last-known index with bounded search for O(1) amortized performance.
 	 */
-	int32 FindClosestPointIndex(const FVector& VehicleLocation);
+	int32 FindClosestPointIndex(const FVector& VehicleLocation, bool bForceFullScan = false);
+
+	/** Project a world position onto the nearest adjacent lane segment around ClosestIndex. */
+	bool ProjectOntoLaneAtIndex(const FVector& ReferenceLocation, int32 ClosestIndex,
+		FVector& OutProjectedPoint, int32& OutSegmentStartIndex) const;
 
 	/** Walk forward along lane points by LookAheadDistance and return the target point. */
 	FVector GetLookAheadPoint(const FVector& VehicleLocation, int32 ClosestIndex) const;
@@ -320,6 +344,22 @@ private:
 	/** Junction negotiator: approach, detection, occupy, release, traversal. */
 	FJunctionNegotiator JunctionNeg_;
 
+	// Last-tick motion diagnostics for event logs (lane departure / collision).
+	float LastDiagEffectiveTargetSpeed = 0.0f;
+	float LastDiagSteeringInput = 0.0f;
+	float LastDiagSignedCTE = 0.0f;
+	float LastDiagHalfLaneWidth = 0.0f;
+	float LastDiagHeadingCrossZ = 0.0f;
+	float LastDiagTargetDistance2D = 0.0f;
+	float LastDiagJunctionCurveRadiusCm = 0.0f;
+	float LastDiagJunctionCurveArcLengthCm = 0.0f;
+	float LastDiagJunctionCurveAngleDeg = 0.0f;
+	float LastDiagJunctionCurveCapCmPerSec = 0.0f;
+	float LastDiagPredictiveCurveRadiusCm = 0.0f;
+	float LastDiagPredictiveCurveDistCm = 0.0f;
+	float LastDiagPredictiveCurveSpeedCmPerSec = 0.0f;
+	bool bLastDiagFollowingJunctionCurve = false;
+
 	/**
 	 * Pick a junction exit using the centralized surveyor table.
 	 * Looks up the pre-computed legal exits for the approach lane, then
@@ -333,6 +373,8 @@ private:
 	FTrafficLaneHandle PickSurveyedExit(
 		const FTrafficLaneHandle& ApproachLane,
 		const TArray<FTrafficLaneHandle>& FallbackExits);
+	const FCanonicalMovementRecord* GetSelectedCanonicalMovement() const;
+	bool IsUsableExitLane(const FTrafficLaneHandle& Lane) const;
 
 	/** Append one lane-decision trace record into the bounded diagnostics ring buffer. */
 	void AddLaneDecisionTrace(const TCHAR* EventName, int32 CandidateLane, float MetricA, float MetricB, const FString& Detail = FString());
@@ -398,12 +440,8 @@ private:
 	/** Set the turn signal and broadcast delegate (no-op if state unchanged). */
 	void SetTurnSignal(ETurnSignalState NewState);
 
-	/**
-	 * Compute the turn direction for a junction transition.
-	 * Uses cross product of approach direction × exit direction.
-	 * Returns Left, Right, or Off (straight-through).
-	 */
-	ETurnSignalState ComputeTurnDirection(const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane) const;
+	/** Get the turn direction from the selected canonical movement when available. */
+	ETurnSignalState GetSelectedTurnDirection() const;
 
 	// ── Brake light state ───────────────────────────────────
 
@@ -423,6 +461,31 @@ private:
 	/** Duration (seconds) to wait at a dead-end before despawning.
 	 *  Configurable per-class; keep short for map-edge roads. */
 	static constexpr float DeadEndDespawnDelaySec = 3.0f;
+
+	/** Elapsed seconds stuck at lane-end with no viable canonical route.
+	 *  When this exceeds NoRouteDespawnDelaySec the vehicle is despawned
+	 *  instead of spamming errors every frame. Reset when a viable
+	 *  transition is found. */
+	float NoRouteStuckTimer = 0.0f;
+
+	/** Duration (seconds) to wait at lane-end without a canonical route
+	 *  before despawning. */
+	static constexpr float NoRouteDespawnDelaySec = 3.0f;
+
+	/** Countdown timer (seconds) for CTE ramp-up after EXIT-LANE-SWITCH.
+	 *  While > 0, CTECorrectionGain is scaled down to prevent the
+	 *  full-lock overcorrection that occurs when the vehicle is laterally
+	 *  offset from the new lane centerline immediately after a junction. */
+	float PostExitCTERampRemaining = 0.0f;
+
+	/** Duration of the CTE ramp-up period after an exit lane switch. */
+	static constexpr float PostExitCTERampDuration = 4.0f;
+
+	/** Minimum speed cap (cm/s) applied at the start of the post-exit ramp.
+	 *  Ramps up to full EffectiveTargetSpeed as RampAlpha → 1.
+	 *  Prevents the vehicle from racing at full lane speed while it is still
+	 *  laterally offset from the exit-lane centerline. */
+	static constexpr float PostExitSpeedCapMinCmPerSec = 300.0f;
 
 	/** Per-instance log throttle counter for waiting-state diagnostics.
 	 *  Replaces the old static int32 that was shared across all instances
@@ -454,7 +517,7 @@ private:
 	/** Computed look-ahead distance (cm) for this tick. */
 	float LookAheadDistance = 300.0f;
 
-	/** Computed following distance (cm) for this tick. */
+	/** Computed following distance (cm) for this tick (display-only — IDM uses MinFollowingDistanceCm directly). */
 	float FollowingDistance = 200.0f;
 
 	/** Computed detection distance (cm) for this tick. */
@@ -757,6 +820,11 @@ protected:
 	 *  After StuckDespawnTimeSec, the vehicle is safety-despawned. */
 	float StuckTimeAccumulator = 0.0f;
 
+	/** Accumulated seconds the vehicle has been severely off-road (CTE > 250%
+	 *  of half-lane) while nearly stopped. Fires regardless of junction phase
+	 *  so vehicles stuck off-road after a bad junction exit get cleaned up. */
+	float OffRoadStuckTimer = 0.0f;
+
 	/** Throttle timer for the wake guard so it fires at most once per second
 	 *  instead of every single tick (avoids energy injection). */
 	float WakeGuardCheckTimer = 0.0f;
@@ -810,6 +878,9 @@ protected:
 	/** When true (non-Shipping builds), draws the lane polyline, look-ahead target, and leader detection in-game. Has no effect in Shipping. Can also be toggled globally via console: traffic.DebugDraw 1 */
 	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")
 	bool bDebugDraw = false;
+
+	// Non-debug leader distance for stuck-timer exemption (must update unconditionally).
+	float LastLeaderDist = -1.0f;
 
 	// --- Cached debug state (populated each tick in UpdateVehicleInput for debug draw) ---
 #if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG

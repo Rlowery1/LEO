@@ -44,9 +44,11 @@ APawn* UTrafficVehiclePool::AcquireVehicle(UWorld* World, TSubclassOf<APawn> Veh
 		Comp->SetComponentTickEnabled(true);
 		if (UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(Comp))
 		{
+			// Enable physics BEFORE clearing velocity — calls are no-ops
+			// when simulation is off (which it is after ReleaseVehicle).
+			Prim->SetSimulatePhysics(true);
 			Prim->SetPhysicsLinearVelocity(FVector::ZeroVector);
 			Prim->SetPhysicsAngularVelocityInDegrees(FVector::ZeroVector);
-			Prim->SetSimulatePhysics(true);
 		}
 	}
 

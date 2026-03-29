@@ -277,10 +277,10 @@ void ATrafficSpawner::PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Prov
 			Signal->PhaseGroups.Add(MoveTemp(Group));
 		}
 
-		// ── Protected left-turn phases ──────────────────────────
+		// ── Protected left-turn phases ──────────────────────────────
 		// For Signal-mode junctions, identify lanes that have left-turn
 		// exits and create a dedicated arrow phase before each through-
-		// phase. The arrow phase gets a shorter green (10s default).
+		// phase. The arrow phase gets a shorter green (5s).
 		// This prevents left-turners from having to yield to through-
 		// traffic — they get their own exclusive green.
 		if (Signal->ControlMode == EJunctionControlMode::Signal && Signal->PhaseGroups.Num() > 1)
@@ -300,7 +300,7 @@ void ATrafficSpawner::PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Prov
 						if (Provider->GetJunctionForLane(Exit) != 0) { continue; }
 						const FVector ExitDir = Provider->GetLaneDirection(Exit);
 						const float CrossZ = FVector::CrossProduct(ApproachDir, ExitDir).Z;
-						if (CrossZ > 0.26f) // Left turn (sin(15°) threshold)
+						if (CrossZ > 0.26f) // Left turn (sin(15deg) threshold)
 						{
 							LeftTurnLanes.AddUnique(GLane);
 							break;
@@ -314,7 +314,7 @@ void ATrafficSpawner::PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Prov
 					FSignalPhaseGroup ArrowGroup;
 					ArrowGroup.GroupName = ThroughGroup.GroupName + TEXT("_LeftArrow");
 					ArrowGroup.GreenLanes = MoveTemp(LeftTurnLanes);
-					ArrowGroup.GroupGreenDuration = 10.0f; // Shorter left-turn phase.
+					ArrowGroup.GroupGreenDuration = 5.0f;
 					ArrowGroup.bIsProtectedArrow = true;
 					ExpandedGroups.Add(MoveTemp(ArrowGroup));
 				}
@@ -345,7 +345,7 @@ void ATrafficSpawner::PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Prov
 		// Stagger signal phases so adjacent junctions don't all start green
 		// simultaneously. Each junction offsets by one full phase period.
 		Signal->PhaseOffset = static_cast<float>(SignalsPlaced)
-			* (Signal->GreenDuration + Signal->YellowDuration);
+			* (Signal->GreenDuration + Signal->YellowDuration + Signal->AllRedClearanceSec);
 
 		// Dump final phase group structure.
 		if (bSignalDiag)

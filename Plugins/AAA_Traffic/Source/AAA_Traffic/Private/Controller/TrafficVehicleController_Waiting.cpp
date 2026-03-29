@@ -109,9 +109,9 @@ return false;
 						&& Signal->GetCurrentPhase() == ETrafficSignalPhase::Red
 						&& FMath::Abs(CurrentSpeed) < 10.0f)
 					{
-						const ETurnSignalState RoRTurn = ComputeTurnDirection(JnctState.FromLane, JnctState.ToLane);
+						const ETurnSignalState RoRTurn = GetSelectedTurnDirection();
 						if (RoRTurn == ETurnSignalState::Right
-							&& !TrafficSub->HasConflictingApproach(JnctState.JunctionId, this, JnctState.FromLane, JnctState.ToLane))
+							&& !TrafficSub->HasConflictingApproach(JnctState.JunctionId, this, JnctState.CanonicalMovementId))
 						{
 							bSignalAllows = true;
 							UE_LOG(LogAAATraffic, Log,
@@ -140,7 +140,7 @@ return false;
 					if (bSignalAllows && JunctionMode == EJunctionControlMode::Yield)
 					{
 						if (TrafficSub->HasApproachingCrossTraffic(
-								JnctState.JunctionId, this, JnctState.FromLane, JnctState.ToLane))
+								JnctState.JunctionId, this, JnctState.CanonicalMovementId))
 						{
 							bSignalAllows = false;
 						}
@@ -153,17 +153,18 @@ return false;
 					bool bLeftTurnYieldRetry = false;
 					if (bSignalAllows)
 					{
-						const ETurnSignalState RetryTurnDir = ComputeTurnDirection(JnctState.FromLane, JnctState.ToLane);
+						const ETurnSignalState RetryTurnDir = GetSelectedTurnDirection();
 						if (RetryTurnDir == ETurnSignalState::Left
 							&& !(Signal && Signal->IsLaneProtectedGreen(JnctState.JunctionLane))
-							&& TrafficSub->HasConflictingApproach(JnctState.JunctionId, this, JnctState.FromLane, JnctState.ToLane))
+							&& TrafficSub->HasConflictingApproach(JnctState.JunctionId, this, JnctState.CanonicalMovementId))
 						{
 							bLeftTurnYieldRetry = true;
 						}
 					}
 
-					if (bSignalAllows && !bLeftTurnYieldRetry && TrafficSub->TryOccupyJunction(JnctState.JunctionId, this, JnctState.FromLane, JnctState.ToLane))
+					if (bSignalAllows && !bLeftTurnYieldRetry && TrafficSub->TryOccupyJunction(JnctState.JunctionId, this, JnctState.CanonicalMovementId))
 					{
+						JnctState.bOwnsJunctionOccupancy = true;
 						JnctState.BeginTraversing();
 						// Remove from stop-sign FIFO queue now that occupancy is granted.
 						TrafficSub->RemoveStopSignArrival(JnctState.JunctionId, this);
@@ -183,37 +184,59 @@ return false;
 					}
 				}
 
-				// FIX (was MAJOR): Timeout -- if the vehicle has been waiting
-				// longer than MaxIntersectionWaitTimeSec, force-proceed to
-				// prevent permanent deadlocks. The junction may be blocked by
-				// a stuck vehicle, broken signal, or mutual denial cycle.
-				//
-				// TryOccupyJunction now auto-evicts occupants that have held
-				// a junction for >20 s (stuck vehicles), so a clean retry is
-				// usually enough.  ForceOccupy is a last resort.
+				// Timeout: retry after stale-occupant eviction, but never force
+				// entry through a live conflict set.
+				// Gated by RetryTimer to avoid per-frame log spam; the normal
+				// retry gate above already resets RetryTimer to 0.25f.
 				if (JnctState.bWaiting && MaxIntersectionWaitTimeSec > 0.0f && JnctState.WaitElapsed >= MaxIntersectionWaitTimeSec)
 				{
-					UE_LOG(LogAAATraffic, Warning,
-						TEXT("JNCT TIMEOUT-FORCE-PROCEED: Pawn='%s' JunctionId=%d -- "
-							 "waited %.1fs (max %.1fs). Retrying TryOccupy (stale occupants auto-evicted)."),
-						GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
-						JnctState.JunctionId,
-						JnctState.WaitElapsed,
-						MaxIntersectionWaitTimeSec);
+					// Extended-timeout despawn: if stuck for 15s past MaxWait, give up.
+					constexpr float ExtendedTimeoutMargin = 15.0f;
+					if (JnctState.WaitElapsed >= MaxIntersectionWaitTimeSec + ExtendedTimeoutMargin)
+					{
+						if (TrafficSub && !bPendingRecoveryDespawn)
+						{
+							bPendingRecoveryDespawn = true;
+							UE_LOG(LogAAATraffic, Warning,
+								TEXT("JNCT TIMEOUT-DESPAWN: Pawn='%s' JunctionId=%d -- "
+									 "waited %.1fs (max %.1fs + %.0fs margin). Despawning."),
+								GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+								JnctState.JunctionId,
+								JnctState.WaitElapsed,
+								MaxIntersectionWaitTimeSec,
+								ExtendedTimeoutMargin);
+							TrafficSub->RequestDespawn(this,
+								FString::Printf(TEXT("junction wait timeout %.1fs"),
+									JnctState.WaitElapsed));
+						}
+						return true;
+					}
+
+					// Throttle timeout logs to ~1/sec.
+					// RetryTimer fires at 0.25f cadence (4/sec); only log every 4th.
+					static constexpr int32 TimeoutLogInterval = 4;
+					const bool bShouldLogTimeout = (++JnctState.TimeoutRetryCount % TimeoutLogInterval) == 1;
+
+					if (bShouldLogTimeout)
+					{
+						UE_LOG(LogAAATraffic, Warning,
+							TEXT("JNCT TIMEOUT-RETRY: Pawn='%s' JunctionId=%d -- "
+								 "waited %.1fs (max %.1fs). Retrying TryOccupy after stale-occupant eviction."),
+							GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+							JnctState.JunctionId,
+							JnctState.WaitElapsed,
+							MaxIntersectionWaitTimeSec);
+					}
 
 					if (TrafficSub)
 					{
-						// TryOccupy now evicts stale occupants (>20 s) before
-						// checking conflicts, so this will succeed if the blocker
-						// was stuck.  If it still fails (e.g. genuine heavy
-						// traffic), force-occupy as last resort so the vehicle
-						// isn't lost forever.
 						if (!TrafficSub->TryOccupyJunction(JnctState.JunctionId,
-							this, JnctState.FromLane, JnctState.ToLane))
+							this, JnctState.CanonicalMovementId))
 						{
-							TrafficSub->ForceOccupyJunction(JnctState.JunctionId,
-								this, JnctState.FromLane, JnctState.ToLane);
+							JnctState.RetryTimer = 0.25f;
+							return true;
 						}
+						JnctState.bOwnsJunctionOccupancy = true;
 					}
 
 					JnctState.BeginTraversing();

@@ -69,17 +69,18 @@ static FAutoConsoleVariableRef CVarTrafficDiagnosticsValidateGraph(
 	TEXT("Run post-build graph invariant validation (adjacency symmetry, dangling handles, duplicate edges)."),
 	ECVF_Default);
 
-namespace
+// Shared diagnostic helpers — defined here, extern-declared by sibling
+// RoadBLDReflectionProvider_*.cpp files.  Must NOT be in an anonymous
+// namespace so that the linker resolves the single definition in unity
+// and non-unity builds alike.
+bool ShouldLogDiagnostics(const int32 Level)
 {
-	static bool ShouldLogDiagnostics(const int32 Level)
-	{
-		return GEnableDiagnosticDumps || GTrafficDiagnosticsLevel >= Level;
-	}
+	return GEnableDiagnosticDumps || GTrafficDiagnosticsLevel >= Level;
+}
 
-	static int32 GetDiagnosticsSampleLimit()
-	{
-		return FMath::Max(1, GTrafficDiagnosticsSampleLimit);
-	}
+int32 GetDiagnosticsSampleLimit()
+{
+	return FMath::Max(1, GTrafficDiagnosticsSampleLimit);
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +433,8 @@ TArray<FTrafficLaneHandle> URoadBLDReflectionProvider::GetConnectedLanes(const F
 	// connections of its own, check whether the original (pre-split) lane
 	// still has connections that were not remapped. This is a safety net
 	// for edge cases missed by the post-split remapping pass.
+	// TODO(P1): Audit DetectAndSplitThroughRoads + BuildJunctionGrouping to
+	//           find and fix the root cause so this fallback can be removed.
 	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
 	{
 		// Only fall back for the LAST virtual segment of the original lane,

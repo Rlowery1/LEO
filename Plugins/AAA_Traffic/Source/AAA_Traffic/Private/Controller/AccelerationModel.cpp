@@ -21,6 +21,7 @@ void FAccelerationModel::ClearDelayBuffer()
 {
 	DelayBuffer.Empty();
 	TimeClock = 0.0f;
+	SmoothedAccel = 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +124,20 @@ FAccelerationOutput FAccelerationModel::Compute(const FAccelerationInput& In)
 			{
 				Out.bAEBActive = true;
 			}
+
+			// Stopping-distance AEB: fire emergency brake when comfort
+			// deceleration cannot stop within 1.5× the kinematic distance.
+			// Accounts for Chaos physics braking being weaker than the
+			// parameterised comfort decel.
+			if (!Out.bAEBActive)
+			{
+				const float StopDist = (ClosingSpeed * ClosingSpeed)
+					/ (2.0f * FMath::Max(In.ComfortDecelCmPerSec2, 1.0f));
+				if (StopDist * 1.5f >= In.RawLeaderDist)
+				{
+					Out.bAEBActive = true;
+				}
+			}
 		}
 	}
 
@@ -151,13 +166,7 @@ FAccelerationOutput FAccelerationModel::Compute(const FAccelerationInput& In)
 	const float b = In.ComfortDecelCmPerSec2 * PersonalityDecelScale;
 	const float T = In.TimeHeadwaySec * PersonalityHeadwayScale;
 
-	// Queue compaction at standstill.
-	float s0 = In.JamDistanceCm;
-	if (DelayedDist >= 0.0f && v < 300.0f && DelayedSpeed < 300.0f)
-	{
-		const float Blend = FMath::Clamp(FMath::Max(v, DelayedSpeed) / 300.0f, 0.0f, 1.0f);
-		s0 = FMath::Lerp(In.JamDistanceCm * 0.5f, In.JamDistanceCm, Blend);
-	}
+	const float s0 = In.JamDistanceCm;
 
 	const float vRatio = v / FMath::Max(v0, 1.0f);
 	const float vRatio2 = vRatio * vRatio;
@@ -232,9 +241,26 @@ FAccelerationOutput FAccelerationModel::Compute(const FAccelerationInput& In)
 		Out.ThrottleInput = 0.08f;
 	}
 
-	// Brake light state.
-	Out.bBraking = (Out.BrakeInput > 0.0f)
-		|| (In.bWaitingAtJunction && FMath::Abs(In.CurrentSpeed) < 100.0f);
+	// Brake light state with hysteresis to prevent flickering at idle.
+	// When waiting at a junction: on below 50 cm/s, off above 150 cm/s.
+	const bool bBrakeInputActive = (Out.BrakeInput > 0.0f);
+	if (In.bWaitingAtJunction)
+	{
+		const float AbsSpeed = FMath::Abs(In.CurrentSpeed);
+		if (bPrevBraking)
+		{
+			Out.bBraking = bBrakeInputActive || AbsSpeed < 150.0f;
+		}
+		else
+		{
+			Out.bBraking = bBrakeInputActive || AbsSpeed < 50.0f;
+		}
+	}
+	else
+	{
+		Out.bBraking = bBrakeInputActive;
+	}
+	bPrevBraking = Out.bBraking;
 
 	// AEB hard override.
 	if (Out.bAEBActive)

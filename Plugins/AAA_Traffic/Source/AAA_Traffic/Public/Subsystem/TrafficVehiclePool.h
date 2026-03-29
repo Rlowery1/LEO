@@ -14,7 +14,7 @@
  * and repositioned — avoiding the cost of full actor construction.
  *
  * Owned by UTrafficSubsystem (world-scoped lifecycle).
- * Determinism: pool acquisition order is FIFO per class (last-released first).
+ * Determinism: pool acquisition order is LIFO per class (last-released, first reused).
  */
 UCLASS()
 class AAA_TRAFFIC_API UTrafficVehiclePool : public UObject
