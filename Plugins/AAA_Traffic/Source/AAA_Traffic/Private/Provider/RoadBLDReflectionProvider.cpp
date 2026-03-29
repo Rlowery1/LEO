@@ -69,17 +69,18 @@ static FAutoConsoleVariableRef CVarTrafficDiagnosticsValidateGraph(
 	TEXT("Run post-build graph invariant validation (adjacency symmetry, dangling handles, duplicate edges)."),
 	ECVF_Default);
 
-namespace
+// Shared diagnostic helpers — defined here, extern-declared by sibling
+// RoadBLDReflectionProvider_*.cpp files.  Must NOT be in an anonymous
+// namespace so that the linker resolves the single definition in unity
+// and non-unity builds alike.
+bool ShouldLogDiagnostics(const int32 Level)
 {
-	static bool ShouldLogDiagnostics(const int32 Level)
-	{
-		return GEnableDiagnosticDumps || GTrafficDiagnosticsLevel >= Level;
-	}
+	return GEnableDiagnosticDumps || GTrafficDiagnosticsLevel >= Level;
+}
 
-	static int32 GetDiagnosticsSampleLimit()
-	{
-		return FMath::Max(1, GTrafficDiagnosticsSampleLimit);
-	}
+int32 GetDiagnosticsSampleLimit()
+{
+	return FMath::Max(1, GTrafficDiagnosticsSampleLimit);
 }
 
 // ---------------------------------------------------------------------------

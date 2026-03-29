@@ -1514,23 +1514,26 @@ void UTrafficSubsystem::BuildJunctionSurvey()
 				continue;
 			}
 
-			UE_LOG(LogAAATraffic, Log,
-				TEXT("CANONICAL TABLE: Junction=%d Movement=%d From=%d To=%d Turn=%d Class=%d Path=%d Arc=%.0f Radius=%.0f EntryAttach=%d ExitAttach=%d Release=%d Resume=%d Conflicts=[%s] Flags=0x%08x"),
-				Record->JunctionId,
-				Record->MovementId,
-				Record->FromLane.HandleId,
-				Record->ToLane.HandleId,
-				(int32)Record->TurnDirection,
-				(int32)Record->MovementClass,
-				Record->CorridorPoints.Num(),
-				Record->CorridorArcLengthCm,
-				Record->MinTurnRadiusCm,
-				Record->EntryLaneAttachIndex,
-				Record->ExitLaneAttachIndex,
-				Record->TraversalReleaseIndex,
-				Record->ExitLaneResumeIndex,
-				*FString::JoinBy(Record->ConflictMovementIds, TEXT(","), [](int32 Value) { return FString::FromInt(Value); }),
-				Record->ValidationFlags);
+			if (GTrafficJunctionDiagnostics >= 1)
+			{
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("CANONICAL TABLE: Junction=%d Movement=%d From=%d To=%d Turn=%d Class=%d Path=%d Arc=%.0f Radius=%.0f EntryAttach=%d ExitAttach=%d Release=%d Resume=%d Conflicts=[%s] Flags=0x%08x"),
+					Record->JunctionId,
+					Record->MovementId,
+					Record->FromLane.HandleId,
+					Record->ToLane.HandleId,
+					(int32)Record->TurnDirection,
+					(int32)Record->MovementClass,
+					Record->CorridorPoints.Num(),
+					Record->CorridorArcLengthCm,
+					Record->MinTurnRadiusCm,
+					Record->EntryLaneAttachIndex,
+					Record->ExitLaneAttachIndex,
+					Record->TraversalReleaseIndex,
+					Record->ExitLaneResumeIndex,
+					*FString::JoinBy(Record->ConflictMovementIds, TEXT(","), [](int32 Value) { return FString::FromInt(Value); }),
+					Record->ValidationFlags);
+			}
 		}
 	}
 }

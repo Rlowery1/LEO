@@ -7,18 +7,9 @@ extern bool GEnableDiagnosticDumps;
 extern int32 GTrafficDiagnosticsLevel;
 extern int32 GTrafficDiagnosticsSampleLimit;
 
-namespace
-{
-	static bool ShouldLogDiagnostics(const int32 Level)
-	{
-		return GEnableDiagnosticDumps || GTrafficDiagnosticsLevel >= Level;
-	}
-
-	static int32 GetDiagnosticsSampleLimit()
-	{
-		return FMath::Max(1, GTrafficDiagnosticsSampleLimit);
-	}
-}
+// Defined in RoadBLDReflectionProvider.cpp
+extern bool ShouldLogDiagnostics(int32 Level);
+extern int32 GetDiagnosticsSampleLimit();
 
 
 // ---------------------------------------------------------------------------
@@ -723,7 +714,7 @@ void URoadBLDReflectionProvider::PrecomputeJunctionMap()
 
 	for (const int32 StartLaneId : AllLaneIds)
 	{
-		const bool bTraceThisLane = true;
+		const bool bTraceThisLane = ShouldLogDiagnostics(2);
 		TArray<FString> WalkTrace;
 		auto AppendTrace = [&WalkTrace](const FString& Line)
 		{

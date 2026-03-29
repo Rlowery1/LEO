@@ -82,7 +82,7 @@ FSteeringOutput FSteeringComputer::Compute(const FSteeringInput& In)
 	PreviousHeadingCrossZ = CrossZ;
 
 	Out.DerivativeTerm = FMath::Clamp(
-		HeadingErrorDerivative * In.SteeringDampingFactor * In.DeltaSeconds,
+		HeadingErrorDerivative * In.SteeringDampingFactor,
 		-0.3f, 0.3f);
 
 	// ── Combine ──────────────────────────────────────────────

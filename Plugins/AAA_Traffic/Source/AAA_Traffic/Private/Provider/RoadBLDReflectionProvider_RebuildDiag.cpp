@@ -10,13 +10,8 @@ extern bool GEnableDiagnosticDumps;
 extern int32 GTrafficDiagnosticsLevel;
 extern bool GTrafficDiagnosticsValidateGraph;
 
-namespace
-{
-	static bool ShouldLogDiagnostics(const int32 Level)
-	{
-		return GEnableDiagnosticDumps || GTrafficDiagnosticsLevel >= Level;
-	}
-}
+// Defined in RoadBLDReflectionProvider.cpp
+extern bool ShouldLogDiagnostics(int32 Level);
 
 // ---------------------------------------------------------------------------
 // TriggerRoadBLDRebuildAndDiagnostics — optionally dump all RoadBLD arrays

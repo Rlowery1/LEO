@@ -88,10 +88,10 @@ FLeaderDetectorOutput FLeaderDetector::Detect(const FLeaderDetectorInput& In) co
 
 			if (BestDist < MAX_FLT)
 			{
-				// Subtract leader's rear extent to convert center-to-center
-				// distance to center-to-rear-bumper.  The shared bumper
-				// correction below subtracts VehicleFrontExtent, yielding
-				// true front-bumper-to-rear-bumper gap.
+				// Subtract ego rear extent as a proxy for leader rear extent
+				// (all vehicles currently share the same mesh dimensions).
+				// The shared bumper correction below subtracts VehicleFrontExtent,
+				// yielding an approximate front-bumper-to-rear-bumper gap.
 				Dist = BestDist - In.VehicleRearExtent;
 				Speed = BestSpeed;
 			}
@@ -152,8 +152,8 @@ FLeaderDetectorOutput FLeaderDetector::Detect(const FLeaderDetectorInput& In) co
 
 			if (BestDist < In.DetectionDistance)
 			{
-				// Subtract both ego front extent and leader rear extent
-				// to convert center-to-center to true bumper-to-bumper gap.
+				// Subtract ego front + ego rear extent as a uniform-fleet
+				// approximation of front-bumper-to-rear-bumper gap.
 				Out.LeaderDist = FMath::Max(BestDist - In.VehicleFrontExtent - In.VehicleRearExtent, 1.0f);
 				Out.LeaderSpeed = BestSpeed;
 			}

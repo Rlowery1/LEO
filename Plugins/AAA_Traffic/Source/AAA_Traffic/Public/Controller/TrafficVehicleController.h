@@ -108,7 +108,7 @@ struct FVehicleJunctionState
 	/** True when waiting for right-of-way (Phase == Waiting). */
 	bool bWaiting = false;
 
-	/** True only after TryOccupyJunction or ForceOccupyJunction succeeds. */
+	/** True only after a successful TryOccupyJunction (or via late-acquire ownership path). */
 	bool bOwnsJunctionOccupancy = false;
 
 	/** Cooldown timer for retry attempts (seconds, Phase == Waiting). */

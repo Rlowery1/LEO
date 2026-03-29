@@ -218,13 +218,16 @@ void ATrafficSignalController::AdvancePhase()
 		break;
 	}
 
-	UE_LOG(LogAAATraffic, Log,
-		TEXT("SIGNAL PHASE-CHANGE: Signal='%s' JunctionId=%d NewPhase=%s "
-			 "GroupIndex=%d/%d Timer=%.2f"),
-		*GetName(), JunctionId,
-		CurrentPhase == ETrafficSignalPhase::Green ? TEXT("GREEN") :
-		CurrentPhase == ETrafficSignalPhase::Yellow ? TEXT("YELLOW") : TEXT("RED"),
-		CurrentGroupIndex, PhaseGroups.Num(), PhaseTimer);
+	if (GTrafficJunctionDiagnostics >= 2)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("SIGNAL PHASE-CHANGE: Signal='%s' JunctionId=%d NewPhase=%s "
+				 "GroupIndex=%d/%d Timer=%.2f"),
+			*GetName(), JunctionId,
+			CurrentPhase == ETrafficSignalPhase::Green ? TEXT("GREEN") :
+			CurrentPhase == ETrafficSignalPhase::Yellow ? TEXT("YELLOW") : TEXT("RED"),
+			CurrentGroupIndex, PhaseGroups.Num(), PhaseTimer);
+	}
 }
 
 bool ATrafficSignalController::IsLaneGreen(const FTrafficLaneHandle& Lane) const

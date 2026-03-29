@@ -101,7 +101,7 @@ void FAccelerationModel::ProcessDelayBuffer(
 	const int32 PruneUpTo = FMath::Max(0, LowerIdx - 1);
 	if (PruneUpTo > 0)
 	{
-		DelayBuffer.RemoveAt(0, PruneUpTo, EAllowShrinking::Yes);
+		DelayBuffer.RemoveAt(0, PruneUpTo, EAllowShrinking::No);
 	}
 }
 
