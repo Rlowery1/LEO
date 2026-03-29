@@ -27,6 +27,7 @@ struct AAA_TRAFFIC_API FSpeedEnvelopeInput
 	float RemainingDistOnLane            = 0.0f;
 	float ApproachDecelCmPerSec2         = 0.0f;
 	float ApproachSafetyMarginCm         = 0.0f;
+	int32 SpeedZoneHopLimit              = 3;
 
 	// ── Intersection speed cap ───────────────────────────────
 	float IntersectionSpeedLimitCmPerSec = 0.0f;
@@ -52,6 +53,13 @@ struct AAA_TRAFFIC_API FSpeedEnvelopeOutput
 
 	// Debug
 	FString DbgAppliedCap;  // e.g. "APPROACH", empty if none
+	float DbgJunctionTurnRadiusCm = 0.0f;
+	float DbgJunctionArcLengthCm = 0.0f;
+	float DbgJunctionTotalAngleDeg = 0.0f;
+	float DbgJunctionSpeedCapCmPerSec = 0.0f;
+	float DbgPredictiveCurveRadiusCm = 0.0f;
+	float DbgPredictiveCurveDistCm = 0.0f;
+	float DbgPredictiveCurveSpeedCmPerSec = 0.0f;
 };
 
 /** Stateless speed-cap stack. */

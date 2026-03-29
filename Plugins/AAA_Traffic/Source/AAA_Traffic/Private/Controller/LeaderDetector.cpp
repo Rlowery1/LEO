@@ -39,6 +39,64 @@ FLeaderDetectorOutput FLeaderDetector::Detect(const FLeaderDetectorInput& In) co
 			Dist = SweepStraight(In, Speed);
 		}
 
+		// Spatial fallback: if physics sweep found nothing, query the
+		// spatial grid for nearby vehicles on the same or adjacent lanes.
+		// This catches cases where the sphere sweep is blocked by road
+		// geometry and also detects vehicles on adjacent lanes that
+		// physically overlap near junctions.
+		if (Dist < 0.0f && In.TrafficSubsystem)
+		{
+			TArray<ATrafficVehicleController*> Nearby =
+				In.TrafficSubsystem->GetNearbyVehicles(In.VehicleLocation, In.DetectionDistance);
+
+			float BestDist = MAX_FLT;
+			float BestSpeed = 0.0f;
+
+			for (const ATrafficVehicleController* Other : Nearby)
+			{
+				if (!Other || Other->GetPawn() == In.ControlledPawn) { continue; }
+				const APawn* OP = Other->GetPawn();
+				if (!OP) { continue; }
+
+				// Heading alignment — reject any vehicle facing the
+				// opposite direction (oncoming traffic). A leader is
+				// always travelling roughly the same way we are.
+				if (FVector::DotProduct(OP->GetActorForwardVector(),
+						In.VehicleForward) < 0.0f)
+				{
+					continue;
+				}
+
+				const FVector Delta = OP->GetActorLocation() - In.VehicleLocation;
+				const float D = Delta.Size();
+				if (D < KINDA_SMALL_NUMBER) { continue; }
+				if (FVector::DotProduct(Delta / D, In.VehicleForward) < 0.5f) { continue; }
+				if (D > In.DetectionDistance) { continue; }
+				if (D < BestDist)
+				{
+					BestDist = D;
+					if (const UPawnMovementComponent* OtherMC = OP->GetMovementComponent())
+					{
+						BestSpeed = FVector::DotProduct(OtherMC->Velocity, In.VehicleForward);
+					}
+					else
+					{
+						BestSpeed = 0.0f;
+					}
+				}
+			}
+
+			if (BestDist < MAX_FLT)
+			{
+				// Subtract leader's rear extent to convert center-to-center
+				// distance to center-to-rear-bumper.  The shared bumper
+				// correction below subtracts VehicleFrontExtent, yielding
+				// true front-bumper-to-rear-bumper gap.
+				Dist = BestDist - In.VehicleRearExtent;
+				Speed = BestSpeed;
+			}
+		}
+
 		// Bumper-to-bumper correction.
 		if (Dist >= 0.0f)
 		{
@@ -64,24 +122,11 @@ FLeaderDetectorOutput FLeaderDetector::Detect(const FLeaderDetectorInput& In) co
 				const APawn* OP = Other->GetPawn();
 				if (!OP) { continue; }
 
-				// Lane affinity filter.
-				if (In.RoadProvider && In.CurrentLane.IsValid())
+				// Heading alignment — reject oncoming traffic.
+				if (FVector::DotProduct(OP->GetActorForwardVector(),
+						In.VehicleForward) < 0.0f)
 				{
-					const FTrafficLaneHandle OtherLane = Other->GetCurrentLane();
-					if (OtherLane.IsValid()
-						&& OtherLane != In.CurrentLane
-						&& OtherLane != In.RoadProvider->GetAdjacentLane(In.CurrentLane, ETrafficLaneSide::Left)
-						&& OtherLane != In.RoadProvider->GetAdjacentLane(In.CurrentLane, ETrafficLaneSide::Right))
-					{
-						bool bConnected = false;
-						TArray<FTrafficLaneHandle> Connected =
-							In.RoadProvider->GetConnectedLanes(In.CurrentLane);
-						for (const FTrafficLaneHandle& CL : Connected)
-						{
-							if (CL == OtherLane) { bConnected = true; break; }
-						}
-						if (!bConnected) { continue; }
-					}
+					continue;
 				}
 
 				const FVector Delta = OP->GetActorLocation() - In.VehicleLocation;
@@ -107,10 +152,18 @@ FLeaderDetectorOutput FLeaderDetector::Detect(const FLeaderDetectorInput& In) co
 
 			if (BestDist < In.DetectionDistance)
 			{
-				Out.LeaderDist = FMath::Max(BestDist - In.VehicleFrontExtent, 1.0f);
+				// Subtract both ego front extent and leader rear extent
+				// to convert center-to-center to true bumper-to-bumper gap.
+				Out.LeaderDist = FMath::Max(BestDist - In.VehicleFrontExtent - In.VehicleRearExtent, 1.0f);
 				Out.LeaderSpeed = BestSpeed;
 			}
 		}
+	}
+	else if (In.TickLOD == ETrafficLOD::Minimal)
+	{
+		// Minimal LOD: no leader detection to preserve frame budget.
+		Out.LeaderDist = -1.0f;
+		Out.LeaderSpeed = 0.0f;
 	}
 
 	// Brake-light perception.
@@ -177,13 +230,19 @@ float FLeaderDetector::SweepPolyline(const FLeaderDetectorInput& In, float& OutS
 			&& Hit.GetActor())
 		{
 			const APawn* HP = Cast<APawn>(Hit.GetActor());
-			if (HP && FVector::DotProduct(HP->GetActorForwardVector(), SegDir) >= -0.3f)
+			if (HP && FVector::DotProduct(HP->GetActorForwardVector(), SegDir) >= 0.0f)
 			{
 				if (const UPawnMovementComponent* LM = HP->GetMovementComponent())
 				{
 					OutSpeed = FVector::DotProduct(LM->Velocity, SegDir);
 				}
-				return AccumDist + Hit.Distance;
+				// Correct distance: add sphere contact radius + first-seg
+				// start offset to convert from sweep-relative to
+				// VehicleLocation-relative distance.
+				const float StartCorrection = bFirst
+					? (SweepRadius + SelfBuffer) : 0.0f;
+				return AccumDist + Hit.Distance
+					+ SweepRadius + StartCorrection;
 			}
 		}
 
@@ -207,13 +266,13 @@ float FLeaderDetector::SweepPolyline(const FLeaderDetectorInput& In, float& OutS
 				&& Hit.GetActor())
 			{
 				const APawn* HP = Cast<APawn>(Hit.GetActor());
-				if (HP && FVector::DotProduct(HP->GetActorForwardVector(), LastDir) >= -0.3f)
+				if (HP && FVector::DotProduct(HP->GetActorForwardVector(), LastDir) >= 0.0f)
 				{
 					if (const UPawnMovementComponent* LM = HP->GetMovementComponent())
 					{
 						OutSpeed = FVector::DotProduct(LM->Velocity, LastDir);
 					}
-					return AccumDist + Hit.Distance;
+					return AccumDist + Hit.Distance + SweepRadius;
 				}
 			}
 		}
@@ -253,13 +312,13 @@ float FLeaderDetector::SweepStraight(const FLeaderDetectorInput& In, float& OutS
 
 	const APawn* HP = Cast<APawn>(Hit.GetActor());
 	if (!HP) { return -1.0f; }
-	if (FVector::DotProduct(HP->GetActorForwardVector(), Dir) < -0.3f) { return -1.0f; }
+	if (FVector::DotProduct(HP->GetActorForwardVector(), Dir) < 0.0f) { return -1.0f; }
 
 	if (const UPawnMovementComponent* LM = HP->GetMovementComponent())
 	{
 		OutSpeed = FVector::DotProduct(LM->Velocity, Dir);
 	}
-	return Hit.Distance;
+	return Hit.Distance + 2.0f * SweepRadius + SelfBuffer;
 }
 
 // ─────────────────────────────────────────────────────────────

@@ -13,6 +13,10 @@
 
 extern float GTrafficWakeGuardMinThrottle;
 extern float GTrafficWakeGuardMaxSpeed;
+extern float GTrafficCTERecoveryThreshold;
+extern float GTrafficCTERecoveryScale;
+extern float GTrafficCTERecoveryMinThrottle;
+extern float GTrafficCTERecoveryBrakeFactor;
 extern int32 GTrafficJunctionDiagnostics;
 extern int32 GTrafficDebugDraw;
 void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
@@ -88,6 +92,9 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	// consumed by speed-limiting and lane-change inhibitor sections.
 	bool bApproachBraking = false;
 
+	// Reset non-debug leader distance each tick (will be set after accel model).
+	LastLeaderDist = -1.0f;
+
 #if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	// Initialize debug cache each tick -- will be overwritten by decision branches.
 	DbgCurrentSpeed = CurrentSpeed;
@@ -133,9 +140,9 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		LCCtx.bLaneDataReady     = bLaneDataReady;
 		LCCtx.bJunctionApproaching = (JnctState.Phase == EJunctionPhase::Approaching);
 
-		// Pre-compute leader distance for non-navigational evaluation.
-		float LeaderSpeedForLC = 0.0f;
-		LCCtx.LeaderDist = GetLeaderDistance(LeaderSpeedForLC);
+		// Pre-compute leader distance for lane-change evaluation.
+		float UnusedLeaderSpeed = 0.0f;
+		LCCtx.LeaderDist = GetLeaderDistance(UnusedLeaderSpeed);
 
 		LCCtx.RoadProvider = CachedProvider;
 		if (UWorld* W = GetWorld())
@@ -151,7 +158,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	}
 
 	// Find where we are on the lane and where to aim
-	const int32 ClosestIndex = FindClosestPointIndex(VehicleLocation);
+	int32 ClosestIndex = FindClosestPointIndex(VehicleLocation);
 
 	// -- PERIODIC JUNCTION DIAGNOSTIC DUMP (every ~2s per vehicle) --
 	// Provides a full status snapshot so you can see at a glance which vehicles
@@ -340,7 +347,11 @@ return;
 	// Junction transition takes priority -- follow synthesized curve first.
 	if (JunctionNeg_.TickTraverse(VehicleLocation, ClosestIndex, TargetPoint))
 	{
-		// TargetPoint set by junction traversal.
+		// TickTraverse may have switched the lane (EXIT-LANE-SWITCH).
+		// The local ClosestIndex was computed on the OLD lane geometry and is
+		// now invalid for the new LanePoints.  Re-sync to LastClosestIndex
+		// which TickTraverse calibrated on the new lane via full scan.
+		ClosestIndex = LastClosestIndex;
 	}
 	else if (LaneChangeCoord_.State == ELaneChangeState::Executing
 		|| LaneChangeCoord_.State == ELaneChangeState::Completing)
@@ -422,6 +433,22 @@ return;
 		}
 	}
 
+	// ── Post-exit CTE gain ramp ────────────────────────────────
+	// After EXIT-LANE-SWITCH the vehicle's heading may be misaligned
+	// with the new lane. Ramp CTE gain from half → full over
+	// PostExitCTERampDuration seconds so correction engages gradually.
+	float EffectiveCTEGain = CTECorrectionGain;
+	if (PostExitCTERampRemaining > 0.0f)
+	{
+		PostExitCTERampRemaining = FMath::Max(PostExitCTERampRemaining - DeltaSeconds, 0.0f);
+		const float RampAlpha = 1.0f - FMath::Clamp(
+			PostExitCTERampRemaining / PostExitCTERampDuration, 0.0f, 1.0f);
+		// Floor at 0.5: vehicles that exit a junction already offset from the
+		// centerline (e.g. via TURN-BYPASS) need immediate CTE correction —
+		// zeroing the gain lets them drift unrecoverably off-road.
+		EffectiveCTEGain *= FMath::Max(RampAlpha, 0.5f);
+	}
+
 	FSteeringInput SteerIn;
 	SteerIn.VehicleLocation    = VehicleLocation;
 	SteerIn.VehicleForward     = VehicleForward;
@@ -433,13 +460,20 @@ return;
 	SteerIn.WheelbaseCm        = VehicleWheelbaseCm;
 	SteerIn.MaxSteerAngleRad   = VehicleMaxSteerAngleRad;
 	SteerIn.EffectiveLaneWidth = EffectiveLaneWidth;
-	SteerIn.CTECorrectionGain  = CTECorrectionGain;
+	SteerIn.CTECorrectionGain  = EffectiveCTEGain;
 	SteerIn.SteeringDampingFactor = SteeringDampingFactor;
 	SteerIn.CurveScanWindowSize = CurveScanWindowSize;
 	SteerIn.DeltaSeconds       = DeltaSeconds;
 
 	const FSteeringOutput SteerOut = SteeringComputer.Compute(SteerIn);
-	const float SteeringInput = SteerOut.SteeringInput;
+	float SteeringInput = SteerOut.SteeringInput;
+
+	LastDiagSteeringInput = SteeringInput;
+	LastDiagSignedCTE = SteerOut.SignedCTE;
+	LastDiagHalfLaneWidth = SteerOut.HalfLaneWidth;
+	LastDiagHeadingCrossZ = SteerOut.HeadingCrossZ;
+	LastDiagTargetDistance2D = SteerOut.TargetDistance2D;
+	bLastDiagFollowingJunctionCurve = SteerOut.bFollowingJunctionCurve;
 
 	// --- Steering diagnostic logging (throttled) ---
 	++SteeringDiagCounter;
@@ -463,13 +497,30 @@ return;
 	if (FMath::Abs(SteerOut.SignedCTE) > SteerOut.HalfLaneWidth * 0.8f)
 	{
 		UE_LOG(LogAAATraffic, Warning,
-			TEXT("LANE DEPARTURE: Pawn='%s' Lane=%d CTE=%.1fcm (%.0f%% of half-lane) "
-				 "Speed=%.0f Steer=%.3f"),
+			TEXT("LANE DEPARTURE: Pawn='%s' Lane=%d Jnct=%d Phase=%d Path=%s CurvePts=%d CurveIdx=%d CTE=%.1fcm (%.0f%% of half-lane) Speed=%.0f Steer=%.3f HeadCross=%.3f TargetDist=%.0f SpeedCap=%.0f JCurveR=%.0f JCurveArc=%.0f JCurveAngle=%.1f JCurveCap=%.0f PredR=%.0f PredDist=%.0f PredCap=%.0f"),
 			GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 			CurrentLane.HandleId,
+			JnctState.JunctionId,
+			(int32)JnctState.Phase,
+			JnctState.TransitionPoints.Num() > 0
+				? (JnctState.bTransitionPathFromProvider ? TEXT("PROVIDER-JNCT") : TEXT("SYNTH-JNCT"))
+				: TEXT("LANE"),
+			JnctState.TransitionPoints.Num(),
+			JnctState.TransitionIndex,
 			SteerOut.SignedCTE,
 			(SteerOut.HalfLaneWidth > 0.0f ? FMath::Abs(SteerOut.SignedCTE) / SteerOut.HalfLaneWidth * 100.0f : 0.0f),
-			CurrentSpeed, SteeringInput);
+			CurrentSpeed,
+			SteeringInput,
+			SteerOut.HeadingCrossZ,
+			SteerOut.TargetDistance2D,
+			LastDiagEffectiveTargetSpeed,
+			LastDiagJunctionCurveRadiusCm,
+			LastDiagJunctionCurveArcLengthCm,
+			LastDiagJunctionCurveAngleDeg,
+			LastDiagJunctionCurveCapCmPerSec,
+			LastDiagPredictiveCurveRadiusCm,
+			LastDiagPredictiveCurveDistCm,
+			LastDiagPredictiveCurveSpeedCmPerSec);
 	}
 
 	// --- Throttle / Brake (IDM -- Intelligent Driver Model) ---
@@ -484,6 +535,7 @@ return;
 	LdrIn.VehicleLocation        = VehicleLocation;
 	LdrIn.VehicleForward         = ControlledPawn->GetActorForwardVector();
 	LdrIn.VehicleFrontExtent     = VehicleFrontExtent;
+	LdrIn.VehicleRearExtent      = VehicleRearExtent;
 	LdrIn.DetectionDistance      = DetectionDistance;
 	LdrIn.LaneWidth              = LaneWidth;
 	LdrIn.LanePoints             = LanePoints;
@@ -543,6 +595,13 @@ return;
 
 	const FSpeedEnvelopeOutput SpeedOut = SpeedEnvelope_.Compute(SpeedIn);
 	float EffectiveTargetSpeed = SpeedOut.EffectiveTargetSpeed;
+	LastDiagJunctionCurveRadiusCm = SpeedOut.DbgJunctionTurnRadiusCm;
+	LastDiagJunctionCurveArcLengthCm = SpeedOut.DbgJunctionArcLengthCm;
+	LastDiagJunctionCurveAngleDeg = SpeedOut.DbgJunctionTotalAngleDeg;
+	LastDiagJunctionCurveCapCmPerSec = SpeedOut.DbgJunctionSpeedCapCmPerSec;
+	LastDiagPredictiveCurveRadiusCm = SpeedOut.DbgPredictiveCurveRadiusCm;
+	LastDiagPredictiveCurveDistCm = SpeedOut.DbgPredictiveCurveDistCm;
+	LastDiagPredictiveCurveSpeedCmPerSec = SpeedOut.DbgPredictiveCurveSpeedCmPerSec;
 
 	if (SpeedOut.bFirstTickOnLaneConsumed)
 	{
@@ -554,6 +613,23 @@ return;
 		DbgStateName = SpeedOut.DbgAppliedCap;
 	}
 #endif
+
+	// ── Post-exit speed cap ──────────────────────────────────────
+	// While the post-exit ramp is active, limit target speed so the
+	// vehicle doesn't race at full speed while laterally offset from
+	// the exit-lane centerline. Ramps from PostExitSpeedCapMinCmPerSec
+	// up to the full EffectiveTargetSpeed in sync with the steering ramp.
+	if (PostExitCTERampRemaining > 0.0f)
+	{
+		const float SpeedRampAlpha = 1.0f - FMath::Clamp(
+			PostExitCTERampRemaining / PostExitCTERampDuration, 0.0f, 1.0f);
+		const float SpeedCap = FMath::Lerp(PostExitSpeedCapMinCmPerSec, EffectiveTargetSpeed, SpeedRampAlpha);
+		EffectiveTargetSpeed = FMath::Min(EffectiveTargetSpeed, SpeedCap);
+	}
+
+	// Record AFTER post-exit speed cap so diagnostics show the actual
+	// effective speed, not the pre-cap value.
+	LastDiagEffectiveTargetSpeed = EffectiveTargetSpeed;
 
 	// -- Merge cooperation ------------------------------------
 	// If a vehicle on an adjacent lane is actively lane-changing toward
@@ -594,6 +670,19 @@ return;
 					}
 				}
 			}
+		}
+	}
+
+	// CTE-aware speed floor: if the vehicle is far off-lane, keep a
+	// minimum forward speed so steering can actually bring it back.
+	// Without this, EffectiveTargetSpeed can reach 0 which triggers the
+	// zero-speed guard below and permanently traps the vehicle.
+	if (LastDiagHalfLaneWidth > 0.0f)
+	{
+		const float CTEFraction = FMath::Abs(LastDiagSignedCTE) / LastDiagHalfLaneWidth;
+		if (CTEFraction > 1.0f && EffectiveTargetSpeed < 100.0f)
+		{
+			EffectiveTargetSpeed = 100.0f;
 		}
 	}
 
@@ -638,6 +727,9 @@ return;
 
 	SetBrakeLights(AccelOut.bBraking);
 
+	// Unconditional leader distance for stuck-timer (not debug-gated).
+	LastLeaderDist = AccelOut.DelayedLeaderDist;
+
 #if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
 	DbgLeaderDist = AccelOut.DelayedLeaderDist;
 	DbgLeaderSpeed = AccelOut.DelayedLeaderSpeed;
@@ -665,6 +757,23 @@ return;
 		CollisionBrakeTimer -= DeltaSeconds;
 		ThrottleInput = 0.0f;
 		BrakeInput    = 1.0f;
+	}
+
+	// Post-collision CTE recovery: if the vehicle is severely off-lane
+	// (|CTE| > 60% of half-lane), reduce throttle so steering can recover.
+	// Without this, a car displaced by a rear-end collision drifts further
+	// off-lane because it can't steer fast enough at travel speed.
+	if (LastDiagHalfLaneWidth > 0.0f)
+	{
+		const float CTEFraction = FMath::Abs(LastDiagSignedCTE) / LastDiagHalfLaneWidth;
+		if (CTEFraction > GTrafficCTERecoveryThreshold)
+		{
+			const float RecoveryScale = FMath::Clamp(
+				1.0f - (CTEFraction - GTrafficCTERecoveryThreshold) * GTrafficCTERecoveryScale,
+				GTrafficCTERecoveryMinThrottle, 1.0f);
+			ThrottleInput *= RecoveryScale;
+			BrakeInput = FMath::Max(BrakeInput, (1.0f - RecoveryScale) * GTrafficCTERecoveryBrakeFactor);
+		}
 	}
 
 	VehicleMovement->SetThrottleInput(ThrottleInput);

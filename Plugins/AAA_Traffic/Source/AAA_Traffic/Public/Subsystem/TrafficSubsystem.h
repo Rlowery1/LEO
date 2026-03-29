@@ -12,6 +12,7 @@ class ITrafficRoadProvider;
 class ATrafficVehicleController;
 class ATrafficSignalController;
 class UTrafficVehiclePool;
+struct FCanonicalMovementRecord;
 
 // Forward-declare ETurnSignalState (defined in TrafficVehicleController.h).
 enum class ETurnSignalState : uint8;
@@ -28,6 +29,23 @@ enum class ETrafficLOD : uint8
 	Reduced,
 	/** Minimal: tick infrequently, teleport along polyline, skip lane changes. */
 	Minimal
+};
+
+enum class ECanonicalMovementClass : uint8
+{
+	Straight,
+	Left,
+	Right,
+	Merge,
+	Diverge,
+	SlipLane,
+	Unknown
+};
+
+enum class ECanonicalMovementSourceKind : uint8
+{
+	ProviderDerived,
+	SynthesizedDuringCompile
 };
 
 /** Broadcast when a provider registers (or re-registers) with the subsystem. */
@@ -56,6 +74,43 @@ struct FJunctionExitRule
 	bool bPhysicallyFeasible = true;
 };
 
+struct FCanonicalMovementRecord
+{
+	int32 MovementId = 0;
+	int32 JunctionId = 0;
+	FTrafficLaneHandle FromLane;
+	FTrafficLaneHandle ToLane;
+	FTrafficLaneHandle ApproachJunctionLane;
+	ETurnSignalState TurnDirection{};
+	ECanonicalMovementClass MovementClass = ECanonicalMovementClass::Unknown;
+	float SelectionWeight = 0.0f;
+	bool bLegallyAllowed = false;
+	bool bPhysicallyFeasible = false;
+	TArray<FVector> CorridorPoints;
+	FVector CorridorEntryPoint = FVector::ZeroVector;
+	FVector CorridorExitPoint = FVector::ZeroVector;
+	int32 EntryLaneAttachIndex = INDEX_NONE;
+	int32 ExitLaneAttachIndex = INDEX_NONE;
+	float CorridorArcLengthCm = 0.0f;
+	float MinTurnRadiusCm = 0.0f;
+	int32 TraversalReleaseIndex = INDEX_NONE;
+	int32 ExitLaneResumeIndex = INDEX_NONE;
+	TArray<int32> ConflictMovementIds;
+	uint32 ValidationFlags = 0;
+	ECanonicalMovementSourceKind SourceKind = ECanonicalMovementSourceKind::ProviderDerived;
+#if !UE_BUILD_SHIPPING
+	FString BuildNotes;
+#endif
+
+	bool IsValid() const
+	{
+		return MovementId > 0
+			&& JunctionId > 0
+			&& FromLane.IsValid()
+			&& ToLane.IsValid();
+	}
+	};
+
 /**
  * Record of a vehicle currently traversing a junction.
  * Stores the approach and exit lanes so the conflict test can determine
@@ -64,6 +119,7 @@ struct FJunctionExitRule
 struct FJunctionOccupant
 {
 	TWeakObjectPtr<ATrafficVehicleController> Controller;
+	int32 MovementId = 0;
 	FTrafficLaneHandle FromLane;
 	FTrafficLaneHandle ToLane;
 
@@ -169,23 +225,17 @@ public:
 	// --- Junction Occupancy ---
 
 	/**
-	 * Attempt to enter a junction. Checks for geometric path conflicts with
-	 * all current occupants via the provider's DoJunctionPathsConflict.
-	 * Returns false if any existing occupant's path conflicts.
+	 * Attempt to enter a junction using a precompiled canonical movement.
+	 * Returns false if any existing occupant holds a conflicting movement.
 	 */
 	bool TryOccupyJunction(int32 JunctionId, ATrafficVehicleController* Controller,
-		const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane);
-
-	/**
-	 * Force-add a vehicle to junction occupancy without checking conflicts.
-	 * Used only by the deadlock-break timeout to ensure the vehicle is visible
-	 * to other vehicles' conflict detection even when entering unconditionally.
-	 */
-	void ForceOccupyJunction(int32 JunctionId, ATrafficVehicleController* Controller,
-		const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane);
+		int32 MovementId);
 
 	/** Release junction occupancy for the given vehicle. */
 	void ReleaseJunction(int32 JunctionId, ATrafficVehicleController* Controller);
+
+	/** Returns true if the given controller currently has an occupancy entry for JunctionId. */
+	bool HasJunctionOccupancy(int32 JunctionId, const ATrafficVehicleController* Controller) const;
 
 	/**
 	 * Check whether any other vehicle approaching the same junction has a
@@ -196,7 +246,7 @@ public:
 	 * @return true if a higher-priority conflicting approach exists (caller should yield).
 	 */
 	bool HasConflictingApproach(int32 JunctionId, ATrafficVehicleController* Self,
-		const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane) const;
+		int32 MovementId) const;
 
 	/**
 	 * Check if any vehicle approaching this junction from a conflicting direction
@@ -207,7 +257,7 @@ public:
 	 * @return true if cross-traffic is too close (caller should wait).
 	 */
 	bool HasApproachingCrossTraffic(int32 JunctionId, ATrafficVehicleController* Self,
-		const FTrafficLaneHandle& FromLane, const FTrafficLaneHandle& ToLane,
+		int32 MovementId,
 		float GapThresholdSec = 4.0f) const;
 
 	// --- Junction Exit Survey ---
@@ -217,6 +267,15 @@ public:
 	 * Returns an empty array if the lane was not surveyed (e.g. not an approach lane).
 	 */
 	const TArray<FJunctionExitRule>& GetLegalExits(int32 ApproachLaneId) const;
+
+	/** Get a canonical movement by stable MovementId. */
+	const FCanonicalMovementRecord* GetCanonicalMovement(int32 MovementId) const;
+
+	/** Get the sorted movement IDs compiled for a junction. */
+	const TArray<int32>& GetCanonicalMovementsForJunction(int32 JunctionId) const;
+
+	/** Get the sorted movement IDs compiled for an approach lane. */
+	const TArray<int32>& GetCanonicalMovementsForApproachLane(int32 ApproachLaneId) const;
 
 	// --- Stop-Sign FIFO Queue ---
 
@@ -269,6 +328,9 @@ public:
 
 	/** Empty array returned by GetLegalExits when no data exists. */
 	static const TArray<FJunctionExitRule> EmptyExitRules;
+
+	/** Empty movement-id array returned when no canonical movement data exists. */
+	static const TArray<int32> EmptyMovementIds;
 
 private:
 	/** Periodic lifecycle sweep: destroy vehicles out of range or stopped at dead end. */
@@ -351,6 +413,18 @@ private:
 
 	/** Approach lane HandleId → array of legal exits (built once at provider registration). */
 	TMap<int32, TArray<FJunctionExitRule>> JunctionExitRules;
+
+	/** Stable movement id → canonical movement record. */
+	TMap<int32, FCanonicalMovementRecord> CanonicalMovementTable;
+
+	/** Junction id → sorted movement ids. */
+	TMap<int32, TArray<int32>> JunctionToMovementIds;
+
+	/** Approach lane id → sorted movement ids. */
+	TMap<int32, TArray<int32>> ApproachLaneToMovementIds;
+
+	/** Clear all canonical movement tables before a rebuild or teardown. */
+	void ResetCanonicalMovementTable();
 
 	/** One-time analysis: build the junction exit table from road provider data. */
 	void BuildJunctionSurvey();

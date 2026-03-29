@@ -3,13 +3,13 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Core/TrafficRoadProvider.h"
 #include "GameFramework/Actor.h"
 #include "DrawDebugHelpers.h"
 #include "TrafficSpawner.generated.h"
 
 class ITrafficRoadProvider;
 class ATrafficVehicleController;
-struct FTrafficLaneHandle;
 
 /**
  * Entry in the vehicle class table for varied spawning.
@@ -62,6 +62,12 @@ private:
 	/** Deferred to next tick so all subsystems (including adapters) are initialized. */
 	void SpawnVehicles();
 
+	/** Spawn a bounded batch of pending initial vehicles to avoid one-frame scene spikes. */
+	void ProcessInitialSpawnBatch();
+
+	/** Finalize respawn subscriptions after the initial population has completed. */
+	void FinalizeSpawnSetup(UWorld* World, class UTrafficSubsystem* TrafficSub);
+
 	/**
 	 * Spawn a single vehicle on the given lane at a position along it.
 	 * Used by both initial spawn and respawn logic.
@@ -104,8 +110,29 @@ private:
 	/** Timer handle for the periodic respawn check. */
 	FTimerHandle RespawnTimerHandle;
 
+	/** Timer handle for batched initial population. */
+	FTimerHandle InitialSpawnBatchTimerHandle;
+
+	/** One pending initial spawn request. */
+	struct FPendingInitialSpawn
+	{
+		FTrafficLaneHandle Lane;
+		int32 SlotIndex = 0;
+		int32 VehicleIndex = 0;
+	};
+
+	/** Pending initial spawn requests processed over several frames. */
+	TArray<FPendingInitialSpawn> PendingInitialSpawns;
+
+	/** Cursor into PendingInitialSpawns for the next batch. */
+	int32 PendingInitialSpawnCursor = 0;
+
 	/** Cached list of all available lanes (populated once during initial spawn). */
 	TArray<FTrafficLaneHandle> CachedAllLanes;
+
+	/** Subset of CachedAllLanes excluding dead-end lanes (no forward connections).
+	 *  Used for respawn re-queuing to avoid spawn→despawn loops on dead-ends. */
+	TArray<FTrafficLaneHandle> CachedRespawnLanes;
 
 	/** Controllers spawned by this spawner, for filtering shared despawn delegate. */
 	TSet<TWeakObjectPtr<ATrafficVehicleController>> OwnedVehicles;
@@ -194,6 +221,14 @@ protected:
 	/** Number of vehicles to spawn. May exceed lane count (vehicles share lanes via SpawnSpacing). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "1"))
 	int32 VehicleCount;
+
+	/** Maximum number of initial vehicles to spawn in a single frame batch. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "1", ClampMax = "64"))
+	int32 InitialSpawnBatchSize;
+
+	/** Seconds between initial spawn batches. Lower values reduce total startup time, higher values reduce scene spikes. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float InitialSpawnBatchInterval;
 
 	/** Target speed for spawned vehicles (cm/s). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))

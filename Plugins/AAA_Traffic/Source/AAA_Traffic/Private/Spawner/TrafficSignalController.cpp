@@ -58,7 +58,14 @@ void ATrafficSignalController::BeginPlay()
 	{
 		float RemainingOffset = FMath::Max(PhaseOffset, 0.0f);
 		CurrentPhase = ETrafficSignalPhase::Green;
-		PhaseTimer = GreenDuration;
+		// Use per-group green duration for group 0 if available, so the
+		// offset calculation matches actual cycle timing.
+		float InitialGreen = GreenDuration;
+		if (PhaseGroups.IsValidIndex(0) && PhaseGroups[0].GroupGreenDuration > 0.0f)
+		{
+			InitialGreen = PhaseGroups[0].GroupGreenDuration;
+		}
+		PhaseTimer = InitialGreen;
 
 		while (RemainingOffset > 0.0f)
 		{
@@ -211,17 +218,13 @@ void ATrafficSignalController::AdvancePhase()
 		break;
 	}
 
-	// Log every phase change (diagnostic-gated to avoid log spam).
-	if (GTrafficJunctionDiagnostics >= 1)
-	{
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("SIGNAL PHASE-CHANGE: Signal='%s' JunctionId=%d NewPhase=%s "
-				 "GroupIndex=%d/%d Timer=%.2f"),
-			*GetName(), JunctionId,
-			CurrentPhase == ETrafficSignalPhase::Green ? TEXT("GREEN") :
-			CurrentPhase == ETrafficSignalPhase::Yellow ? TEXT("YELLOW") : TEXT("RED"),
-			CurrentGroupIndex, PhaseGroups.Num(), PhaseTimer);
-	}
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("SIGNAL PHASE-CHANGE: Signal='%s' JunctionId=%d NewPhase=%s "
+			 "GroupIndex=%d/%d Timer=%.2f"),
+		*GetName(), JunctionId,
+		CurrentPhase == ETrafficSignalPhase::Green ? TEXT("GREEN") :
+		CurrentPhase == ETrafficSignalPhase::Yellow ? TEXT("YELLOW") : TEXT("RED"),
+		CurrentGroupIndex, PhaseGroups.Num(), PhaseTimer);
 }
 
 bool ATrafficSignalController::IsLaneGreen(const FTrafficLaneHandle& Lane) const

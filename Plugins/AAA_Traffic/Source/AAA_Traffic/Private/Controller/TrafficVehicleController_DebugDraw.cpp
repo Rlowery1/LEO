@@ -168,6 +168,21 @@ void ATrafficVehicleController::DrawVehicleDebug()
 				DrawDebugLine(DbgWorld, LaneChangeCoord_.TargetLanePoints[i], LaneChangeCoord_.TargetLanePoints[i + 1], FColor::Magenta, false, -1.0f, 0, 2.0f);
 			}
 		}
+
+		// --- JUNCTION TRANSITION CURVE (yellow) ---
+		if (JnctState.TransitionPoints.Num() >= 2)
+		{
+			for (int32 i = 0; i < JnctState.TransitionPoints.Num() - 1; ++i)
+			{
+				DrawDebugLine(DbgWorld, JnctState.TransitionPoints[i],
+					JnctState.TransitionPoints[i + 1],
+					FColor::Yellow, false, -1.0f, 0, 3.0f);
+			}
+			DrawDebugSphere(DbgWorld, JnctState.TransitionPoints[0],
+				25.0f, 4, FColor::Green, false, -1.0f, 0, 2.0f);
+			DrawDebugSphere(DbgWorld, JnctState.TransitionPoints.Last(),
+				25.0f, 4, FColor::Red, false, -1.0f, 0, 2.0f);
+		}
 	}
 #endif // ENABLE_DRAW_DEBUG
 }

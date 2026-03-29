@@ -27,6 +27,35 @@ Final output must contain the following sections (even if brief):
 - CI Impact
 - Verification Status (**VERIFIED / FAILED / UNVERIFIED**)
 
+## Delegation and Context Management (Required)
+- Use subagents for read-heavy discovery so the main chat context stays focused on decisions and code edits.
+- Delegate before coding when any of these are true:
+  - Code location is unknown and requires broad repository search.
+  - The task spans more than 3 likely files or multiple candidate call paths.
+  - There are 2 or more plausible implementation approaches and tradeoff analysis is needed.
+  - The user asks for review/triage of logs, CI output, or broad regressions.
+- Keep the main agent as the decision and integration authority:
+  - Main agent defines acceptance criteria and scope.
+  - Subagent returns evidence (paths, symbols, concise findings).
+  - Main agent decides final implementation and applies edits.
+- Never delegate final patch authority or verification status assignment.
+
+## Task Routing Rules
+- Use subagent-first exploration for:
+  - Symbol/file discovery, dependency tracing, and impact mapping.
+  - PR or issue evidence gathering across many files.
+  - CI/compiler-log triage where multiple failure candidates exist.
+- Use main-agent direct execution for:
+  - Small, obvious single-file fixes.
+  - Applying minimal diffs after scope is known.
+  - Final response synthesis and compliance checks.
+
+## Delegation Log (Required In Final Response)
+Include a brief "Delegation Log" section in implementation responses whenever delegation is used:
+- What was delegated.
+- Which evidence came back (files/symbols/findings).
+- What was accepted or rejected and why.
+
 ## Structural Boundaries (Repo Layout)
 - Treat this layout as authoritative:
   - `HostProject/HostProject.uproject`
@@ -88,6 +117,7 @@ Rule:
 ## Code Hygiene (Non-Negotiable)
 - **One implementation per role.** There must be exactly one class for each subsystem role (e.g., one `ITrafficRoadProvider`). Never create a second class that does the same job — extend or replace the existing one.
 - **No dead code.** If code is superseded, delete it in the same change. Source control has the history.
+- **No legacy compatibility paths for replaced authority.** If a new implementation replaces an old runtime authority, semantic path, or subsystem responsibility, remove the superseded code in the same change. Do not keep fallback branches, comparison modes, compatibility shims, or feature-flagged duplicates inside the plugin.
 - **Module inventory is locked.** The plugin has exactly two modules: `AAA_Traffic` (core runtime) and `AAA_TrafficEditor` (editor-only). Do not add new modules without explicit user approval.
 - **No copy-paste utilities.** Shared functions live in one place. Do not duplicate a function into a second file and rename it to avoid collisions.
 

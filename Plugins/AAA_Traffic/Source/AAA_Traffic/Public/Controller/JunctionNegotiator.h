@@ -15,6 +15,15 @@ class ATrafficVehicleController;
  *  - Post-transition release (unlock junction after lane switch)
  *  - Traversal steering (follow synthesized junction curve)
  *
+ * Junction-phase state machine authority:
+ *   Phase transitions (JnctState.Phase) are set ONLY through this class
+ *   and through LaneTransitionEngine::InitializeLane (which resets or
+ *   preserves phase based on traversal context).
+ *   Occupancy release happens in:
+ *     1. TickPostTransitionRelease (primary authority after traversal)
+ *     2. LaneTransitionEngine::InitializeLane (if phase == Waiting, safety net)
+ *     3. TrafficSubsystem::UnregisterVehicle (despawn cleanup)
+ *
  * Accesses all state through Owner pointer; not a UObject.
  */
 struct AAA_TRAFFIC_API FJunctionNegotiator

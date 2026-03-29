@@ -432,6 +432,8 @@ TArray<FTrafficLaneHandle> URoadBLDReflectionProvider::GetConnectedLanes(const F
 	// connections of its own, check whether the original (pre-split) lane
 	// still has connections that were not remapped. This is a safety net
 	// for edge cases missed by the post-split remapping pass.
+	// TODO(P1): Audit DetectAndSplitThroughRoads + BuildJunctionGrouping to
+	//           find and fix the root cause so this fallback can be removed.
 	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
 	{
 		// Only fall back for the LAST virtual segment of the original lane,

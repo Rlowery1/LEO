@@ -23,6 +23,8 @@ extern int32 GTrafficJunctionDiagnostics;
 
 ATrafficSpawner::ATrafficSpawner()
 	: VehicleCount(1)
+	, InitialSpawnBatchSize(4)
+	, InitialSpawnBatchInterval(0.05f)
 	, VehicleSpeed(2012.f)
 	, SpawnSeed(42)
 	, SpawnZOffset(50.f)
@@ -114,12 +116,74 @@ void ATrafficSpawner::EndPlay(const EEndPlayReason::Type EndPlayReason)
 			TrafficSub->OnVehicleDespawned.RemoveAll(this);
 			TrafficSub->OnProviderRegistered.RemoveAll(this);
 		}
+		World->GetTimerManager().ClearTimer(InitialSpawnBatchTimerHandle);
 		World->GetTimerManager().ClearTimer(RespawnTimerHandle);
 	}
 
 	OwnedVehicles.Empty();
 
 	Super::EndPlay(EndPlayReason);
+}
+
+void ATrafficSpawner::ProcessInitialSpawnBatch()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>();
+	ITrafficRoadProvider* Provider = TrafficSub ? TrafficSub->GetProvider() : nullptr;
+	if (!Provider)
+	{
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("TrafficSpawner: Initial spawn batch deferred because provider is unavailable."));
+		return;
+	}
+
+	const int32 BatchSize = FMath::Max(1, InitialSpawnBatchSize);
+	const int32 BatchEnd = FMath::Min(PendingInitialSpawnCursor + BatchSize, PendingInitialSpawns.Num());
+	for (; PendingInitialSpawnCursor < BatchEnd; ++PendingInitialSpawnCursor)
+	{
+		const FPendingInitialSpawn& Request = PendingInitialSpawns[PendingInitialSpawnCursor];
+		SpawnSingleVehicle(World, Provider, Request.Lane, Request.SlotIndex, Request.VehicleIndex);
+	}
+
+	if (PendingInitialSpawnCursor >= PendingInitialSpawns.Num())
+	{
+		World->GetTimerManager().ClearTimer(InitialSpawnBatchTimerHandle);
+		PendingInitialSpawns.Empty();
+		PendingInitialSpawnCursor = 0;
+		FinalizeSpawnSetup(World, TrafficSub);
+	}
+}
+
+void ATrafficSpawner::FinalizeSpawnSetup(UWorld* World, UTrafficSubsystem* TrafficSub)
+{
+	bSpawnComplete = true;
+
+	// Unbind delegate now that spawning is complete (review feedback: keep delegate list clean).
+	if (TrafficSub)
+	{
+		TrafficSub->OnProviderRegistered.RemoveAll(this);
+	}
+
+	// Subscribe to despawn events for respawning.
+	if (bEnableRespawn && TrafficSub)
+	{
+		TrafficSub->OnVehicleDespawned.AddUObject(this, &ATrafficSpawner::OnVehicleDespawned);
+
+		World->GetTimerManager().SetTimer(
+			RespawnTimerHandle,
+			FTimerDelegate::CreateUObject(this, &ATrafficSpawner::CheckRespawn),
+			RespawnCheckInterval,
+			/*bLoop=*/ true);
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("TrafficSpawner: Respawn enabled — checking every %.1f seconds."),
+			RespawnCheckInterval);
+	}
 }
 
 
@@ -335,17 +399,20 @@ void ATrafficSpawner::OnVehicleDespawned(ATrafficVehicleController* Controller, 
 		return;
 	}
 
-	// Queue the lane for respawn.
-	if (Lane.IsValid())
+	// Queue a respawn-safe lane (non-dead-end). If the vehicle was on a
+	// dead-end lane, redirect to a random respawn-safe lane instead.
+	if (CachedRespawnLanes.Num() == 0) { return; }
+
+	if (Lane.IsValid() && CachedRespawnLanes.Contains(Lane))
 	{
 		RespawnQueue.Add(Lane);
 	}
-	else if (CachedAllLanes.Num() > 0)
+	else
 	{
-		// If lane is unknown, pick one deterministically.
+		// Lane is invalid or a dead-end — pick a respawn-safe lane deterministically.
 		FRandomStream RespawnRng(SpawnSeed + TotalVehiclesSpawned + RespawnCounter);
-		const int32 Idx = RespawnRng.RandRange(0, CachedAllLanes.Num() - 1);
-		RespawnQueue.Add(CachedAllLanes[Idx]);
+		const int32 Idx = RespawnRng.RandRange(0, CachedRespawnLanes.Num() - 1);
+		RespawnQueue.Add(CachedRespawnLanes[Idx]);
 	}
 }
 
@@ -408,9 +475,9 @@ void ATrafficSpawner::CheckRespawn()
 
 		++RespawnCounter;
 		const int32 VehicleIdx = TotalVehiclesSpawned++;
-		// Use RespawnCounter as slot offset to stagger respawn positions
-		// and avoid clumping when multiple respawns target the same lane.
-		SpawnSingleVehicle(World, Provider, Lane, RespawnCounter, VehicleIdx);
+		// Always spawn at lane start (SlotIndex=0). The pre-spawn overlap
+		// check inside SpawnSingleVehicle prevents stacking.
+		SpawnSingleVehicle(World, Provider, Lane, 0, VehicleIdx);
 
 		UE_LOG(LogAAATraffic, Log,
 			TEXT("TrafficSpawner: Respawned vehicle on lane %d (respawn #%d)."),
@@ -555,49 +622,160 @@ void ATrafficSpawner::SpawnVehicles()
 	// Cache filtered lanes for respawn use.
 	CachedAllLanes = AllLanes;
 
+	// Build a respawn-safe subset: lanes that have a viable downstream route.
+	// A single immediate connection is not sufficient here because a lane can
+	// feed directly into a terminal corridor (for example 25 -> 15 -> dead-end).
+	// Prefer lanes whose precomputed forward scan reaches a junction; if none do,
+	// fall back to the broader non-dead-end set so pure non-junction maps still work.
+	CachedRespawnLanes = AllLanes;
+	CachedRespawnLanes.RemoveAll([Provider](const FTrafficLaneHandle& L)
+	{
+		const TArray<FTrafficLaneHandle> Connected = Provider->GetConnectedLanes(L);
+		if (Connected.IsEmpty())
+		{
+			return true;
+		}
+
+		const float LaneLengthCm = Provider->GetLaneLength(L);
+		const ITrafficRoadProvider::FJunctionScanResult Scan =
+			Provider->GetDistanceToNextJunction(L, LaneLengthCm, 50000.0f, 10);
+		return !Scan.IsValid();
+	});
+
+	// Filter out lanes whose downstream junction has no canonical movements
+	// for them. A lane may reach a junction geometrically but the survey may
+	// have rejected all exits (e.g. same-road opposing with a single exit),
+	// making it a network trap. Only apply if the subsystem is available and
+	// has canonical data compiled.
+	if (TrafficSub)
+	{
+		const int32 PreCanonicalCount = CachedRespawnLanes.Num();
+		CachedRespawnLanes.RemoveAll([Provider, TrafficSub](const FTrafficLaneHandle& L)
+		{
+			// Check if this lane is an approach lane with canonical movements
+			const TArray<int32>& DirectMovements =
+				TrafficSub->GetCanonicalMovementsForApproachLane(L.HandleId);
+			if (!DirectMovements.IsEmpty())
+			{
+				// Has direct canonical movements — check if any have non-zero weight
+				for (const int32 MoveId : DirectMovements)
+				{
+					const FCanonicalMovementRecord* Record = TrafficSub->GetCanonicalMovement(MoveId);
+					if (Record && Record->SelectionWeight > 0.0f)
+					{
+						return false; // Keep — has viable canonical authority
+					}
+				}
+				return true; // Remove — all canonical movements have zero weight
+			}
+
+			// Not a direct approach lane — check if the downstream junction
+			// approach lane has canonical movements
+			const float LaneLengthCm = Provider->GetLaneLength(L);
+			const ITrafficRoadProvider::FJunctionScanResult Scan =
+				Provider->GetDistanceToNextJunction(L, LaneLengthCm, 50000.0f, 10);
+			if (!Scan.IsValid())
+			{
+				return false; // No junction downstream — keep (non-junction road)
+			}
+			if (Scan.ApproachLane.IsValid())
+			{
+				const TArray<int32>& ApproachMovements =
+					TrafficSub->GetCanonicalMovementsForApproachLane(Scan.ApproachLane.HandleId);
+				if (ApproachMovements.IsEmpty())
+				{
+					return true; // Remove — downstream approach has no canonical movements
+				}
+				for (const int32 MoveId : ApproachMovements)
+				{
+					const FCanonicalMovementRecord* Record = TrafficSub->GetCanonicalMovement(MoveId);
+					if (Record && Record->SelectionWeight > 0.0f)
+					{
+						return false; // Keep
+					}
+				}
+				return true; // Remove — all downstream movements zero weight
+			}
+
+			return false; // Keep by default
+		});
+
+		const int32 CanonicalFiltered = PreCanonicalCount - CachedRespawnLanes.Num();
+		if (CanonicalFiltered > 0)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("TrafficSpawner: Filtered %d lanes with no viable canonical authority at downstream junction (%d -> %d)."),
+				CanonicalFiltered, PreCanonicalCount, CachedRespawnLanes.Num());
+		}
+	}
+
+	if (CachedRespawnLanes.IsEmpty())
+	{
+		// Fallback: no lane reaches a junction ahead. This is valid on simple
+		// straight-road maps, so fall back to immediate non-dead-end lanes.
+		CachedRespawnLanes = AllLanes;
+		CachedRespawnLanes.RemoveAll([Provider](const FTrafficLaneHandle& L)
+		{
+			return Provider->GetConnectedLanes(L).IsEmpty();
+		});
+
+		if (CachedRespawnLanes.IsEmpty())
+		{
+			CachedRespawnLanes = AllLanes;
+		}
+	}
+
 	// Allow VehicleCount to exceed lane count — vehicles share lanes with
 	// staggered positioning via SpawnSpacing.
 	const int32 SpawnCount = VehicleCount;
 
+	// Use respawn-safe lanes (no dead-ends) for initial spawn so vehicles
+	// can immediately participate in the traffic network.
+	const TArray<FTrafficLaneHandle>& SpawnLanes = CachedRespawnLanes.Num() > 0 ? CachedRespawnLanes : AllLanes;
+
 	UE_LOG(LogAAATraffic, Log,
-		TEXT("TrafficSpawner: Spawning %d vehicles across %d available lanes (junction lanes excluded)."),
-		SpawnCount, AllLanes.Num());
+		TEXT("TrafficSpawner: Spawning %d vehicles across %d available lanes (%d downstream-terminal lanes excluded)."),
+		SpawnCount, SpawnLanes.Num(), AllLanes.Num() - SpawnLanes.Num());
 
 	// Track how many vehicles have been placed on each lane for staggered positioning.
 	TMap<int32, int32> LaneOccupancy;
+	PendingInitialSpawns.Empty();
+	PendingInitialSpawnCursor = 0;
+	PendingInitialSpawns.Reserve(SpawnCount);
 
 	for (int32 i = 0; i < SpawnCount; ++i)
 	{
-		const FTrafficLaneHandle& Lane = AllLanes[i % AllLanes.Num()];
+		const FTrafficLaneHandle& Lane = SpawnLanes[i % SpawnLanes.Num()];
 		const int32 SlotIndex = LaneOccupancy.FindOrAdd(Lane.HandleId, 0);
 		LaneOccupancy[Lane.HandleId] = SlotIndex + 1;
 
-		SpawnSingleVehicle(World, Provider, Lane, SlotIndex, i);
+		FPendingInitialSpawn& Request = PendingInitialSpawns.Emplace_GetRef();
+		Request.Lane = Lane;
+		Request.SlotIndex = SlotIndex;
+		Request.VehicleIndex = i;
 	}
 
 	TotalVehiclesSpawned = SpawnCount;
-	bSpawnComplete = true;
-
-	// Unbind delegate now that spawning is complete (review feedback: keep delegate list clean).
-	if (TrafficSub)
+	if (PendingInitialSpawns.IsEmpty())
 	{
-		TrafficSub->OnProviderRegistered.RemoveAll(this);
+		FinalizeSpawnSetup(World, TrafficSub);
+		return;
 	}
 
-	// Subscribe to despawn events for respawning.
-	if (bEnableRespawn && TrafficSub)
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("TrafficSpawner: Initial population will be spawned in batches of %d every %.2f seconds."),
+		FMath::Max(1, InitialSpawnBatchSize),
+		FMath::Max(0.0f, InitialSpawnBatchInterval));
+
+	ProcessInitialSpawnBatch();
+
+	if (PendingInitialSpawns.Num() > 0)
 	{
-		TrafficSub->OnVehicleDespawned.AddUObject(this, &ATrafficSpawner::OnVehicleDespawned);
-
 		World->GetTimerManager().SetTimer(
-			RespawnTimerHandle,
-			FTimerDelegate::CreateUObject(this, &ATrafficSpawner::CheckRespawn),
-			RespawnCheckInterval,
+			InitialSpawnBatchTimerHandle,
+			FTimerDelegate::CreateUObject(this, &ATrafficSpawner::ProcessInitialSpawnBatch),
+			FMath::Max(0.0f, InitialSpawnBatchInterval),
 			/*bLoop=*/ true);
-
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("TrafficSpawner: Respawn enabled — checking every %.1f seconds."),
-			RespawnCheckInterval);
 	}
 }
 

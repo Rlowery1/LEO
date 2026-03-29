@@ -91,6 +91,7 @@ struct AAA_TRAFFIC_API FAccelerationModel
 	float PersonalityDecelScale = 1.0f;
 	float PersonalityHeadwayScale = 1.0f;
 	float SmoothedAccel = 0.0f;
+	bool bPrevBraking = false;
 
 private:
 	struct FLeaderSample
