@@ -387,9 +387,6 @@ private:
 	/** Curve class Get3DPositionAtDistance — resolved lazily from first edge. */
 	UFunction* Get3DPosFunc = nullptr;
 
-	/** Timer handle for deferred road discovery retry. */
-	FTimerHandle DeferredDiscoveryTimerHandle;
-
 	/** How many deferred discovery retries have been attempted. */
 	int32 DeferredDiscoveryRetryCount = 0;
 

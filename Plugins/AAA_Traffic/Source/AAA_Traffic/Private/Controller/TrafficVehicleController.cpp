@@ -692,8 +692,10 @@ void ATrafficVehicleController::HandleActorHit(
 		Impulse);
 	CollisionBrakeTimer = FMath::Max(CollisionBrakeTimer, BrakeTime);
 
-	// Track whether this was a vehicle-vehicle collision (other actor is a Pawn).
-	bCollisionWithVehicle = OtherActor->IsA<APawn>();
+	// Latch for the duration of the current brake window by OR-ing with
+	// the existing flag.  A subsequent geometry hit must not clear a prior
+	// vehicle-vehicle collision while CollisionBrakeTimer is still active.
+	bCollisionWithVehicle = bCollisionWithVehicle || OtherActor->IsA<APawn>();
 
 	UE_LOG(LogAAATraffic, Warning,
 		TEXT("COLLISION: Pawn='%s' hit '%s' impulse=%.0f Lane=%d Jnct=%d Phase=%d Path=%s CurvePts=%d CurveIdx=%d CTE=%.1f/%.1f HeadCross=%.3f TargetDist=%.0f SpeedCap=%.0f Steer=%.3f JCurveR=%.0f JCurveCap=%.0f PredR=%.0f PredDist=%.0f PredCap=%.0f LeaderDist=%.0f BrakeTime=%.2f"),

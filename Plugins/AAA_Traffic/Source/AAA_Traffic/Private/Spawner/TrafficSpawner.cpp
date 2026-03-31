@@ -672,7 +672,9 @@ void ATrafficSpawner::SpawnVehicles()
 	// Extract worst-case min turn radius and max half-width so the
 	// provider can generate junction curves safe for every vehicle.
 	{
-		float WorstMinTurnRadius = TNumericLimits<float>::Max();
+		// Aggregate fleet-worst (LARGEST minimum turn radius across all
+		// vehicle classes) so junction curves are safe for every vehicle.
+		float WorstMinTurnRadius = 0.0f;
 		float WorstMaxHalfWidth = 100.0f; // conservative default
 
 		auto ScanVehicleClass = [&](TSubclassOf<APawn> PawnClass)
@@ -705,7 +707,7 @@ void ATrafficSpawner::SpawnVehicles()
 				const float SteerRad = FMath::DegreesToRadians(
 					FMath::Clamp(MaxSteerDeg, 15.0f, 55.0f));
 				const float MinRadius = EstimatedWheelbaseCm / FMath::Tan(SteerRad);
-				WorstMinTurnRadius = FMath::Min(WorstMinTurnRadius, MinRadius);
+				WorstMinTurnRadius = FMath::Max(WorstMinTurnRadius, MinRadius);
 			}
 
 			// Try to get vehicle bounds from the CDO for half-width.
@@ -750,7 +752,7 @@ void ATrafficSpawner::SpawnVehicles()
 			ScanVehicleClass(VehicleClass);
 		}
 
-		if (WorstMinTurnRadius < TNumericLimits<float>::Max())
+		if (WorstMinTurnRadius > 0.0f)
 		{
 			// Add 15% safety margin — real steering performance varies with speed.
 			WorstMinTurnRadius *= 1.15f;

@@ -106,7 +106,18 @@ public:
 
 	virtual bool Update() override
 	{
-		UWorld* World = GEngine ? GEngine->GetWorldContexts()[0].World() : nullptr;
+		UWorld* World = nullptr;
+		if (GEngine)
+		{
+			for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+			{
+				if (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE)
+				{
+					World = Ctx.World();
+					break;
+				}
+			}
+		}
 		if (!World) { return false; }
 
 		UTrafficSubsystem* Sub = World->GetSubsystem<UTrafficSubsystem>();
@@ -142,7 +153,18 @@ DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FRunSimulationAndValidate,
 
 bool FRunSimulationAndValidate::Update()
 {
-	UWorld* World = GEngine ? GEngine->GetWorldContexts()[0].World() : nullptr;
+	UWorld* World = nullptr;
+	if (GEngine)
+	{
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			if (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE)
+			{
+				World = Ctx.World();
+				break;
+			}
+		}
+	}
 	if (!World) { return false; }
 
 	UTrafficSubsystem* Sub = World->GetSubsystem<UTrafficSubsystem>();
@@ -484,7 +506,12 @@ bool FTrafficSimulationTest::RunTest(const FString& Parameters)
 	// Suppress LogAAATraffic Error messages (e.g. canonical-compile diagnostics,
 	// spawner config warnings) from failing the test.  The test has its own
 	// explicit AddError() calls for the 7 safety conditions.
-	AddExpectedErrorPlain(TEXT("LogAAATraffic"), EAutomationExpectedErrorFlags::Contains, -1);
+	// Suppress a bounded number of LogAAATraffic Error messages (e.g.
+	// canonical-compile diagnostics, spawner config warnings) from failing
+	// the test.  The test has its own explicit AddError() calls for the
+	// 7 safety conditions.  Unexpected errors beyond this count will still
+	// surface as test failures.
+	AddExpectedErrorPlain(TEXT("LogAAATraffic"), EAutomationExpectedErrorFlags::Contains, 50);
 
 	// Step 1: Load the map.
 	ADD_LATENT_AUTOMATION_COMMAND(FLoadGameMapCommand(MapPath));

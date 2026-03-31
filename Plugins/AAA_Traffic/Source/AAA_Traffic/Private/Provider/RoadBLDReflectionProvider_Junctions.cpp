@@ -498,10 +498,6 @@ bool URoadBLDReflectionProvider::GetJunctionPath(
 		if (!Dir.IsNearlyZero()) { ExitDir = Dir; }
 	}
 
-	// Angle-aware tangent scaling: sharp turns need shorter tangents to
-	// avoid overshooting into the oncoming lane.  Straight-through keeps
-	// the original 0.5 × SpanDist; a 90° turn uses ~0.35; a U-turn ~0.25.
-	const float DotFactor = FVector::DotProduct(ApproachDir, ExitDir);
 	// ── Tangent scaling: circular-arc Hermite approximation ────────
 	// For a Hermite spline approximating a circular arc of turn angle θ,
 	// the optimal tangent/chord ratio is α = 2·tan(θ/4) / (3·sin(θ/2)).

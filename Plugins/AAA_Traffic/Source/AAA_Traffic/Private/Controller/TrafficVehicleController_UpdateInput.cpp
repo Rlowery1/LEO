@@ -140,6 +140,9 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 
 	// Track cumulative distance traveled on this lane to prevent short-lane transition loops.
 	DistanceThisTick = 0.0f;
+	// Snapshot for end-of-tick displacement guard (must be saved BEFORE
+	// PreviousVehicleLocation is updated to the current frame).
+	const FVector PreTickLocation = PreviousVehicleLocation;
 	if (!PreviousVehicleLocation.IsZero())
 	{
 		DistanceThisTick = FVector::Dist(PreviousVehicleLocation, VehicleLocation);
@@ -852,15 +855,15 @@ return;
 	{
 		const FVector CurrLoc = SafetyPawnDisp->GetActorLocation();
 		constexpr float MaxSingleTickDisplacementCm = 5000.0f;
-		if (!PreviousVehicleLocation.IsZero()
-			&& FVector::DistSquared(CurrLoc, PreviousVehicleLocation)
+		if (!PreTickLocation.IsZero()
+			&& FVector::DistSquared(CurrLoc, PreTickLocation)
 				> MaxSingleTickDisplacementCm * MaxSingleTickDisplacementCm)
 		{
 			UE_LOG(LogAAATraffic, Warning,
 				TEXT("SAFETY DISPLACEMENT-GUARD: Pawn='%s' teleported %.0f cm in one tick — snapping back"),
 				*SafetyPawnDisp->GetName(),
-				FVector::Dist(CurrLoc, PreviousVehicleLocation));
-			SafetyPawnDisp->SetActorLocation(PreviousVehicleLocation);
+				FVector::Dist(CurrLoc, PreTickLocation));
+			SafetyPawnDisp->SetActorLocation(PreTickLocation);
 			if (UPrimitiveComponent* DispPrim = VehicleMovement->UpdatedPrimitive)
 			{
 				if (FBodyInstance* DispBI = DispPrim->GetBodyInstance())
