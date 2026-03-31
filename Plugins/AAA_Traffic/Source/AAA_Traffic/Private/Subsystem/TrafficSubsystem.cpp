@@ -84,7 +84,7 @@ void UTrafficSubsystem::RegisterProvider(UObject* InProvider)
 	UE_LOG(LogAAATraffic, Log, TEXT("TrafficSubsystem: Provider registered — %s"), *InProvider->GetName());
 
 	// Build the junction exit survey before notifying listeners.
-	BuildJunctionSurvey();
+	RebuildJunctionSurvey();
 
 	// Notify listeners (e.g. TrafficSpawner deferred retry).
 	OnProviderRegistered.Broadcast(Cast<ITrafficRoadProvider>(InProvider));
@@ -112,6 +112,17 @@ ITrafficRoadProvider* UTrafficSubsystem::GetProvider() const
 bool UTrafficSubsystem::HasProvider() const
 {
 	return ActiveProviderObject != nullptr;
+}
+
+void UTrafficSubsystem::RebuildJunctionSurvey()
+{
+	if (!GetProvider())
+	{
+		return;
+	}
+
+	ResetCanonicalMovementTable();
+	BuildJunctionSurvey();
 }
 
 void UTrafficSubsystem::RegisterVehicle(ATrafficVehicleController* InController)

@@ -9,6 +9,9 @@
 #include "TrafficVehiclePool.h"
 #include "TrafficLog.h"
 #include "ChaosWheeledVehicleMovementComponent.h"
+#include "ChaosVehicleWheel.h"
+#include "WheeledVehiclePawn.h"
+#include "AssetRegistry/IAssetRegistry.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
 #include "EngineUtils.h"
@@ -17,6 +20,9 @@
 
 // Global debug draw CVar — declared in TrafficVehicleController.cpp.
 extern int32 GTrafficDebugDraw;
+
+// Path-only debug draw CVar — declared in TrafficVehicleController.cpp.
+extern int32 GTrafficDebugDrawPaths;
 
 // Junction diagnostics CVar — declared in TrafficVehicleController.cpp.
 extern int32 GTrafficJunctionDiagnostics;
@@ -76,6 +82,44 @@ void ATrafficSpawner::Tick(float DeltaSeconds)
 	Super::Tick(DeltaSeconds);
 
 #if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
+	// --- Mode 2 of traffic.DebugDrawPaths: draw all precomputed canonical corridors ---
+	if (GTrafficDebugDrawPaths >= 2)
+	{
+		UWorld* World = GetWorld();
+		if (World)
+		{
+			if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
+			{
+				static constexpr float ZLift = 60.0f;
+				for (const auto& Pair : TrafficSub->GetAllCanonicalMovements())
+				{
+					const FCanonicalMovementRecord& Record = Pair.Value;
+					if (Record.CorridorPoints.Num() < 2) { continue; }
+
+					// Orange for provider-derived curves, red for synthesized (straight-line) fallbacks.
+					const FColor CurveColor = (Record.SourceKind == ECanonicalMovementSourceKind::ProviderDerived)
+						? FColor::Orange : FColor::Red;
+
+					for (int32 i = 0; i < Record.CorridorPoints.Num() - 1; ++i)
+					{
+						const FVector A = Record.CorridorPoints[i] + FVector(0, 0, ZLift);
+						const FVector B = Record.CorridorPoints[i + 1] + FVector(0, 0, ZLift);
+						DrawDebugLine(World, A, B, CurveColor,
+							false, -1.0f, SDPG_Foreground, 4.0f);
+					}
+
+					// Start/end markers.
+					DrawDebugSphere(World,
+						Record.CorridorPoints[0] + FVector(0, 0, ZLift),
+						20.0f, 4, FColor::Green, false, -1.0f, SDPG_Foreground);
+					DrawDebugSphere(World,
+						Record.CorridorPoints.Last() + FVector(0, 0, ZLift),
+						20.0f, 4, FColor::Red, false, -1.0f, SDPG_Foreground);
+				}
+			}
+		}
+	}
+
 	if (!bDebugDrawLanes && !bDebugDrawIntersections)
 	{
 		return;
@@ -370,6 +414,16 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 		Controller->Possess(Vehicle);
 		Controller->InitializeLaneFollowing(Lane);
 
+		// Immediately register in the spatial grid so subsequent same-frame
+		// spawns detect this vehicle in the overlap check. Without this,
+		// UpdateVehiclePosition only runs on the next Tick, leaving a one-frame
+		// window where GetNearbyVehicles returns empty and multiple vehicles
+		// can stack on the same lane start.
+		if (TrafficSub)
+		{
+			TrafficSub->UpdateVehiclePosition(Controller, SpawnLocation);
+		}
+
 		OwnedVehicles.Add(Controller);
 
 		// --- Spawner diagnostic: confirm possession and movement readiness ---
@@ -509,8 +563,74 @@ void ATrafficSpawner::SpawnVehicles()
 
 	if (VehicleClasses.Num() == 0 && !VehicleClass)
 	{
-		UE_LOG(LogAAATraffic, Error, TEXT("TrafficSpawner: No VehicleClass or VehicleClasses assigned."));
-		return;
+		// Auto-discover: find a Blueprint Pawn inheriting AWheeledVehiclePawn.
+		// Prefer smaller vehicles (names containing "Sedan") over trucks.
+		auto IsValidCandidate = [](const UClass* C) -> bool
+		{
+			return C
+				&& C->IsChildOf(AWheeledVehiclePawn::StaticClass())
+				&& !C->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)
+				&& C != AWheeledVehiclePawn::StaticClass();
+		};
+
+		UClass* Fallback = nullptr;
+
+		// Pass 1: loaded classes (fast — no disk I/O).
+		for (TObjectIterator<UClass> It; It; ++It)
+		{
+			if (IsValidCandidate(*It))
+			{
+				if (It->GetName().Contains(TEXT("Sedan")))
+				{
+					VehicleClass = *It;
+					break;
+				}
+				if (!Fallback) { Fallback = *It; }
+			}
+		}
+
+		// Pass 2: Asset Registry (catches GC'd / never-loaded BPs).
+		if (!VehicleClass && !Fallback)
+		{
+			if (IAssetRegistry* Registry = IAssetRegistry::Get())
+			{
+				TArray<FTopLevelAssetPath> BasePaths;
+				BasePaths.Add(AWheeledVehiclePawn::StaticClass()->GetClassPathName());
+				TSet<FTopLevelAssetPath> DerivedPaths;
+				Registry->GetDerivedClassNames(BasePaths, TSet<FTopLevelAssetPath>(), DerivedPaths);
+				for (const FTopLevelAssetPath& Path : DerivedPaths)
+				{
+					UClass* Candidate = FindObject<UClass>(nullptr, *Path.ToString());
+					if (!Candidate)
+					{
+						Candidate = LoadObject<UClass>(nullptr, *Path.ToString());
+					}
+					if (IsValidCandidate(Candidate))
+					{
+						if (Candidate->GetName().Contains(TEXT("Sedan")))
+						{
+							VehicleClass = Candidate;
+							break;
+						}
+						if (!Fallback) { Fallback = Candidate; }
+					}
+				}
+			}
+		}
+
+		if (!VehicleClass) { VehicleClass = Fallback; }
+
+		if (VehicleClass)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("TrafficSpawner: No VehicleClass assigned — auto-discovered '%s'"),
+				*VehicleClass->GetName());
+		}
+		else
+		{
+			UE_LOG(LogAAATraffic, Error, TEXT("TrafficSpawner: No VehicleClass or VehicleClasses assigned and auto-discovery found nothing."));
+			return;
+		}
 	}
 
 	UWorld* World = GetWorld();
@@ -544,6 +664,102 @@ void ATrafficSpawner::SpawnVehicles()
 	if (auto* RoadBLDProvider = World->GetSubsystem<URoadBLDReflectionProvider>())
 	{
 		RoadBLDProvider->SetSpeedTiers(ResidentialSpeed, UrbanSpeed, HighwaySpeed);
+	}
+
+	// ── Fleet vehicle pre-computation ——————————————————————
+	// Scan all vehicle class CDOs BEFORE junction paths are generated
+	// (PlaceAutoSignals triggers canonical movement compilation).
+	// Extract worst-case min turn radius and max half-width so the
+	// provider can generate junction curves safe for every vehicle.
+	{
+		float WorstMinTurnRadius = TNumericLimits<float>::Max();
+		float WorstMaxHalfWidth = 100.0f; // conservative default
+
+		auto ScanVehicleClass = [&](TSubclassOf<APawn> PawnClass)
+		{
+			if (!PawnClass) { return; }
+			const APawn* PawnCDO = PawnClass->GetDefaultObject<APawn>();
+			if (!PawnCDO) { return; }
+
+			const UChaosWheeledVehicleMovementComponent* MovComp =
+				PawnCDO->FindComponentByClass<UChaosWheeledVehicleMovementComponent>();
+			if (!MovComp) { return; }
+
+			float MaxSteerDeg = 0.0f;
+			for (const FChaosWheelSetup& WS : MovComp->WheelSetups)
+			{
+				if (!WS.WheelClass) { continue; }
+				const UChaosVehicleWheel* WheelCDO =
+					WS.WheelClass->GetDefaultObject<UChaosVehicleWheel>();
+				if (WheelCDO && WheelCDO->AxleType == EAxleType::Front)
+				{
+					MaxSteerDeg = FMath::Max(MaxSteerDeg, WheelCDO->MaxSteerAngle);
+				}
+			}
+
+			if (MaxSteerDeg > 1.0f)
+			{
+				// Conservative wheelbase: 280cm default (typical sedan).
+				// Actual wheelbase requires bone positions from a spawned mesh.
+				constexpr float EstimatedWheelbaseCm = 280.0f;
+				const float SteerRad = FMath::DegreesToRadians(
+					FMath::Clamp(MaxSteerDeg, 15.0f, 55.0f));
+				const float MinRadius = EstimatedWheelbaseCm / FMath::Tan(SteerRad);
+				WorstMinTurnRadius = FMath::Min(WorstMinTurnRadius, MinRadius);
+			}
+
+			// Try to get vehicle bounds from the CDO for half-width.
+			const FBox Bounds = PawnCDO->GetComponentsBoundingBox(false);
+			if (Bounds.IsValid)
+			{
+				const FVector ActorOrigin = PawnCDO->GetActorLocation();
+				const FVector Right = PawnCDO->GetActorRightVector();
+
+				FVector RightCorner;
+				RightCorner.X = (Right.X >= 0.0f) ? Bounds.Max.X : Bounds.Min.X;
+				RightCorner.Y = (Right.Y >= 0.0f) ? Bounds.Max.Y : Bounds.Min.Y;
+				RightCorner.Z = (Right.Z >= 0.0f) ? Bounds.Max.Z : Bounds.Min.Z;
+
+				const float HalfWidth = FMath::Clamp(
+					FMath::Abs(FVector::DotProduct(RightCorner - ActorOrigin, Right)),
+					50.0f,
+					300.0f);
+				if (HalfWidth > 50.0f)
+				{
+					WorstMaxHalfWidth = FMath::Max(WorstMaxHalfWidth, HalfWidth);
+				}
+			}
+
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("TrafficSpawner: Fleet scan — '%s' MaxSteer=%.1f° MinTurnR=%.0f cm HalfWidth=%.0f cm"),
+				*PawnClass->GetName(), MaxSteerDeg,
+				(MaxSteerDeg > 1.0f) ? (280.0f / FMath::Tan(FMath::DegreesToRadians(
+					FMath::Clamp(MaxSteerDeg, 15.0f, 55.0f)))) : 0.0f,
+				WorstMaxHalfWidth);
+		};
+
+		if (VehicleClasses.Num() > 0)
+		{
+			for (const FVehicleClassEntry& Entry : VehicleClasses)
+			{
+				ScanVehicleClass(Entry.VehicleClass);
+			}
+		}
+		else
+		{
+			ScanVehicleClass(VehicleClass);
+		}
+
+		if (WorstMinTurnRadius < TNumericLimits<float>::Max())
+		{
+			// Add 15% safety margin — real steering performance varies with speed.
+			WorstMinTurnRadius *= 1.15f;
+			Provider->SetFleetVehicleConstraints(WorstMinTurnRadius, WorstMaxHalfWidth);
+			if (TrafficSub)
+			{
+				TrafficSub->RebuildJunctionSurvey();
+			}
+		}
 	}
 
 	// Gather all lanes across all roads.
@@ -580,6 +796,7 @@ void ATrafficSpawner::SpawnVehicles()
 	// Filter out junction lanes — vehicles must not spawn inside intersections.
 	// Junction lanes are short virtual segments (12-14m) and spawning on them
 	// causes vehicles to immediately enter junction logic on their first tick.
+	TArray<FTrafficLaneHandle> AllLanesPreJunctionFilter = AllLanes;
 	{
 		const int32 PreFilterCount = AllLanes.Num();
 		AllLanes.RemoveAll([Provider](const FTrafficLaneHandle& Lane)
@@ -615,8 +832,38 @@ void ATrafficSpawner::SpawnVehicles()
 
 	if (AllLanes.IsEmpty())
 	{
-		UE_LOG(LogAAATraffic, Warning, TEXT("TrafficSpawner: All lanes are junction lanes — no spawn candidates!"));
-		return;
+		// All lanes touch junctions (e.g. short road between 2 intersections).
+		// Fall back to the longest non-stub junction lanes so vehicles can
+		// still spawn. Prefer lanes >= 800cm to give enough room to start.
+		constexpr float FallbackMinLengthCm = 800.0f;
+		for (const FTrafficLaneHandle& Lane : AllLanesPreJunctionFilter)
+		{
+			const float Len = Provider->GetLaneLength(Lane);
+			if (Len >= FallbackMinLengthCm)
+			{
+				AllLanes.Add(Lane);
+			}
+		}
+		// If still empty, take any lane that isn't a micro-stub (> 300cm).
+		if (AllLanes.IsEmpty())
+		{
+			for (const FTrafficLaneHandle& Lane : AllLanesPreJunctionFilter)
+			{
+				const float Len = Provider->GetLaneLength(Lane);
+				if (Len > 300.0f || Len <= 0.0f)
+				{
+					AllLanes.Add(Lane);
+				}
+			}
+		}
+		if (AllLanes.IsEmpty())
+		{
+			UE_LOG(LogAAATraffic, Warning, TEXT("TrafficSpawner: All lanes are junction lanes — no spawn candidates!"));
+			return;
+		}
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("TrafficSpawner: All non-junction lanes filtered — using %d junction-adjacent lanes as fallback."),
+			AllLanes.Num());
 	}
 
 	// Cache filtered lanes for respawn use.

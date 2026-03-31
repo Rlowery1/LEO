@@ -73,6 +73,22 @@ FSteeringOutput FSteeringComputer::Compute(const FSteeringInput& In)
 		? FMath::Atan(In.CTECorrectionGain * CTENormalized) / In.MaxSteerAngleRad
 		: 0.0f;
 
+	// Ramp CTE correction in gradually at junction curve start.
+	// When entering a junction curve the vehicle heading may be misaligned
+	// from the curve tangent.  Full CTE correction immediately would fight
+	// pure pursuit and push the vehicle off-path.  Ramp over 0.5s lets
+	// pure pursuit align the heading first.
+	if (bFollowingJunctionCurve)
+	{
+		JunctionCurveFollowElapsed += In.DeltaSeconds;
+		constexpr float RampDurationSec = 0.5f;
+		Out.CTETerm *= FMath::Clamp(JunctionCurveFollowElapsed / RampDurationSec, 0.0f, 1.0f);
+	}
+	else
+	{
+		JunctionCurveFollowElapsed = 0.0f;
+	}
+
 	// ── Derivative damping (heading error rate) ─────────────
 	// Dampens the rate of change of the pure-pursuit heading error
 	// (CrossZ), NOT the CTE. This suppresses steering oscillation.
@@ -135,4 +151,5 @@ float FSteeringComputer::ComputeLocalCurvature(
 void FSteeringComputer::Reset()
 {
 	PreviousHeadingCrossZ = 0.0f;
+	JunctionCurveFollowElapsed = 0.0f;
 }

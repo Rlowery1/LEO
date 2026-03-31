@@ -62,6 +62,11 @@ public:
 	virtual float GetLaneWidthAtDistance(const FTrafficLaneHandle& Lane, float Distance) override;
 	virtual float GetLaneCurvatureAtDistance(const FTrafficLaneHandle& Lane, float Distance) override;
 	virtual float GetLaneArcLength(const FTrafficLaneHandle& Lane) override;
+	virtual bool IsRoadClosedLoop(const FTrafficRoadHandle& Road) override;
+	virtual ETrafficRoadClass GetRoadClass(const FTrafficRoadHandle& Road) override;
+	virtual void SetFleetVehicleConstraints(float MinTurnRadiusCm, float MaxHalfWidthCm) override;
+	virtual float GetFleetMinTurnRadiusCm() const override;
+	virtual float GetFleetMaxHalfWidthCm() const override;
 	virtual FJunctionScanResult GetDistanceToNextJunction(
 		const FTrafficLaneHandle& StartLane,
 		float RemainingDistOnCurrentLane,
@@ -98,6 +103,9 @@ private:
 	 *  and create virtual lane segments so vehicles can exit/enter at the intersection. */
 	void DetectAndSplitThroughRoads();
 
+	/** Identify roads whose spline forms a closed loop (start ≈ end within threshold). */
+	void DetectClosedLoopRoads();
+
 	/** Build proximity-based connections between lane endpoints on different roads. */
 	void BuildProximityConnections();
 
@@ -126,6 +134,10 @@ private:
 	/** Trigger RoadBLD incremental rebuild and dump diagnostic arrays (pre/post).
 	 *  Separated from BuildLaneConnectivity to keep connectivity logic focused. */
 	void TriggerRoadBLDRebuildAndDiagnostics(UWorld* World, AActor* NetworkActor);
+
+	/** Deferred retry for road discovery when WorldPartition hasn't streamed
+	 *  DynamicRoad actors by the time OnWorldBeginPlay runs. */
+	void DeferredRoadDiscovery();
 
 	// ── Reflection helpers ──────────────────────────────────
 
@@ -275,6 +287,9 @@ private:
 	/** Lane handles whose travel direction is reversed relative to reference line. */
 	TSet<int32> ReversedLaneSet;
 
+	/** Road handles whose reference line forms a closed loop (start ≈ end). */
+	TSet<int32> ClosedLoopRoadHandles;
+
 	/** True once CacheRoadData() has successfully run. */
 	bool bCached = false;
 
@@ -318,6 +333,18 @@ private:
 	 *  5+ lanes  = highway (2906 cm/s ≈ 65 mph) */
 	TMap<int32, float> RoadClassifiedSpeedLimits;
 
+	/** Road handle ID → functional classification (Local/Collector/Arterial/Freeway).
+	 *  Populated by RebuildRoadSpeedClassification alongside the speed map. */
+	TMap<int32, ETrafficRoadClass> RoadClassificationMap;
+
+	/** Worst-case minimum turn radius (cm) across all vehicle classes in the fleet.
+	 *  Set by the spawner via SetFleetVehicleConstraints before junction path
+	 *  generation.  Zero means not yet set (no constraint applied). */
+	float FleetMinTurnRadiusCm = 0.0f;
+
+	/** Worst-case lateral half-width (cm) across all vehicle classes. */
+	float FleetMaxHalfWidthCm = 100.0f;
+
 	/** Configurable speed tiers (cm/s) — updated via SetSpeedTiers(). */
 	float ConfiguredResidentialSpeed = 1118.0f;
 	float ConfiguredUrbanSpeed = 2012.0f;
@@ -359,6 +386,12 @@ private:
 
 	/** Curve class Get3DPositionAtDistance — resolved lazily from first edge. */
 	UFunction* Get3DPosFunc = nullptr;
+
+	/** Timer handle for deferred road discovery retry. */
+	FTimerHandle DeferredDiscoveryTimerHandle;
+
+	/** How many deferred discovery retries have been attempted. */
+	int32 DeferredDiscoveryRetryCount = 0;
 
 	/** Lane class LeftEdgeCurve property. */
 	FProperty* LeftEdgeProp = nullptr;

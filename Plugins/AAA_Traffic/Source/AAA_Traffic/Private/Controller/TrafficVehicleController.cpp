@@ -94,6 +94,13 @@ static FAutoConsoleVariableRef CVarTrafficDebugDraw(
 	TEXT("Global toggle for in-world debug visualization: 0=off (default), 1=on for ALL vehicles. Overrides per-vehicle bDebugDraw."),
 	ECVF_Default);
 
+int32 GTrafficDebugDrawPaths = 0;
+static FAutoConsoleVariableRef CVarTrafficDebugDrawPaths(
+	TEXT("traffic.DebugDrawPaths"),
+	GTrafficDebugDrawPaths,
+	TEXT("Path-only debug visualization: 0=off, 1=show only the path each vehicle follows (lane polyline + junction curve), 2=also show all precomputed junction corridors."),
+	ECVF_Default);
+
 int32 GTrafficJunctionDiagnostics = 0;
 static FAutoConsoleVariableRef CVarTrafficJunctionDiagnostics(
 	TEXT("traffic.JunctionDiagnostics"),
@@ -413,6 +420,40 @@ FTrafficLaneHandle ATrafficVehicleController::PickSurveyedExit(
 			ValidMovements.Add(Movement);
 		}
 
+		// Fallback: if all canonical movements were filtered (typically
+		// because every curve is physically infeasible), admit the
+		// infeasible ones so the vehicle is not orphaned at the junction.
+		if (ValidMovements.IsEmpty())
+		{
+			const FCanonicalMovementRecord* BestInfeasible = nullptr;
+			float BestRadius = -1.0f;
+			for (const int32 MovementId : CanonicalMovementIds)
+			{
+				const FCanonicalMovementRecord* Movement = TrafficSub->GetCanonicalMovement(MovementId);
+				if (!Movement || !Movement->IsValid() || !Movement->bLegallyAllowed
+					|| !IsAllowedCandidate(Movement->ToLane))
+				{
+					continue;
+				}
+				if (Movement->MinTurnRadiusCm > BestRadius)
+				{
+					BestRadius = Movement->MinTurnRadiusCm;
+					BestInfeasible = Movement;
+				}
+			}
+			if (BestInfeasible)
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("CANONICAL-PICK-INFEASIBLE-FALLBACK: Pawn='%s' Approach=%d — admitting Movement=%d Exit=%d (R=%.0f) as last resort"),
+					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+					ApproachLane.HandleId,
+					BestInfeasible->MovementId,
+					BestInfeasible->ToLane.HandleId,
+					BestRadius);
+				ValidMovements.Add(BestInfeasible);
+			}
+		}
+
 		if (!ValidMovements.IsEmpty())
 		{
 			ValidMovements.Sort([](const FCanonicalMovementRecord& A, const FCanonicalMovementRecord& B)
@@ -454,11 +495,13 @@ FTrafficLaneHandle ATrafficVehicleController::PickSurveyedExit(
 		}
 
 		UE_LOG(LogAAATraffic, Warning,
-			TEXT("CANONICAL-PICK-EMPTY: Pawn='%s' Approach=%d has canonical movements but none survived runtime filtering"),
+			TEXT("CANONICAL-PICK-EMPTY: Pawn='%s' Approach=%d has canonical movements but none survived runtime filtering — falling through to Rules"),
 			GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
 			ApproachLane.HandleId);
 		JnctState.CanonicalMovementId = 0;
-		return FTrafficLaneHandle();
+		// Fall through to Rules-based selection below instead of
+		// returning invalid — the survey Rules table may still have
+		// a usable exit even when canonical movements are all culled.
 	}
 
 	JnctState.CanonicalMovementId = 0;
@@ -648,6 +691,9 @@ void ATrafficVehicleController::HandleActorHit(
 		FVector2f(0.1f, 1.0f),
 		Impulse);
 	CollisionBrakeTimer = FMath::Max(CollisionBrakeTimer, BrakeTime);
+
+	// Track whether this was a vehicle-vehicle collision (other actor is a Pawn).
+	bCollisionWithVehicle = OtherActor->IsA<APawn>();
 
 	UE_LOG(LogAAATraffic, Warning,
 		TEXT("COLLISION: Pawn='%s' hit '%s' impulse=%.0f Lane=%d Jnct=%d Phase=%d Path=%s CurvePts=%d CurveIdx=%d CTE=%.1f/%.1f HeadCross=%.3f TargetDist=%.0f SpeedCap=%.0f Steer=%.3f JCurveR=%.0f JCurveCap=%.0f PredR=%.0f PredDist=%.0f PredCap=%.0f LeaderDist=%.0f BrakeTime=%.2f"),
@@ -847,22 +893,40 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 		// another vehicle and correctly car-following at near-zero speed).
 		const bool bInJunction = (JnctState.Phase != EJunctionPhase::Idle);
 		const bool bHasLeader = (LastLeaderDist > 0.0f);
-		// Only exempt vehicles actively traversing the junction curve.
-		// Approaching-phase vehicles that aren't moving should still be
-		// caught — bWaiting already covers signal waits separately.
-		const bool bTraversingJunction = (JnctState.Phase == EJunctionPhase::Traversing);
-		const bool bShouldBeMoving = (TargetSpeed > 10.0f) && !JnctState.bWaiting
-			&& !bAtDeadEnd && !bTraversingJunction && !bHasLeader;
+		// Exempt ALL junction phases. Approaching vehicles legitimately
+		// brake to near-zero at the stop line before the detection gate
+		// transitions them to Waiting. Without this exemption the 2-second
+		// stuck timer fires during the Approaching→Waiting gap, triggering
+		// false stuck recovery on every car that stops for a red light.
+		const bool bShouldBeMoving = (TargetSpeed > 10.0f) && !bInJunction
+			&& !bAtDeadEnd && !bHasLeader;
 		if (bShouldBeMoving && MovedDist < 5.0f)
 		{
 			StuckTimeAccumulator += EffectiveDeltaSeconds;
+
+			// Phase 1: After StuckRecoveryTimeSec, attempt reverse + counter-steer.
+			// Skip if recovery was already exhausted (micro-wiggle detected).
+			if (StuckTimeAccumulator >= StuckRecoveryTimeSec && !bStuckRecoveryActive
+				&& !bStuckRecoveryExhausted && StuckTimeAccumulator < StuckDespawnTimeSec)
+			{
+				bStuckRecoveryActive = true;
+				StuckRecoveryElapsed = 0.0f;
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("Safety: Vehicle '%s' Lane=%d — initiating stuck recovery (reverse + counter-steer)"),
+					SafetyPawn ? *SafetyPawn->GetName() : TEXT("NULL"),
+					CurrentLane.HandleId);
+			}
+
+			// Phase 2: After StuckDespawnTimeSec, give up and despawn.
 			if (StuckTimeAccumulator >= StuckDespawnTimeSec)
 			{
 				if (TrafficSub)
 				{
 					bPendingRecoveryDespawn = true;
+					bStuckRecoveryActive = false;
+					bStuckRecoveryExhausted = false;
 					TrafficSub->RequestDespawn(this,
-						FString::Printf(TEXT("stuck for %.1fs (moved %.1f cm this tick)"),
+						FString::Printf(TEXT("stuck for %.1fs (moved %.1f cm this tick, recovery failed)"),
 							StuckTimeAccumulator, MovedDist));
 				}
 				else
@@ -870,13 +934,50 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 					UE_LOG(LogAAATraffic, Warning,
 						TEXT("Safety: stuck vehicle has no subsystem for despawn -- resetting accumulator."));
 					StuckTimeAccumulator = 0.0f;
+					bStuckRecoveryActive = false;
+					bStuckRecoveryExhausted = false;
 				}
 				return;
 			}
 		}
 		else
 		{
-			StuckTimeAccumulator = 0.0f;
+			// Vehicle is moving — check if this is genuine recovery or
+			// just a micro-wiggle from the reverse maneuver.
+			if (bStuckRecoveryActive && StuckTimeAccumulator > StuckRecoveryTimeSec)
+			{
+				if (MovedDist < 50.0f)
+				{
+					// Micro-move: recovery failed to truly unstick.
+					// Don't reset the timer — let it keep counting toward despawn.
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("Safety: Vehicle '%s' — stuck recovery micro-move (%.1f cm), marking exhausted"),
+						SafetyPawn ? *SafetyPawn->GetName() : TEXT("NULL"), MovedDist);
+					bStuckRecoveryActive = false;
+					bStuckRecoveryExhausted = true;
+					StuckRecoveryElapsed = 0.0f;
+					// DO NOT reset StuckTimeAccumulator
+				}
+				else
+				{
+					// Genuine recovery — vehicle moved substantially.
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("Safety: Vehicle '%s' — stuck recovery succeeded (moved %.1f cm)"),
+						SafetyPawn ? *SafetyPawn->GetName() : TEXT("NULL"), MovedDist);
+					StuckTimeAccumulator = 0.0f;
+					bStuckRecoveryActive = false;
+					bStuckRecoveryExhausted = false;
+					StuckRecoveryElapsed = 0.0f;
+				}
+			}
+			else
+			{
+				// Normal movement — reset all stuck state.
+				StuckTimeAccumulator = 0.0f;
+				bStuckRecoveryActive = false;
+				bStuckRecoveryExhausted = false;
+				StuckRecoveryElapsed = 0.0f;
+			}
 		}
 
 		// --- Off-road stuck detection (CTE safety net) ---

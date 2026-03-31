@@ -17,6 +17,20 @@ enum class ETrafficLaneSide : uint8
 };
 
 /**
+ * Functional classification of a road, derived from lane count,
+ * road length, and connectivity.  Feeds speed defaults, signal
+ * placement weighting, and spawn-density targets.
+ */
+UENUM(BlueprintType)
+enum class ETrafficRoadClass : uint8
+{
+	Local       UMETA(ToolTip = "Residential / minor street, typically \u22642 lanes"),
+	Collector   UMETA(ToolTip = "Collector road, 2 lanes, longer with moderate connectivity"),
+	Arterial    UMETA(ToolTip = "Major road, 3-4 lanes"),
+	Freeway     UMETA(ToolTip = "Highway / expressway, 5+ lanes")
+};
+
+/**
  * Opaque handle to a road managed by a traffic road provider.
  * The handle ID is meaningful only to the adapter that created it.
  */
@@ -254,6 +268,38 @@ public:
 	 * @return Arc length in cm.
 	 */
 	virtual float GetLaneArcLength(const FTrafficLaneHandle& Lane) { return GetLaneLength(Lane); }
+
+	/**
+	 * Query whether a road's geometry forms a closed loop (start ≈ end).
+	 * Used by junction classification to identify residential loop roads
+	 * (minor roads) vs through roads (major roads).
+	 * Default returns false.
+	 */
+	virtual bool IsRoadClosedLoop(const FTrafficRoadHandle& Road) { return false; }
+
+	/**
+	 * Get the functional classification of a road.
+	 * Derived from lane count, road length, and connectivity.
+	 * Default returns Local (safest assumption for unknown roads).
+	 */
+	virtual ETrafficRoadClass GetRoadClass(const FTrafficRoadHandle& Road) { return ETrafficRoadClass::Local; }
+
+	/**
+	 * Inform the provider of the fleet's worst-case vehicle dimensions.
+	 * Called by the spawner after scanning vehicle class CDOs so the provider
+	 * can generate junction paths that are physically feasible for every
+	 * vehicle in the fleet.
+	 *
+	 * @param MinTurnRadiusCm  Tightest turn circle across all vehicle classes.
+	 * @param MaxHalfWidthCm   Widest vehicle half-width across all classes.
+	 */
+	virtual void SetFleetVehicleConstraints(float MinTurnRadiusCm, float MaxHalfWidthCm) {}
+
+	/** Get the currently compiled fleet minimum turn radius in cm. */
+	virtual float GetFleetMinTurnRadiusCm() const { return 0.0f; }
+
+	/** Get the currently compiled fleet maximum half-width in cm. */
+	virtual float GetFleetMaxHalfWidthCm() const { return 100.0f; }
 
 	/**
 	 * Result of a multi-hop junction scan ahead of a given lane.

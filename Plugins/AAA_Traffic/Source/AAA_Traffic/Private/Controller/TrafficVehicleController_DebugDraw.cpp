@@ -8,10 +8,45 @@
 #include "Engine/World.h"
 
 extern int32 GTrafficDebugDraw;
+extern int32 GTrafficDebugDrawPaths;
 
 void ATrafficVehicleController::DrawVehicleDebug()
 {
 #if defined(ENABLE_DRAW_DEBUG) && ENABLE_DRAW_DEBUG
+	if (GTrafficDebugDrawPaths != 0 && GetPawn())
+	{
+		const UWorld* DbgWorld = GetWorld();
+		const FVector VehicleLoc = GetPawn()->GetActorLocation();
+
+		// --- PATH ONLY: Lane polyline (bright cyan, thick) ---
+		for (int32 i = 0; i < LanePoints.Num() - 1; ++i)
+		{
+			DrawDebugLine(DbgWorld, LanePoints[i], LanePoints[i + 1],
+				FColor::Cyan, false, -1.0f, SDPG_Foreground, 4.0f);
+		}
+
+		// --- PATH ONLY: Junction transition curve (yellow, thick) ---
+		if (JnctState.TransitionPoints.Num() >= 2)
+		{
+			for (int32 i = 0; i < JnctState.TransitionPoints.Num() - 1; ++i)
+			{
+				DrawDebugLine(DbgWorld, JnctState.TransitionPoints[i],
+					JnctState.TransitionPoints[i + 1],
+					FColor::Yellow, false, -1.0f, SDPG_Foreground, 5.0f);
+			}
+			DrawDebugSphere(DbgWorld, JnctState.TransitionPoints[0],
+				30.0f, 6, FColor::Green, false, -1.0f, SDPG_Foreground, 2.0f);
+			DrawDebugSphere(DbgWorld, JnctState.TransitionPoints.Last(),
+				30.0f, 6, FColor::Red, false, -1.0f, SDPG_Foreground, 2.0f);
+		}
+
+		// --- PATH ONLY: Vehicle position marker ---
+		DrawDebugSphere(DbgWorld, VehicleLoc, 40.0f, 6, FColor::White,
+			false, -1.0f, SDPG_Foreground, 2.0f);
+
+		return; // Skip the full debug draw.
+	}
+
 	if ((bDebugDraw || GTrafficDebugDraw != 0) && GetPawn())
 	{
 		const UWorld* DbgWorld = GetWorld();

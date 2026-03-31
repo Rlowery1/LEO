@@ -21,7 +21,7 @@ Before finalizing any implementation response, internally simulate these passes:
 
 Final output must contain the following sections (even if brief):
 
-- Summary
+- Summary (In plain english)
 - Assumptions (if any)
 - File-by-file patch (what changed, where)
 - CI Impact
@@ -109,6 +109,13 @@ Rule:
 - No hidden network operations.
 - Do not depend on generated folders: `Binaries/`, `Intermediate/`, `DerivedDataCache/`, `Saved/`.
 - Avoid breaking serialization/config without an explicit migration note.
+
+## Test Integrity (Non-Negotiable)
+- **NEVER falsify a test.** Do not exempt, skip, weaken, or inflate thresholds on test checks to make tests pass.
+- **NEVER add phase/state exemptions** (e.g. "skip off-road check during Traversing") to hide real failures.
+- Tests exist to **catch** failures. If a test fails, the **simulation code** is broken — fix the simulation, not the test.
+- The only valid reason to modify a test check is if the check logic itself is genuinely wrong (e.g. measuring the wrong metric). Never modify it because the simulation fails the check.
+- No grace windows, no blanket error suppression, no threshold inflation to paper over bugs.
 
 ## Change Discipline
 - Minimal diffs; no broad refactors unless explicitly requested.

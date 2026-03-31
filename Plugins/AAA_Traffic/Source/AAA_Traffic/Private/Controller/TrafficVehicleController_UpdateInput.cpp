@@ -79,6 +79,33 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	const FVector VehicleForward = ControlledPawn->GetActorForwardVector();
 	const float CurrentSpeed = VehicleMovement->GetForwardSpeed();
 
+	// ── Stuck recovery override ─────────────────────────────────
+	// While bStuckRecoveryActive, bypass normal driving and apply
+	// reverse + counter-steer to dislodge the vehicle from geometry.
+	if (bStuckRecoveryActive)
+	{
+		StuckRecoveryElapsed += DeltaSeconds;
+
+		VehicleMovement->SetThrottleInput(-0.4f);  // gentle reverse
+		VehicleMovement->SetBrakeInput(0.0f);
+
+		// Counter-steer: steer AWAY from the lane centerline to escape
+		// whatever wall/curb the vehicle is pinned against.
+		// Use the last known CTE to determine which side we're stuck on.
+		const float CounterSteer = (LastDiagSignedCTE > 0.0f) ? -0.6f : 0.6f;
+		VehicleMovement->SetSteeringInput(CounterSteer);
+
+		// If recovery duration exceeded, the stuck timer in the physics
+		// safety net will escalate to despawn.
+		if (StuckRecoveryElapsed >= StuckRecoveryDurationSec)
+		{
+			// Recovery time is up — let the safety net decide (continue to
+			// accumulate StuckTimeAccumulator until StuckDespawnTimeSec).
+			bStuckRecoveryActive = false;
+		}
+		return;
+	}
+
 	// -- Compute adaptive distances from time-based parameters --
 	// Each distance = |CurrentSpeed| * TimeSec, clamped to a floor so
 	// behaviour remains stable even when the vehicle is nearly stopped.
@@ -603,6 +630,42 @@ return;
 	LastDiagPredictiveCurveDistCm = SpeedOut.DbgPredictiveCurveDistCm;
 	LastDiagPredictiveCurveSpeedCmPerSec = SpeedOut.DbgPredictiveCurveSpeedCmPerSec;
 
+	// Junction curve distance — perpendicular distance from vehicle to the
+	// nearest segment of the junction curve polyline (not just the nearest point).
+	// Gate on TransitionIndex > 0: on the first frame after corridor commit, the
+	// vehicle is still at its approach-lane position and hasn't had a tick to
+	// steer toward the corridor. Measuring before convergence is a false positive.
+	if (JnctState.TransitionPoints.Num() >= 2 && JnctState.TransitionIndex > 0)
+	{
+		float MinDistSq = TNumericLimits<float>::Max();
+		for (int32 i = 0; i < JnctState.TransitionPoints.Num() - 1; ++i)
+		{
+			const FVector& A = JnctState.TransitionPoints[i];
+			const FVector& B = JnctState.TransitionPoints[i + 1];
+			const FVector AB = B - A;
+			const float ABLenSq = AB.SizeSquared2D();
+			if (ABLenSq < KINDA_SMALL_NUMBER)
+			{
+				MinDistSq = FMath::Min(MinDistSq,
+					FVector::DistSquared2D(VehicleLocation, A));
+				continue;
+			}
+			// Project vehicle position onto segment [A,B], clamp to [0,1].
+			const float T = FMath::Clamp(
+				FVector2D::DotProduct(
+					FVector2D(VehicleLocation - A), FVector2D(AB)) / ABLenSq,
+				0.0f, 1.0f);
+			const FVector ClosestPt = A + AB * T;
+			MinDistSq = FMath::Min(MinDistSq,
+				FVector::DistSquared2D(VehicleLocation, ClosestPt));
+		}
+		LastDiagJunctionCurveDistanceCm = FMath::Sqrt(MinDistSq);
+	}
+	else
+	{
+		LastDiagJunctionCurveDistanceCm = 0.0f;
+	}
+
 	if (SpeedOut.bFirstTickOnLaneConsumed)
 	{
 		bFirstTickOnLane = false;
@@ -779,6 +842,35 @@ return;
 	VehicleMovement->SetThrottleInput(ThrottleInput);
 	VehicleMovement->SetSteeringInput(SteeringInput);
 	VehicleMovement->SetBrakeInput(BrakeInput);
+
+	// --- Position displacement guard ---
+	// If the vehicle teleported an unreasonable distance in a single tick
+	// (physics explosion / penetration impulse), snap it back to the
+	// previous good position and zero velocity.  5000 cm is ~10x a
+	// sedan length — normal driving never approaches this per-tick.
+	if (APawn* SafetyPawnDisp = GetPawn())
+	{
+		const FVector CurrLoc = SafetyPawnDisp->GetActorLocation();
+		constexpr float MaxSingleTickDisplacementCm = 5000.0f;
+		if (!PreviousVehicleLocation.IsZero()
+			&& FVector::DistSquared(CurrLoc, PreviousVehicleLocation)
+				> MaxSingleTickDisplacementCm * MaxSingleTickDisplacementCm)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("SAFETY DISPLACEMENT-GUARD: Pawn='%s' teleported %.0f cm in one tick — snapping back"),
+				*SafetyPawnDisp->GetName(),
+				FVector::Dist(CurrLoc, PreviousVehicleLocation));
+			SafetyPawnDisp->SetActorLocation(PreviousVehicleLocation);
+			if (UPrimitiveComponent* DispPrim = VehicleMovement->UpdatedPrimitive)
+			{
+				if (FBodyInstance* DispBI = DispPrim->GetBodyInstance())
+				{
+					DispBI->SetLinearVelocity(FVector::ZeroVector, false);
+					DispBI->SetAngularVelocityInRadians(FVector::ZeroVector, false);
+				}
+			}
+		}
+	}
 
 	// --- Velocity sanity clamp ---
 	// If the physics body somehow exceeds MaxAllowedSpeedCmPerSec (e.g. from

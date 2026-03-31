@@ -440,26 +440,87 @@ void URoadBLDReflectionProvider::SetSpeedTiers(float InResidentialSpeed, float I
 void URoadBLDReflectionProvider::RebuildRoadSpeedClassification()
 {
 	RoadClassifiedSpeedLimits.Empty();
+	RoadClassificationMap.Empty();
 
-	// Step 1: Classify by lane count.
+	// Step 1: Classify by lane count + road length + connectivity.
 	for (const auto& RoadEntry : RoadToLaneHandles)
 	{
 		const int32 RoadId = RoadEntry.Key;
 		const int32 LaneCount = RoadEntry.Value.Num();
 		float ClassifiedSpeed;
+		ETrafficRoadClass RoadClass;
+
 		if (LaneCount <= 2)
 		{
 			ClassifiedSpeed = ConfiguredResidentialSpeed;
+
+			// Distinguish Local vs Collector: a 2-lane road that is long
+			// and connects to multiple junctions is a collector, not a
+			// dead-end residential street.  Closed-loop roads are always
+			// Local (residential cul-de-sac / loop).
+			RoadClass = ETrafficRoadClass::Local;
+
+			if (!ClosedLoopRoadHandles.Contains(RoadId))
+			{
+				// Compute total polyline length for this road.
+				float TotalRoadLength = 0.0f;
+				for (const int32 LaneId : RoadEntry.Value)
+				{
+					const FLaneEndpointCache* Cache = LaneEndpointMap.Find(LaneId);
+					if (Cache)
+					{
+						for (int32 i = 0; i < Cache->Polyline.Num() - 1; ++i)
+						{
+							TotalRoadLength += FVector::Dist(Cache->Polyline[i], Cache->Polyline[i + 1]);
+						}
+						break; // one lane's length represents the road
+					}
+				}
+
+				// Count junctions this road participates in.
+				int32 JunctionCount = 0;
+				TSet<int32> SeenJunctions;
+				for (const int32 LaneId : RoadEntry.Value)
+				{
+					// Check original and virtual lanes
+					if (const TArray<int32>* Virtuals = OriginalToVirtualMap.Find(LaneId))
+					{
+						for (const int32 VH : *Virtuals)
+						{
+							if (const int32* JId = LaneToJunctionMap.Find(VH))
+							{
+								SeenJunctions.Add(*JId);
+							}
+						}
+					}
+					if (const int32* JId = LaneToJunctionMap.Find(LaneId))
+					{
+						SeenJunctions.Add(*JId);
+					}
+				}
+				JunctionCount = SeenJunctions.Num();
+
+				// Collector: ≥3000cm (30m) long AND connects to 3+ junctions
+				if (TotalRoadLength >= 3000.0f && JunctionCount >= 3)
+				{
+					RoadClass = ETrafficRoadClass::Collector;
+					ClassifiedSpeed = ConfiguredUrbanSpeed;
+				}
+			}
 		}
 		else if (LaneCount <= 4)
 		{
 			ClassifiedSpeed = ConfiguredUrbanSpeed;
+			RoadClass = ETrafficRoadClass::Arterial;
 		}
 		else
 		{
 			ClassifiedSpeed = ConfiguredHighwaySpeed;
+			RoadClass = ETrafficRoadClass::Freeway;
 		}
+
 		RoadClassifiedSpeedLimits.Add(RoadId, ClassifiedSpeed);
+		RoadClassificationMap.Add(RoadId, RoadClass);
 	}
 
 	// Step 2: Cap each road's speed at the geometry-safe limit.
@@ -535,6 +596,22 @@ void URoadBLDReflectionProvider::RebuildRoadSpeedClassification()
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("RoadBLDReflectionProvider: Classified speed limits for %d roads (%d capped by curve geometry)."),
 		RoadClassifiedSpeedLimits.Num(), CappedCount);
+
+	// Log road class distribution.
+	int32 LocalCount = 0, CollectorCount = 0, ArterialCount = 0, FreewayCount = 0;
+	for (const auto& ClassEntry : RoadClassificationMap)
+	{
+		switch (ClassEntry.Value)
+		{
+		case ETrafficRoadClass::Local:     ++LocalCount; break;
+		case ETrafficRoadClass::Collector: ++CollectorCount; break;
+		case ETrafficRoadClass::Arterial:  ++ArterialCount; break;
+		case ETrafficRoadClass::Freeway:   ++FreewayCount; break;
+		}
+	}
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDReflectionProvider: Road classes — Local=%d Collector=%d Arterial=%d Freeway=%d"),
+		LocalCount, CollectorCount, ArterialCount, FreewayCount);
 }
 
 // ---------------------------------------------------------------------------
@@ -612,15 +689,31 @@ void URoadBLDReflectionProvider::DetectReversedLanes()
 		UObject* RefLine = GetReferenceLine(RoadActor);
 		if (!RefLine || !Get3DPosFunc) { continue; }
 
-		// Sample reference line at midpoint for direction and position.
-		const double MidDist = RoadLength * 0.5;
-		const double NearDist = FMath::Max(MidDist - 100.0, 0.0);
-		const FVector RefMid = Get3DPositionAtDistance(RefLine, RefLine, MidDist);
-		const FVector RefNear = Get3DPositionAtDistance(RefLine, RefLine, NearDist);
-		const FVector RefDir = (RefMid - RefNear).GetSafeNormal();
-		if (RefDir.IsNearlyZero()) { continue; }
+		// Sample reference line at multiple points to handle curved roads.
+		// Single-midpoint sampling fails on loops where curvature shifts
+		// lanes across the reference line centerpoint.
+		struct FRefSample { FVector Pos; FVector Dir; float Fraction; };
+		TArray<FRefSample> RefSamples;
+		{
+			constexpr double Fractions[] = { 0.25, 0.50, 0.75 };
+			for (const double Frac : Fractions)
+			{
+				const double SampleDist = RoadLength * Frac;
+				const double NearDist = FMath::Max(SampleDist - 100.0, 0.0);
+				FRefSample S;
+				S.Pos = Get3DPositionAtDistance(RefLine, RefLine, SampleDist);
+				const FVector Near = Get3DPositionAtDistance(RefLine, RefLine, NearDist);
+				S.Dir = (S.Pos - Near).GetSafeNormal();
+				S.Fraction = static_cast<float>(Frac);
+				if (!S.Dir.IsNearlyZero())
+				{
+					RefSamples.Add(S);
+				}
+			}
+		}
+		if (RefSamples.Num() == 0) { continue; }
 
-		// Classify each lane as left-of-center or right-of-center.
+		// Classify each lane by averaging lateral cross products across samples.
 		struct FSideData { int32 LaneId; float Cross; };
 		TArray<FSideData> SideInfo;
 		int32 LeftCount = 0, RightCount = 0;
@@ -630,11 +723,22 @@ void URoadBLDReflectionProvider::DetectReversedLanes()
 			TArray<FVector> Points;
 			float Width;
 			if (!GetLanePath(FTrafficLaneHandle(LaneId), Points, Width) || Points.Num() < 2) { continue; }
-			const FVector LaneMid = Points[Points.Num() / 2];
-			const float Cross = FVector::CrossProduct(RefDir, (LaneMid - RefMid)).Z;
-			SideInfo.Add({ LaneId, Cross });
-			if (Cross > 50.0f) { ++LeftCount; }
-			else if (Cross < -50.0f) { ++RightCount; }
+
+			float CrossSum = 0.0f;
+			int32 ValidSamples = 0;
+			for (const FRefSample& S : RefSamples)
+			{
+				const int32 LaneIdx = FMath::Clamp(
+					FMath::RoundToInt32(static_cast<float>(Points.Num() - 1) * S.Fraction),
+					0, Points.Num() - 1);
+				const float Cross = FVector::CrossProduct(S.Dir, (Points[LaneIdx] - S.Pos)).Z;
+				CrossSum += Cross;
+				++ValidSamples;
+			}
+			const float AvgCross = (ValidSamples > 0) ? (CrossSum / static_cast<float>(ValidSamples)) : 0.0f;
+			SideInfo.Add({ LaneId, AvgCross });
+			if (AvgCross > 50.0f) { ++LeftCount; }
+			else if (AvgCross < -50.0f) { ++RightCount; }
 		}
 
 		// Only mark reversed on 2-way roads (lanes on both sides).
@@ -649,4 +753,80 @@ void URoadBLDReflectionProvider::DetectReversedLanes()
 	UE_LOG(LogAAATraffic, Log,
 		TEXT("RoadBLDReflectionProvider: Detected %d reversed lanes on 2-way roads."),
 		ReversedLaneSet.Num());
+}
+
+// ---------------------------------------------------------------------------
+// DetectClosedLoopRoads — identify roads whose start ≈ end (closed loops)
+// ---------------------------------------------------------------------------
+
+void URoadBLDReflectionProvider::DetectClosedLoopRoads()
+{
+	ClosedLoopRoadHandles.Empty();
+
+	constexpr double ClosureThresholdCm = 500.0; // 5 m — generous for RoadBLD snapping
+
+	for (const auto& RoadPair : RoadHandleMap)
+	{
+		UObject* RoadActor = RoadPair.Value.Get();
+		if (!RoadActor) { continue; }
+
+		const double RoadLength = GetRoadLength(RoadActor);
+		if (RoadLength < 1000.0) { continue; } // Ignore very short roads
+
+		UObject* RefLine = GetReferenceLine(RoadActor);
+		if (!RefLine || !Get3DPosFunc) { continue; }
+
+		const FVector StartPos = Get3DPositionAtDistance(RefLine, RefLine, 0.0);
+		const FVector EndPos = Get3DPositionAtDistance(RefLine, RefLine, RoadLength);
+
+		const double Dist2D = FVector::Dist2D(StartPos, EndPos);
+		if (Dist2D < ClosureThresholdCm)
+		{
+			ClosedLoopRoadHandles.Add(RoadPair.Key);
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("RoadBLDReflectionProvider: Road %d detected as CLOSED LOOP (start-end dist=%.1f cm, length=%.0f cm)"),
+				RoadPair.Key, Dist2D, RoadLength);
+		}
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDReflectionProvider: Detected %d closed-loop roads."),
+		ClosedLoopRoadHandles.Num());
+}
+
+// ---------------------------------------------------------------------------
+bool URoadBLDReflectionProvider::IsRoadClosedLoop(const FTrafficRoadHandle& Road)
+{
+	return ClosedLoopRoadHandles.Contains(Road.HandleId);
+}
+
+// ---------------------------------------------------------------------------
+ETrafficRoadClass URoadBLDReflectionProvider::GetRoadClass(const FTrafficRoadHandle& Road)
+{
+	if (const ETrafficRoadClass* Found = RoadClassificationMap.Find(Road.HandleId))
+	{
+		return *Found;
+	}
+	return ETrafficRoadClass::Local;
+}
+
+// ---------------------------------------------------------------------------
+void URoadBLDReflectionProvider::SetFleetVehicleConstraints(float MinTurnRadiusCm, float MaxHalfWidthCm)
+{
+	FleetMinTurnRadiusCm = MinTurnRadiusCm;
+	FleetMaxHalfWidthCm = MaxHalfWidthCm;
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDReflectionProvider: Fleet constraints set — MinTurnRadius=%.0f cm, MaxHalfWidth=%.0f cm"),
+		FleetMinTurnRadiusCm, FleetMaxHalfWidthCm);
+}
+
+float URoadBLDReflectionProvider::GetFleetMinTurnRadiusCm() const
+{
+	return FleetMinTurnRadiusCm;
+}
+
+float URoadBLDReflectionProvider::GetFleetMaxHalfWidthCm() const
+{
+	return FleetMaxHalfWidthCm;
 }

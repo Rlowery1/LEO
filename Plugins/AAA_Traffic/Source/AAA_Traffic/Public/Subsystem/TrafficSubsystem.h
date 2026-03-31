@@ -277,6 +277,12 @@ public:
 	/** Get the sorted movement IDs compiled for an approach lane. */
 	const TArray<int32>& GetCanonicalMovementsForApproachLane(int32 ApproachLaneId) const;
 
+	/** Get read-only access to all canonical movements (for debug drawing). */
+	const TMap<int32, FCanonicalMovementRecord>& GetAllCanonicalMovements() const { return CanonicalMovementTable; }
+
+	/** Rebuild the junction survey and canonical movement table using the current provider state. */
+	void RebuildJunctionSurvey();
+
 	// --- Stop-Sign FIFO Queue ---
 
 	/** Record that a vehicle has completed its mandatory stop at a stop-sign junction.

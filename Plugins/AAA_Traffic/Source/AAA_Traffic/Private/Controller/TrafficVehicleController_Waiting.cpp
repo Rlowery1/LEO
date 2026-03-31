@@ -136,7 +136,8 @@ return false;
 							bSignalAllows = false;
 						}
 					}
-					// Yield mode: also check approaching cross-traffic gap acceptance.
+					// Yield mode: check approaching cross-traffic gap acceptance.
+					// All vehicles at Yield junctions must check for gaps.
 					if (bSignalAllows && JunctionMode == EJunctionControlMode::Yield)
 					{
 						if (TrafficSub->HasApproachingCrossTraffic(

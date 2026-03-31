@@ -165,12 +165,13 @@ bool FJunctionNegotiator::TickApproach(int32 ClosestIndex, float AbsSpeed, float
 				}
 				else if (ChosenExit.IsValid())
 				{
-					UE_LOG(LogAAATraffic, Error,
-						TEXT("JNCT ROUTE-CONTRACT: Pawn='%s' approach cached exit %d exists without canonical movement authority -- discarding stale cached exit"),
+					// Canonical authority has no valid movement, but a cached
+					// exit exists. Keep it so the vehicle can still navigate
+					// via the Rules-based fallback in PickSurveyedExit.
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT ROUTE-FALLBACK: Pawn='%s' approach cached exit %d exists without canonical movement authority — keeping for fallback"),
 						Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
 						ChosenExit.HandleId);
-					ChosenExit = FTrafficLaneHandle();
-					Owner->JnctState.ToLane = FTrafficLaneHandle();
 				}
 				bool bKeepChosenExit = false;
 				if (ChosenExit.IsValid())
@@ -547,11 +548,12 @@ void FJunctionNegotiator::TickDetectAndOccupy(float RemainingDist, float Transit
 					}
 					else
 					{
-						UE_LOG(LogAAATraffic, Error,
-							TEXT("JNCT ROUTE-CONTRACT: Pawn='%s' occupy cached exit %d exists without canonical movement authority -- discarding stale cached exit"),
+						// Canonical authority has no valid movement, but a
+						// cached exit exists. Keep it for fallback navigation.
+						UE_LOG(LogAAATraffic, Warning,
+							TEXT("JNCT ROUTE-FALLBACK: Pawn='%s' occupy cached exit %d exists without canonical movement authority — keeping for fallback"),
 							Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
 							Owner->JnctState.ToLane.HandleId);
-						Owner->JnctState.ToLane = FTrafficLaneHandle();
 					}
 				}
 
@@ -587,12 +589,11 @@ void FJunctionNegotiator::TickDetectAndOccupy(float RemainingDist, float Transit
 				{
 					if (!Owner->GetSelectedCanonicalMovement())
 					{
-						UE_LOG(LogAAATraffic, Error,
-							TEXT("JNCT CANONICAL-MISSING: Pawn='%s' JunctionId=%d selected exit %d without canonical movement authority"),
+						UE_LOG(LogAAATraffic, Warning,
+							TEXT("JNCT CANONICAL-MISSING: Pawn='%s' JunctionId=%d selected exit %d without canonical movement authority — proceeding via Rules fallback"),
 							Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
 							DetectedJunctionId,
 							Owner->JnctState.ToLane.HandleId);
-						return;
 					}
 
 					UE_LOG(LogAAATraffic, Warning,
@@ -982,7 +983,40 @@ bool FJunctionNegotiator::TickTraverse(const FVector& VehicleLocation, int32 Clo
 				VehicleLocation.Y,
 				VehicleLocation.Z);
 		}
-		OutTargetPoint = Owner->GetLookAheadPoint(VehicleLocation, Owner->LastClosestIndex);
+
+		// ── Post-exit position snap ────────────────────────────────
+		// If the vehicle ended the junction curve too far from the exit
+		// lane (curve endpoint / exit-lane geometry mismatch, or physics
+		// collision during traversal), ordinary CTE correction cannot
+		// recover in time.  Snap the pawn to the nearest lane point so
+		// the vehicle doesn't drive off-road indefinitely.
+		FVector EffectiveVehicleLocation = VehicleLocation;
+		if (Owner->LanePoints.IsValidIndex(Owner->LastClosestIndex))
+		{
+			const FVector& ClosestLanePt = Owner->LanePoints[Owner->LastClosestIndex];
+			const float DistToLaneSq = FVector::DistSquared2D(VehicleLocation, ClosestLanePt);
+			const float SnapThresholdCm = Owner->LaneWidth * 1.5f;
+			if (DistToLaneSq > SnapThresholdCm * SnapThresholdCm)
+			{
+				APawn* Pawn = Owner->GetPawn();
+				if (Pawn)
+				{
+					const FVector SnapTarget(ClosestLanePt.X, ClosestLanePt.Y, VehicleLocation.Z);
+					Pawn->SetActorLocation(SnapTarget, /*bSweep=*/ false,
+						/*OutSweepHitResult=*/ nullptr, ETeleportType::TeleportPhysics);
+					EffectiveVehicleLocation = SnapTarget;
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT EXIT-SNAP: Pawn='%s' Lane=%d snapped %.0f cm to lane "
+							 "(threshold=%.0f cm)"),
+						*Pawn->GetName(),
+						Owner->CurrentLane.HandleId,
+						FMath::Sqrt(DistToLaneSq),
+						SnapThresholdCm);
+				}
+			}
+		}
+
+		OutTargetPoint = Owner->GetLookAheadPoint(EffectiveVehicleLocation, Owner->LastClosestIndex);
 		return true;
 	}
 

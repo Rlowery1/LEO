@@ -276,11 +276,10 @@ void URoadBLDReflectionProvider::BuildJunctionGrouping()
 			else
 			{
 				// Neither road shares a mask group with the other.
-				// This is a simple end-to-end road join (e.g. user extended a
-				// road by drawing a new piece), NOT an intersection.
-				// Do NOT assign a junction — the lane connectivity (next-lane)
-				// already handles the hand-off; adding a junction here would
-				// cause vehicles to stop at a non-intersection join point.
+				// Treat as a simple road continuation — the lane connectivity
+				// (next-lane) already handles the hand-off.  Adding a junction
+				// here would cause vehicles to stop at a non-intersection
+				// join point.
 				UE_LOG(LogAAATraffic, Log,
 					TEXT("  Connection FromLane=%d -> ToLane=%d (Road=%s -> Road=%s): road continuation (no shared mask group) — skipping junction assignment."),
 					PC.FromLane, PC.ToLane,
@@ -476,66 +475,72 @@ bool URoadBLDReflectionProvider::GetJunctionPath(
 		return false;
 	}
 
+	// ── Smoothed tangent directions for curved-road stability ──────
+	// On curved roads (loops, arcs), the instantaneous tangent at the
+	// junction boundary diverges from the overall approach direction,
+	// causing the Hermite curve to overshoot along the road curvature
+	// and produce a tight apex that triggers the infeasibility check.
+	// Sample over a wider polyline window (up to 10m) for a more
+	// representative approach arc.
+	FVector ApproachDir = FromCache->EndDir;
+	if (FromCache->Polyline.Num() >= 4)
+	{
+		const int32 Window = FMath::Min(10, FromCache->Polyline.Num() / 2);
+		const int32 Idx = FromCache->Polyline.Num() - 1 - Window;
+		const FVector Dir = (FromCache->Polyline.Last() - FromCache->Polyline[Idx]).GetSafeNormal();
+		if (!Dir.IsNearlyZero()) { ApproachDir = Dir; }
+	}
+	FVector ExitDir = ToCache->StartDir;
+	if (ToCache->Polyline.Num() >= 4)
+	{
+		const int32 Window = FMath::Min(10, ToCache->Polyline.Num() / 2);
+		const FVector Dir = (ToCache->Polyline[Window] - ToCache->Polyline[0]).GetSafeNormal();
+		if (!Dir.IsNearlyZero()) { ExitDir = Dir; }
+	}
+
 	// Angle-aware tangent scaling: sharp turns need shorter tangents to
 	// avoid overshooting into the oncoming lane.  Straight-through keeps
 	// the original 0.5 × SpanDist; a 90° turn uses ~0.35; a U-turn ~0.25.
-	const float DotFactor = FVector::DotProduct(FromCache->EndDir, ToCache->StartDir);
-	// For actual turns (dot < 0.3) raise the floor from 0.25 to 0.35 to
-	// pull the curve outward through the mid-arc — wider clearance at apex.
-	const float AlphaFloor = (DotFactor < 0.3f) ? 0.35f : 0.25f;
-	const float Alpha = FMath::Lerp(AlphaFloor, 0.5f,
-		FMath::Clamp((DotFactor + 1.0f) * 0.5f, 0.0f, 1.0f));
-	const float TangentScale = SpanDist * Alpha;
+	const float DotFactor = FVector::DotProduct(ApproachDir, ExitDir);
+	// ── Tangent scaling: circular-arc Hermite approximation ────────
+	// For a Hermite spline approximating a circular arc of turn angle θ,
+	// the optimal tangent/chord ratio is α = 2·tan(θ/4) / (3·sin(θ/2)).
+	// This produces smooth arcs without the overshoot and fishhook shapes
+	// that proportional scaling (TangentScale ∝ SpanDist) causes on wide
+	// junctions.  No lateral bend is needed — properly-scaled tangents
+	// produce arcs that naturally clear the inner corner.
+	const float DotFactor = FVector::DotProduct(ApproachDir, ExitDir);
+	const float CrossZ = FVector::CrossProduct(ApproachDir, ExitDir).Z;
+	const float TurnAngleRad = FMath::Acos(FMath::Clamp(DotFactor, -1.0f, 1.0f));
 	const bool bLogPathDiagnostics = ShouldLogDiagnostics(2);
 
-	// ── Inner-corner offset for turns ──────────────────────────────
-	// Bend the tangents outward (away from the inner curb) so the Hermite
-	// curve clears the corner while still terminating on the actual lane
-	// centerlines. Cross-product Z of approach×exit gives turn direction:
-	// positive = left turn, negative = right turn.
-	const float CrossZ = FVector::CrossProduct(FromCache->EndDir, ToCache->StartDir).Z;
-	float AppliedLateralBend = 0.0f;
-	constexpr float InnerCornerOffset = 150.0f; // cm — fixed perpendicular bend
-	const bool bIsActualTurn = FMath::Abs(CrossZ) > 0.26f; // >15°
-
-	// Perpendicular directions for the inner-corner bend (computed once).
-	const float BendSign = (CrossZ < 0.0f) ? 1.0f : -1.0f;
-	const FVector PerpFrom = FVector(-FromCache->EndDir.Y, FromCache->EndDir.X, 0.0f) * BendSign;
-	const FVector PerpTo = FVector(-ToCache->StartDir.Y, ToCache->StartDir.X, 0.0f) * BendSign;
-	const float SharpnessFactor = FMath::Clamp(FMath::Abs(CrossZ), 0.0f, 1.0f);
+	float Alpha;
+	if (TurnAngleRad < 0.05f) // Nearly straight-through
+	{
+		Alpha = 0.5f;
+	}
+	else
+	{
+		const float HalfAngle = TurnAngleRad * 0.5f;
+		const float QuarterAngle = TurnAngleRad * 0.25f;
+		Alpha = (2.0f * FMath::Tan(QuarterAngle)) / (3.0f * FMath::Sin(HalfAngle));
+		Alpha = FMath::Clamp(Alpha, 0.25f, 0.55f);
+	}
+	const float TangentScale = SpanDist * Alpha;
 
 	// Segment count scales with span distance for consistent resolution.
-	// 200 cm per segment, clamped to [6, 32].
-	const int32 NumSegments = FMath::Clamp(FMath::CeilToInt32(SpanDist / 200.0f), 6, 32);
+	// 200 cm per segment, clamped to [6, 48].
+	// Sharp turns (>90°) get higher resolution so the min-radius measurement
+	// doesn't miss the tightest apex between coarse sample points.
+	const int32 BaseSegments = FMath::CeilToInt32(SpanDist / 200.0f);
+	const int32 SharpBonus = (TurnAngleRad > PI * 0.5f) ? 8 : 0;
+	const int32 NumSegments = FMath::Clamp(BaseSegments + SharpBonus, 6, 48);
 
-	// ── Generate Hermite curve (single pass) ───────────────────────
-	FVector M0 = FromCache->EndDir * TangentScale;
-	FVector M1 = ToCache->StartDir * TangentScale;
-
-	if (bIsActualTurn)
-	{
-		AppliedLateralBend = InnerCornerOffset * SharpnessFactor;
-
-		// Clamp lateral bend to 40% of the narrower lane width so the
-		// curve stays within lane boundaries on narrow roads.
-		const float FromWidth = GetLaneWidthAtDistance(FromLane, GetLaneLength(FromLane));
-		const float ToWidth = GetLaneWidthAtDistance(ToLane, 0.0f);
-		if (FromWidth > 0.0f && ToWidth > 0.0f)
-		{
-			const float MaxSafeBend = FMath::Min(FromWidth, ToWidth) * 0.4f;
-			if (AppliedLateralBend > MaxSafeBend)
-			{
-				UE_LOG(LogAAATraffic, Warning,
-					TEXT("JNCT: InnerCornerOffset clamped from %.0f to %.0f (LaneW From=%.0f To=%.0f) for From=%d To=%d"),
-					AppliedLateralBend, MaxSafeBend, FromWidth, ToWidth,
-					FromLane.HandleId, ToLane.HandleId);
-				AppliedLateralBend = MaxSafeBend;
-			}
-		}
-
-		M0 += PerpFrom * AppliedLateralBend;
-		M1 += PerpTo * AppliedLateralBend;
-	}
+	// ── Generate Hermite curve ─────────────────────────────────────
+	// Pure forward tangents only — no lateral bend.  The circular-arc
+	// ratio produces clean arcs that stay within the junction surface.
+	const FVector M0 = ApproachDir * TangentScale;
+	const FVector M1 = ExitDir * TangentScale;
 
 	OutPath.Reset();
 	OutPath.Reserve(NumSegments + 1);
@@ -549,6 +554,37 @@ bool URoadBLDReflectionProvider::GetJunctionPath(
 		const float H01 = -2.0f * T3 + 3.0f * T2;
 		const float H11 = T3 - T2;
 		OutPath.Add(H00 * P0 + H10 * M0 + H01 * P1 + H11 * M1);
+	}
+
+	// ── Turn radius diagnostic ─────────────────────────────────────
+	// Log if the curve's minimum radius is below the fleet minimum.
+	// The arc shape is determined by the junction geometry; if it's too
+	// tight there's no parameter that can fix it without leaving the road.
+	constexpr float AbsoluteMinTurnRadiusCm = 270.0f;
+	const float EffectiveMinTurnRadius = FMath::Max(FleetMinTurnRadiusCm, AbsoluteMinTurnRadiusCm);
+	if (TurnAngleRad > 0.26f && OutPath.Num() >= 3)
+	{
+		float CurveMinR = TNumericLimits<float>::Max();
+		for (int32 Idx = 1; Idx + 1 < OutPath.Num(); ++Idx)
+		{
+			const FVector SA = OutPath[Idx] - OutPath[Idx - 1];
+			const FVector SB = OutPath[Idx + 1] - OutPath[Idx];
+			const float CMag = FMath::Abs(FVector::CrossProduct(SA, SB).Z);
+			if (CMag <= KINDA_SMALL_NUMBER) { continue; }
+			const float Chord = FVector::Dist(OutPath[Idx - 1], OutPath[Idx + 1]);
+			const float Num = SA.Size() * SB.Size() * Chord;
+			if (Num <= KINDA_SMALL_NUMBER) { continue; }
+			const float R = Num / (2.0f * CMag);
+			if (R > 0.0f) { CurveMinR = FMath::Min(CurveMinR, R); }
+		}
+		if (CurveMinR == TNumericLimits<float>::Max()) { CurveMinR = 0.0f; }
+
+		if (CurveMinR > 0.0f && CurveMinR < EffectiveMinTurnRadius)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("JNCT: Turn radius below fleet min: From=%d To=%d MinR=%.0f Effective=%.0f Fleet=%.0f — geometry-limited"),
+				FromLane.HandleId, ToLane.HandleId, CurveMinR, EffectiveMinTurnRadius, FleetMinTurnRadiusCm);
+		}
 	}
 
 	if (bLogPathDiagnostics && OutPath.Num() >= 2)
@@ -573,7 +609,7 @@ bool URoadBLDReflectionProvider::GetJunctionPath(
 		const float ExitAlignCross = FVector::CrossProduct(FinalSeg2D, ExitDir2D).Z;
 
 		UE_LOG(LogAAATraffic, Log,
-			TEXT("JNCT PROVIDER-PATH: From=%d To=%d Span=%.1f Arc=%.1f Pts=%d Dot=%.3f Cross=%.3f Alpha=%.3f Tangent=%.1f Bend=%.1f PreEndLat=%.1f PreEndLong=%.1f ExitAlignDot=%.3f ExitAlignCross=%.3f"),
+			TEXT("JNCT PROVIDER-PATH: From=%d To=%d Span=%.1f Arc=%.1f Pts=%d Dot=%.3f Cross=%.3f Alpha=%.3f Tangent=%.1f PreEndLat=%.1f PreEndLong=%.1f ExitAlignDot=%.3f ExitAlignCross=%.3f"),
 			FromLane.HandleId,
 			ToLane.HandleId,
 			SpanDist,
@@ -583,7 +619,6 @@ bool URoadBLDReflectionProvider::GetJunctionPath(
 			CrossZ,
 			Alpha,
 			TangentScale,
-			AppliedLateralBend,
 			PreEndLateral,
 			PreEndLongitudinal,
 			ExitAlignDot,

@@ -107,4 +107,7 @@ struct AAA_TRAFFIC_API FSteeringComputer
 
 	/** Previous-tick heading cross product for derivative term. */
 	float PreviousHeadingCrossZ = 0.0f;
+
+	/** Elapsed time following current junction curve (for CTE ramp-in). */
+	float JunctionCurveFollowElapsed = 0.0f;
 };

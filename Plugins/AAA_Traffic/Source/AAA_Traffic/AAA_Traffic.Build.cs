@@ -28,6 +28,6 @@ public class AAA_Traffic : ModuleRules
 			}
 		);
 
-		PrivateDependencyModuleNames.AddRange(new string[] { "Chaos" });
+		PrivateDependencyModuleNames.AddRange(new string[] { "Chaos", "AssetRegistry" });
 	}
 }

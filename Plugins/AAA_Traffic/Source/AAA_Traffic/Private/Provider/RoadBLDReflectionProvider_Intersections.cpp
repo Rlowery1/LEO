@@ -160,8 +160,10 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 					SplitMaskDistEnd = Mask.EndDistance;
 				}
 
-				// Clamp to valid range (never at very first or last point).
-				StartIdx = FMath::Clamp(StartIdx, 1, TotalPoints - 2);
+				// Clamp to valid range. StartIdx may be 0 when a mask begins at
+				// the road start — the segment-creation loop handles this by
+				// skipping the empty [0..0] range and inheriting the GroupId.
+				StartIdx = FMath::Clamp(StartIdx, 0, TotalPoints - 2);
 				EndIdx = FMath::Clamp(EndIdx, StartIdx + 1, TotalPoints - 1);
 
 				// Mark start of intersection segment and start of free segment after it.
@@ -227,7 +229,15 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 					? SplitPoints[s].PolyIndex
 					: (TotalPoints - 1);
 
-				if (SegEnd <= PrevStart) { PrevStart = SegEnd; continue; }
+				if (SegEnd <= PrevStart)
+				{
+					// Empty segment (e.g. mask starts at polyline index 0).
+					// Propagate the GroupId so the NEXT segment inherits it
+					// instead of defaulting to free-flow (group 0).
+					PrevStart = SegEnd;
+					PrevGroupId = (s < SplitPoints.Num()) ? SplitPoints[s].GroupId : 0;
+					continue;
+				}
 
 				const int32 VirtualId = NextHandleId++;
 				FVirtualLaneInfo VInfo;
@@ -334,6 +344,21 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 				{
 					TArray<FTrafficLaneHandle>& Conns = LaneConnectionMap.FindOrAdd(Virtuals[v]);
 					Conns.AddUnique(FTrafficLaneHandle(Virtuals[v + 1]));
+				}
+
+				// Closed-loop roads: connect last virtual → first virtual so the
+				// virtual chain forms a cycle. Without this, the last free-flow
+				// segment is a dead-end because BuildProximityConnections' same-road
+				// filter blocks intra-road connections.
+				const int32* LaneRoadHandle = LaneToRoadHandleMap.Find(LaneHandle);
+				if (LaneRoadHandle && ClosedLoopRoadHandles.Contains(*LaneRoadHandle))
+				{
+					TArray<FTrafficLaneHandle>& WrapConns = LaneConnectionMap.FindOrAdd(Virtuals.Last());
+					WrapConns.AddUnique(FTrafficLaneHandle(Virtuals[0]));
+
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("      Loop wrap-around: Virtual %d → Virtual %d (closed-loop road %d)"),
+						Virtuals.Last(), Virtuals[0], *LaneRoadHandle);
 				}
 			}
 			else
@@ -459,6 +484,60 @@ void URoadBLDReflectionProvider::DetectAndSplitThroughRoads()
 			 "Remapped %d outgoing + %d incoming corner connections to virtual handles."),
 		ThroughRoadCount, TotalVirtuals, ReplacedLaneHandles.Num(),
 		RemappedOutgoing, RemappedIncoming);
+
+	// ── Init-time virtual lane chain validation ─────────────────
+	// Verify every virtual chain is non-degenerate: each segment must
+	// have ≥3 polyline points and at least one outgoing connection
+	// (except junction segments which may only have incoming).
+	{
+		int32 DegenerateCount = 0;
+		int32 DisconnectedCount = 0;
+		for (const auto& VirtualPair : OriginalToVirtualMap)
+		{
+			const TArray<int32>& Chain = VirtualPair.Value;
+			for (int32 CI = 0; CI < Chain.Num(); ++CI)
+			{
+				const int32 VH = Chain[CI];
+				const FLaneEndpointCache* VCache = LaneEndpointMap.Find(VH);
+				const int32 GroupId = VirtualLaneToGroupId.FindRef(VH);
+
+				if (!VCache || VCache->Polyline.Num() < 3)
+				{
+					++DegenerateCount;
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("VALIDATION: Degenerate virtual lane %d (orig=%d, chain[%d]) — %d polyline points"),
+						VH, VirtualPair.Key, CI,
+						VCache ? VCache->Polyline.Num() : 0);
+				}
+
+				// Free-flow segments (GroupId==0) should have outgoing connections
+				// unless they are the last segment of a non-loop chain.
+				if (GroupId == 0)
+				{
+					const TArray<FTrafficLaneHandle>* Conns = LaneConnectionMap.Find(VH);
+					if ((!Conns || Conns->Num() == 0) && CI < Chain.Num() - 1)
+					{
+						++DisconnectedCount;
+						UE_LOG(LogAAATraffic, Warning,
+							TEXT("VALIDATION: Virtual lane %d (orig=%d, chain[%d]) free-flow segment has no outgoing connections"),
+							VH, VirtualPair.Key, CI);
+					}
+				}
+			}
+		}
+		if (DegenerateCount == 0 && DisconnectedCount == 0)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("RoadBLDReflectionProvider: Virtual lane chain validation PASSED — %d chains, all healthy."),
+				OriginalToVirtualMap.Num());
+		}
+		else
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("RoadBLDReflectionProvider: Virtual lane chain validation — %d degenerate, %d disconnected segments."),
+				DegenerateCount, DisconnectedCount);
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

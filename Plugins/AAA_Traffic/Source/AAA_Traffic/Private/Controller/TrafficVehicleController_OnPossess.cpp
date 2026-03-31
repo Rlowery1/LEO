@@ -15,6 +15,7 @@
 void ATrafficVehicleController::OnPossess(APawn* InPawn)
 {
 	Super::OnPossess(InPawn);
+	float ObservedMinTurnRadiusCm = 0.0f;
 	if (JnctState.Phase != EJunctionPhase::Idle
 		|| JnctState.ToLane.IsValid()
 		|| JnctState.CanonicalMovementId != 0)
@@ -246,6 +247,7 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 				if (MaxSteerDeg > 1.0f)
 				{
 					VehicleMaxSteerAngleRad = FMath::DegreesToRadians(FMath::Clamp(MaxSteerDeg, 15.0f, 55.0f));
+					ObservedMinTurnRadiusCm = VehicleWheelbaseCm / FMath::Tan(VehicleMaxSteerAngleRad);
 				}
 				UE_LOG(LogAAATraffic, Log,
 					TEXT("VehicleController::OnPossess: Vehicle '%s' Wheelbase=%.1f cm, MaxSteerAngle=%.1f deg"),
@@ -261,8 +263,18 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 		// the sign of the forward vector, giving the corner that
 		// projects furthest forward.  This is orientation-correct
 		// regardless of which world axis the car faces at spawn.
+		//
+		// IMPORTANT: Use the skeletal mesh bounds, NOT GetComponentsBoundingBox().
+		// The full actor AABB includes child-actor seats (DriverSeat, CodriverSeat)
+		// whose physics bodies can be displaced during collisions or pool recycling.
+		// This causes the AABB to grow on each lifecycle (front jumps from ~345cm to
+		// the 1000cm clamp on the second pool reuse), making the vehicle virtually
+		// 10m long and unable to navigate junction curves.
 		{
-			const FBox ActorBounds = InPawn->GetComponentsBoundingBox(/*bNonColliding=*/ false);
+			USkeletalMeshComponent* ExtentMesh = InPawn->FindComponentByClass<USkeletalMeshComponent>();
+			const FBox ActorBounds = ExtentMesh
+				? ExtentMesh->Bounds.GetBox()
+				: InPawn->GetComponentsBoundingBox(/*bNonColliding=*/ false);
 			if (ActorBounds.IsValid)
 			{
 				const FVector ActorOrigin = InPawn->GetActorLocation();
@@ -305,6 +317,36 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 			UE_LOG(LogAAATraffic, Log,
 				TEXT("VehicleController::OnPossess: Vehicle '%s' front=%.1f rear=%.1f halfWidth=%.1f cm"),
 				*InPawn->GetName(), VehicleFrontExtent, VehicleRearExtent, VehicleLateralHalfWidth);
+
+			if (UWorld* World = GetWorld())
+			{
+				if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
+				{
+					if (ITrafficRoadProvider* Provider = TrafficSub->GetProvider())
+					{
+						const float CompiledFleetHalfWidthCm = Provider->GetFleetMaxHalfWidthCm();
+						const float CompiledFleetMinTurnRadiusCm = Provider->GetFleetMinTurnRadiusCm();
+						if (CompiledFleetHalfWidthCm > 0.0f
+							&& VehicleLateralHalfWidth > CompiledFleetHalfWidthCm + 1.0f)
+						{
+							UE_LOG(LogAAATraffic, Warning,
+								TEXT("VehicleController::OnPossess: Vehicle '%s' halfWidth=%.1f cm exceeds compiled fleet MaxHalfWidth=%.1f cm"),
+								*InPawn->GetName(),
+								VehicleLateralHalfWidth,
+								CompiledFleetHalfWidthCm);
+						}
+						if (CompiledFleetMinTurnRadiusCm > 0.0f
+							&& ObservedMinTurnRadiusCm > CompiledFleetMinTurnRadiusCm + 1.0f)
+						{
+							UE_LOG(LogAAATraffic, Warning,
+								TEXT("VehicleController::OnPossess: Vehicle '%s' minTurnRadius=%.1f cm exceeds compiled fleet MinTurnRadius=%.1f cm"),
+								*InPawn->GetName(),
+								ObservedMinTurnRadiusCm,
+								CompiledFleetMinTurnRadiusCm);
+						}
+					}
+				}
+			}
 		}
 
 		// --- Neutralize marketplace BP physics-optimization parking ---

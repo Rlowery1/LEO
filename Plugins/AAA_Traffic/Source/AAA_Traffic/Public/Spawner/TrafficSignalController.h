@@ -117,10 +117,14 @@ public:
 	 * Check if a given lane has a green signal right now.
 	 * When ControlMode is Signal: checks phase groups or legacy phase.
 	 * When ControlMode is StopSign/FlashingRed: always returns false (vehicles must stop).
-	 * When ControlMode is Yield: always returns false (vehicles must slow/check occupancy).
+	 * When ControlMode is Yield: returns true for priority (through-road) lanes,
+	 *   false for non-priority (side-street) lanes.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Traffic|Signal")
 	bool IsLaneGreen(const FTrafficLaneHandle& Lane) const;
+
+	/** Returns true if this lane has through-road priority at this junction. */
+	bool IsLanePriority(const FTrafficLaneHandle& Lane) const { return PriorityLaneIds.Contains(Lane.HandleId); }
 
 	/**
 	 * Check if a given lane has a protected green arrow right now.
@@ -197,6 +201,14 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Signal", meta = (ClampMin = "0.5", EditCondition = "ControlMode == EJunctionControlMode::StopSign || ControlMode == EJunctionControlMode::FlashingRed"))
 	float StopSignWaitTimeSec;
+
+	/**
+	 * Lane HandleIds that have through-road priority at this junction.
+	 * In Yield mode, priority lanes are always green (traffic flows without
+	 * stopping). Non-priority lanes must yield via gap acceptance.
+	 * Populated by PlaceAutoSignals via through-arm detection.
+	 */
+	TSet<int32> PriorityLaneIds;
 
 	/** When true (non-Shipping builds), draws a sphere at this signal's location colored by the current phase. Has no effect in Shipping. */
 	UPROPERTY(EditAnywhere, Category = "Traffic|Debug")

@@ -180,6 +180,21 @@ struct FVehicleJunctionState
 	bool IsEngaged() const { return Phase >= EJunctionPhase::Waiting && Phase <= EJunctionPhase::Traversing; }
 };
 
+/** Read-only snapshot of vehicle diagnostic state for automation tests. */
+struct FVehicleDiagnosticSnapshot
+{
+	EJunctionPhase JunctionPhase = EJunctionPhase::Idle;
+	float CollisionBrakeTimer = 0.0f;
+	float FlipTimeAccumulator = 0.0f;
+	bool bStuckRecoveryActive = false;
+	bool bPendingRecoveryDespawn = false;
+	float StuckTimeAccumulator = 0.0f;
+	/** True when the most recent collision was with another Pawn (vehicle-vehicle). */
+	bool bCollisionWithVehicle = false;
+	/** Distance from vehicle to nearest junction curve point (cm). 0 if not traversing. */
+	float JunctionCurveDistanceCm = 0.0f;
+};
+
 /**
  * AI controller that drives a Chaos vehicle along a lane
  * obtained from an ITrafficRoadProvider adapter.
@@ -232,6 +247,21 @@ public:
 
 	/** Get the cached lane width (cm). */
 	float GetLaneWidth() const { return LaneWidth; }
+
+	/** Snapshot of internal diagnostic state for automation tests. */
+	FVehicleDiagnosticSnapshot GetDiagnosticSnapshot() const
+	{
+		FVehicleDiagnosticSnapshot S;
+		S.JunctionPhase = JnctState.Phase;
+		S.CollisionBrakeTimer = CollisionBrakeTimer;
+		S.FlipTimeAccumulator = FlipTimeAccumulator;
+		S.bStuckRecoveryActive = bStuckRecoveryActive;
+		S.bPendingRecoveryDespawn = bPendingRecoveryDespawn;
+		S.StuckTimeAccumulator = StuckTimeAccumulator;
+		S.bCollisionWithVehicle = bCollisionWithVehicle;
+		S.JunctionCurveDistanceCm = LastDiagJunctionCurveDistanceCm;
+		return S;
+	}
 
 	/**
 	 * Configure lane-change behavior from spawner aggression slider (0-1).
@@ -359,6 +389,7 @@ private:
 	float LastDiagPredictiveCurveDistCm = 0.0f;
 	float LastDiagPredictiveCurveSpeedCmPerSec = 0.0f;
 	bool bLastDiagFollowingJunctionCurve = false;
+	float LastDiagJunctionCurveDistanceCm = 0.0f;
 
 	/**
 	 * Pick a junction exit using the centralized surveyor table.
@@ -817,8 +848,22 @@ protected:
 	float FlipTimeAccumulator = 0.0f;
 
 	/** Accumulated seconds the vehicle has been continuously stuck.
-	 *  After StuckDespawnTimeSec, the vehicle is safety-despawned. */
+	 *  After StuckRecoveryTimeSec, recovery is attempted (reverse + counter-steer).
+	 *  After StuckDespawnTimeSec, the vehicle is safety-despawned if recovery failed. */
 	float StuckTimeAccumulator = 0.0f;
+
+	/** True while the vehicle is actively attempting stuck recovery
+	 *  (reversing + counter-steering). Reset when recovery succeeds or
+	 *  despawn fires. */
+	bool bStuckRecoveryActive = false;
+
+	/** True after a recovery attempt produced only a micro-move (<50 cm).
+	 *  Prevents re-triggering recovery — the timer keeps counting toward
+	 *  the despawn threshold instead, breaking infinite wiggle loops. */
+	bool bStuckRecoveryExhausted = false;
+
+	/** Elapsed time in the current recovery attempt. */
+	float StuckRecoveryElapsed = 0.0f;
 
 	/** Accumulated seconds the vehicle has been severely off-road (CTE > 250%
 	 *  of half-lane) while nearly stopped. Fires regardless of junction phase
@@ -831,6 +876,9 @@ protected:
 
 	/** Remaining seconds of full-braking forced by the reactive collision handler. */
 	float CollisionBrakeTimer = 0.0f;
+
+	/** True when the most recent collision was with another Pawn (vehicle-vehicle). */
+	bool bCollisionWithVehicle = false;
 
 	// ── IDM Runtime State ───────────────────────────────────
 
@@ -865,8 +913,14 @@ protected:
 	static constexpr float FlipDespawnTimeSec = 1.5f;
 
 	/** Seconds a vehicle must be continuously stuck before despawn.
-	 *  5.0 s is a generous grace period for temporary stops. */
-	static constexpr float StuckDespawnTimeSec = 5.0f;
+	 *  Recovery is attempted first at StuckRecoveryTimeSec. */
+	static constexpr float StuckDespawnTimeSec = 7.0f;
+
+	/** Seconds before attempting reverse + counter-steer recovery. */
+	static constexpr float StuckRecoveryTimeSec = 2.0f;
+
+	/** Maximum seconds to spend in recovery (reverse) before giving up. */
+	static constexpr float StuckRecoveryDurationSec = 2.5f;
 
 	/**
 	 * Seed for deterministic random decisions.

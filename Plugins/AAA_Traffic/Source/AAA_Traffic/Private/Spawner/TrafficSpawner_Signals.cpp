@@ -96,6 +96,85 @@ void ATrafficSpawner::PlaceAutoSignals(UWorld* World, ITrafficRoadProvider* Prov
 		}
 		const int32 ApproachArmCount = ApproachArmDirs.Num();
 
+		// ── Through-arm detection ──────────────────────────────────────
+		// A "through-arm" is an approach direction that has at least one
+		// exit continuing roughly straight (dot > 0.7).  Through-arms
+		// represent a road that passes THROUGH the junction — its traffic
+		// should flow without stopping.  Arms that only have turning exits
+		// are "minor arms" (side streets) that must yield.
+		//
+		// This single heuristic handles loops, T-junctions, highway
+		// merges, feeder streets, and any topology where one road has
+		// continuity through the junction and others branch off.
+		TSet<int32> ThroughLaneIds;
+		TSet<int32> ThroughArmIndices;
+
+		for (const FTrafficLaneHandle& JLane : Lanes)
+		{
+			const float JLaneLen = Provider->GetLaneLength(JLane);
+			const FVector ApproachEndDir = Provider->GetLaneDirectionAtDistance(JLane, JLaneLen);
+
+			TArray<FTrafficLaneHandle> Exits = Provider->GetConnectedLanes(JLane);
+			bool bHasStraightExit = false;
+			for (const FTrafficLaneHandle& Exit : Exits)
+			{
+				const FVector ExitDir = Provider->GetLaneDirection(Exit);
+				if (FVector::DotProduct(ApproachEndDir, ExitDir) > 0.7f)
+				{
+					bHasStraightExit = true;
+					break;
+				}
+			}
+
+			if (bHasStraightExit)
+			{
+				ThroughLaneIds.Add(JLane.HandleId);
+
+				// Match this lane to its approach arm for arm-level counting.
+				const FVector LaneStartDir = Provider->GetLaneDirection(JLane);
+				for (int32 ArmIdx = 0; ArmIdx < ApproachArmDirs.Num(); ++ArmIdx)
+				{
+					if (FVector::DotProduct(LaneStartDir, ApproachArmDirs[ArmIdx]) > 0.7f)
+					{
+						ThroughArmIndices.Add(ArmIdx);
+						break;
+					}
+				}
+			}
+		}
+
+		const bool bHasThroughArms = ThroughArmIndices.Num() > 0;
+		const bool bAllArmsThrough = (ThroughArmIndices.Num() >= ApproachArmCount);
+
+		// ── Loop-road-minor partitioning ───────────────────────────────
+		// Check which junction lanes belong to closed-loop roads vs
+		// non-loop (straight) roads.  When a junction connects both,
+		// the loop is treated as the minor road per US residential
+		// loop-road design standards.
+		TArray<int32> LoopMinorLaneIds;
+		TArray<int32> NonLoopLaneIds;
+		for (const FTrafficLaneHandle& JLane : Lanes)
+		{
+			const FTrafficRoadHandle Road = Provider->GetRoadForLane(JLane);
+			if (Provider->IsRoadClosedLoop(Road))
+			{
+				LoopMinorLaneIds.Add(JLane.HandleId);
+			}
+			else
+			{
+				NonLoopLaneIds.Add(JLane.HandleId);
+			}
+		}
+		const bool bHasLoopMinor = (LoopMinorLaneIds.Num() > 0 && NonLoopLaneIds.Num() > 0);
+
+		if (bSignalDiag)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("SIGNAL-DIAG: JunctionId=%d ThroughArms=%d/%d ThroughLanes=%d HasThrough=%s AllThrough=%s"),
+				JId, ThroughArmIndices.Num(), ApproachArmCount, ThroughLaneIds.Num(),
+				bHasThroughArms ? TEXT("Y") : TEXT("N"), bAllArmsThrough ? TEXT("Y") : TEXT("N"));
+		}
+
 		// First, check for roundabout topology: if a junction's internal
 		// lanes form a cycle (can follow connected lanes back to the start),
 		// it's a roundabout. Roundabouts use Yield mode — entering traffic

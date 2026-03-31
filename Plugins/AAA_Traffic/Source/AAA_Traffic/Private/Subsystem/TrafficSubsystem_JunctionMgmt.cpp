@@ -190,19 +190,20 @@ namespace
 			return false;
 		}
 
-		if (!Rule.bPhysicallyFeasible)
-		{
-			OutFailureReason = TEXT("survey marked movement physically infeasible");
-			return false;
-		}
+		// NOTE: Infeasible movements are still compiled so their
+		// corridor curves exist.  Weight=0 and bPhysicallyFeasible=false
+		// are preserved in the record; runtime selection skips them when
+		// better options exist but can fall back to them (via the
+		// ALL-CULLED orphan-prevention path) to prevent junction deadlock.
 
-		TArray<FVector> ApproachPoints;
+		TArray<FVector> ApproachJunctionPoints;
 		TArray<FVector> ExitPoints;
-		float ApproachWidthCm = 0.0f;
+		float ApproachJunctionWidthCm = 0.0f;
 		float ExitWidthCm = 0.0f;
-		if (!Provider->GetLanePath(ApproachLane, ApproachPoints, ApproachWidthCm) || ApproachPoints.Num() < 2)
+		if (!Provider->GetLanePath(ApproachJunctionLane, ApproachJunctionPoints, ApproachJunctionWidthCm)
+			|| ApproachJunctionPoints.Num() < 2)
 		{
-			OutFailureReason = TEXT("approach lane path unavailable");
+			OutFailureReason = TEXT("approach junction lane path unavailable");
 			return false;
 		}
 		if (!Provider->GetLanePath(Rule.ExitLane, ExitPoints, ExitWidthCm) || ExitPoints.Num() < 2)
@@ -222,12 +223,16 @@ namespace
 		OutRecord.bLegallyAllowed = true;
 		OutRecord.bPhysicallyFeasible = Rule.bPhysicallyFeasible;
 
+		// Use the approach free lane (not the junction segment) as the
+		// curve origin so P0 = junction ENTRY point.  Using the junction
+		// segment would place P0 at its far end, producing corner-hugging
+		// curves that form a pinwheel instead of proper through-centre arcs.
 		bool bHasProviderPath = Provider->GetJunctionPath(ApproachLane, Rule.ExitLane, OutRecord.CorridorPoints)
 			&& OutRecord.CorridorPoints.Num() >= 2;
 		if (!bHasProviderPath)
 		{
 			OutRecord.CorridorPoints.Reset();
-			OutRecord.CorridorPoints.Add(ApproachPoints.Last());
+			OutRecord.CorridorPoints.Add(ApproachJunctionPoints[0]);
 			OutRecord.CorridorPoints.Add(ExitPoints[0]);
 			OutRecord.SourceKind = ECanonicalMovementSourceKind::SynthesizedDuringCompile;
 		}
@@ -245,8 +250,12 @@ namespace
 
 		OutRecord.CorridorEntryPoint = OutRecord.CorridorPoints[0];
 		OutRecord.CorridorExitPoint = OutRecord.CorridorPoints.Last();
-		OutRecord.EntryLaneAttachIndex = FindNearestPolylineIndex(ApproachPoints, OutRecord.CorridorEntryPoint);
-		OutRecord.ExitLaneAttachIndex = FindNearestPolylineIndex(ExitPoints, OutRecord.CorridorExitPoint);
+		OutRecord.EntryLaneAttachIndex = FindNearestPolylineIndex(
+			OutRecord.CorridorPoints,
+			ApproachJunctionPoints[0]);
+		OutRecord.ExitLaneAttachIndex = FindNearestPolylineIndex(
+			OutRecord.CorridorPoints,
+			ExitPoints[0]);
 		if (OutRecord.EntryLaneAttachIndex == INDEX_NONE)
 		{
 			OutFailureReason = TEXT("entry attach index unresolved");
@@ -415,12 +424,31 @@ bool UTrafficSubsystem::TryOccupyJunction(int32 JunctionId,
 			const float EnteringVehicleLengthCm = FMath::Max(
 				Controller->VehicleFrontExtent + Controller->VehicleRearExtent,
 				450.0f);
-			const float RequiredExitClearanceCm = FMath::Max(500.0f, EnteringVehicleLengthCm + 250.0f);
+			float RequiredExitClearanceCm = FMath::Max(500.0f, EnteringVehicleLengthCm + 250.0f);
+
+			// Cap clearance to 60% of exit lane length so short lanes
+			// don't create impossible requirements that deadlock traffic.
+			if (Provider)
+			{
+				const float ExitLaneLen = Provider->GetLaneLength(ToLane);
+				if (ExitLaneLen > 0.0f)
+				{
+					RequiredExitClearanceCm = FMath::Min(RequiredExitClearanceCm, ExitLaneLen * 0.6f);
+				}
+			}
 
 			for (const TWeakObjectPtr<ATrafficVehicleController>& VC : *ExitVehicles)
 			{
 				ATrafficVehicleController* ExitController = VC.Get();
 				if (!ExitController || ExitController == Controller)
+				{
+					continue;
+				}
+
+				// Skip vehicles still executing a junction curve — they are
+				// in the junction box, not truly on the exit lane yet.
+				// Conflict safety is already handled by the movement check above.
+				if (ExitController->JnctState.TransitionPoints.Num() > 0)
 				{
 					continue;
 				}
@@ -732,6 +760,17 @@ void UTrafficSubsystem::BuildJunctionSurvey()
 	JunctionExitRules.Empty();
 	ResetCanonicalMovementTable();
 
+	const float FleetMinTurnRadiusCm = Provider->GetFleetMinTurnRadiusCm();
+	const float FleetMaxHalfWidthCm = Provider->GetFleetMaxHalfWidthCm();
+	const bool bFleetConstraintsKnown = FleetMinTurnRadiusCm > 0.0f;
+	if (bFleetConstraintsKnown)
+	{
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("SURVEY: Using fleet constraints — MinTurnRadius=%.0f cm MaxHalfWidth=%.0f cm"),
+			FleetMinTurnRadiusCm,
+			FleetMaxHalfWidthCm);
+	}
+
 	// Discover all junctions in the road network.
 	// Walk every road → every lane → GetJunctionForLane to find junction IDs.
 	TSet<int32> JunctionIds;
@@ -958,34 +997,41 @@ void UTrafficSubsystem::BuildJunctionSurvey()
 
 				// --- Filter 4: Physical feasibility (junction path turn radius) ---
 				// The curve generator already widens tight curves via tangent
-				// scaling. This gate only rejects turns that are STILL too tight
-				// after widening — i.e. genuinely impossible geometry.
-				// Use a conservative threshold (200cm) well below the vehicle's
-				// physical minimum (~400cm) to avoid false positives that would
-				// leave vehicles with no routes at small intersections.
+				// scaling.  This gate uses a PERMISSIVE fixed threshold to
+				// reject only genuinely impossible geometry (e.g. hairpin
+				// U-turns on narrow roads).  Fleet-specific constraints are
+				// logged as diagnostics but NOT used for hard filtering —
+				// vehicles navigate junctions at low speed where achievable
+				// turn radii are much tighter than the high-speed geometric
+				// minimum.  Runtime per-vehicle decisions will handle the
+				// speed/radius tradeoff.
 				bool bPhysicallyFeasible = true;
 				{
 					TArray<FVector> JunctionPath;
 					if (Provider->GetJunctionPath(Approach, Exit, JunctionPath) && JunctionPath.Num() >= 3)
 					{
 						const float MeasuredMinRadius = ComputeMinTurnRadiusCm(JunctionPath);
-
-						// 200cm is roughly half the vehicle's min turning radius.
-						// Turns this tight are genuinely impossible even at a crawl.
-						// Orphan-prevention below ensures that if this is the ONLY
-						// exit for the approach, it stays alive to prevent a
-						// network-wide reachability cascade.
-						constexpr float HardInfeasibleRadiusCm = 200.0f;
+						constexpr float HardInfeasibleRadiusCm = 100.0f;
 
 						if (MeasuredMinRadius > 0.0f && MeasuredMinRadius < HardInfeasibleRadiusCm)
 						{
 							bPhysicallyFeasible = false;
-							if (GTrafficJunctionDiagnostics >= 1)
-							{
-								UE_LOG(LogAAATraffic, Log,
-									TEXT("SURVEY:   Approach=%d Exit=%d INFEASIBLE (MeasuredMinR=%.0f < HardLimit=%.0f)"),
-									Approach.HandleId, Exit.HandleId, MeasuredMinRadius, HardInfeasibleRadiusCm);
-							}
+							UE_LOG(LogAAATraffic, Log,
+								TEXT("SURVEY:   Approach=%d Exit=%d INFEASIBLE (MeasuredMinR=%.0f < HardLimit=%.0f)"),
+								Approach.HandleId,
+								Exit.HandleId,
+								MeasuredMinRadius,
+								HardInfeasibleRadiusCm);
+						}
+						else if (bFleetConstraintsKnown && MeasuredMinRadius > 0.0f
+							&& MeasuredMinRadius < FleetMinTurnRadiusCm)
+						{
+							UE_LOG(LogAAATraffic, Log,
+								TEXT("SURVEY:   Approach=%d Exit=%d TIGHT (MeasuredMinR=%.0f < FleetMin=%.0f) — admitted, runtime will manage speed"),
+								Approach.HandleId,
+								Exit.HandleId,
+								MeasuredMinRadius,
+								FleetMinTurnRadiusCm);
 						}
 					}
 				}

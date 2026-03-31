@@ -308,11 +308,12 @@ void FLaneTransitionEngine::CheckTransition()
 	}
 	else if (bJunctionRouteAuthorityActive && Owner->JnctState.ToLane.IsValid())
 	{
-		UE_LOG(LogAAATraffic, Error,
-			TEXT("JNCT ROUTE-CONTRACT: Pawn='%s' cached exit %d exists during active junction routing without canonical movement authority -- discarding stale cached exit"),
+		// Canonical authority exists but has no valid movement — keep the
+		// cached exit so the vehicle can still navigate via the Rules table.
+		UE_LOG(LogAAATraffic, Warning,
+			TEXT("JNCT ROUTE-FALLBACK: Pawn='%s' cached exit %d exists without canonical movement authority — keeping for Rules-based fallback"),
 			Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
 			Owner->JnctState.ToLane.HandleId);
-		Owner->JnctState.ToLane = FTrafficLaneHandle();
 	}
 
 	if (SelectedCanonicalMovement
@@ -462,54 +463,25 @@ void FLaneTransitionEngine::CheckTransition()
 			const bool bFeederLane = SelectedCanonicalMovement
 				&& SelectedCanonicalMovement->IsValid()
 				&& SelectedCanonicalMovement->FromLane.HandleId != Owner->CurrentLane.HandleId;
-			if (!bFeederLane)
+			if (bFeederLane)
 			{
-				// Accumulate stuck timer — if the vehicle has been stuck at
-				// lane-end with no canonical route for too long, request
-				// despawn instead of spamming errors every frame.
-				const float DeltaSec = Owner->GetWorld()
-					? Owner->GetWorld()->GetDeltaSeconds() : 0.016f;
-				Owner->NoRouteStuckTimer += DeltaSec;
-
-				if (Owner->NoRouteStuckTimer >= Owner->NoRouteDespawnDelaySec)
-				{
-					UE_LOG(LogAAATraffic, Warning,
-						TEXT("JNCT ROUTE-CONTRACT-DESPAWN: Pawn='%s' JunctionId=%d Lane=%d — stuck for %.1fs with no canonical route, requesting despawn"),
-						Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
-						Owner->JnctState.JunctionId,
-						Owner->CurrentLane.HandleId,
-						Owner->NoRouteStuckTimer);
-					if (UTrafficSubsystem* DespawnSub = Owner->GetWorld()
-						? Owner->GetWorld()->GetSubsystem<UTrafficSubsystem>() : nullptr)
-					{
-						DespawnSub->RequestDespawn(Owner, TEXT("NoCanonicalRoute"));
-					}
-					Owner->bAtDeadEnd = true;
-					Owner->FlushLaneDecisionTrace(TEXT("RouteContractDespawn"), true);
-					return;
-				}
-
-				UE_LOG(LogAAATraffic, Error,
-					TEXT("JNCT ROUTE-CONTRACT: Pawn='%s' JunctionId=%d reached transition-time selection on lane %d without a consumable canonical route -- blocking transition (stuck %.1fs/%.1fs)"),
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("JNCT FEEDER-PASSTHROUGH: Pawn='%s' Lane=%d FromLane=%d — allowing normal transition toward approach"),
+					Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+					Owner->CurrentLane.HandleId,
+					SelectedCanonicalMovement->FromLane.HandleId);
+			}
+			else
+			{
+				// Canonical authority is active but no exit was preselected.
+				// Fall through to PickSurveyedExit which will try the Rules
+				// table as a fallback instead of blocking the transition.
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JNCT ROUTE-FALLBACK: Pawn='%s' JunctionId=%d Lane=%d — no canonical route consumed, falling through to surveyor pick"),
 					Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
 					Owner->JnctState.JunctionId,
-					Owner->CurrentLane.HandleId,
-					Owner->NoRouteStuckTimer,
-					Owner->NoRouteDespawnDelaySec);
-				Owner->AddLaneDecisionTrace(TEXT("TransitionCheck.RouteContractBlocked"),
-					0,
-					static_cast<float>(Owner->JnctState.JunctionId),
-					0.0f,
-					TEXT("Blocked transition-time repick while canonical route authority is active"));
-				Owner->FlushLaneDecisionTrace(TEXT("RouteContractBlocked"), true);
-				return;
+					Owner->CurrentLane.HandleId);
 			}
-
-			UE_LOG(LogAAATraffic, Log,
-				TEXT("JNCT FEEDER-PASSTHROUGH: Pawn='%s' Lane=%d FromLane=%d — allowing normal transition toward approach"),
-				Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
-				Owner->CurrentLane.HandleId,
-				SelectedCanonicalMovement->FromLane.HandleId);
 		}
 
 		NextLane = Owner->PickSurveyedExit(Owner->CurrentLane, Connected);
@@ -715,18 +687,100 @@ void FLaneTransitionEngine::CheckTransition()
 			0,
 			FMath::Max(CanonicalMovement->CorridorPoints.Num() - 1, 0));
 		Owner->JnctState.bTransitionPathFromProvider = CanonicalMovement->SourceKind == ECanonicalMovementSourceKind::ProviderDerived;
+		Owner->JnctState.TransitionIndex = Owner->JnctState.CurveStartIndex;
+
+		// Snap TransitionIndex to the nearest curve point so that
+		// TURN-BYPASS re-entries (where the vehicle is past the original
+		// CurveStartIndex) don't stall the advancement loop.
+		if (const APawn* P = Owner->GetPawn())
+		{
+			const FVector Loc = P->GetActorLocation();
+			const int32 Num = Owner->JnctState.TransitionPoints.Num();
+			int32 BestIdx = Owner->JnctState.CurveStartIndex;
+			float BestDistSq = FVector::DistSquared(Loc, Owner->JnctState.TransitionPoints[BestIdx]);
+			for (int32 Idx = BestIdx + 1; Idx < Num; ++Idx)
+			{
+				const float DSq = FVector::DistSquared(Loc, Owner->JnctState.TransitionPoints[Idx]);
+				if (DSq < BestDistSq)
+				{
+					BestDistSq = DSq;
+					BestIdx = Idx;
+				}
+			}
+			Owner->JnctState.TransitionIndex = BestIdx;
+		}
+	}
+
+	// ── Entry validation ─────────────────────────────────────
+	// Reject junction curve entry if the vehicle is backward (heading
+	// >90° from curve tangent) OR too far from the curve (snap
+	// distance > 600 cm).  Either case means the vehicle cannot
+	// follow the curve and would cause chaotic collisions.
+	if (Owner->JnctState.TransitionPoints.Num() >= 2)
+	{
+		const int32 SnapIdx = Owner->JnctState.TransitionIndex;
+		if (SnapIdx < Owner->JnctState.TransitionPoints.Num() - 1)
+		{
+			const FVector CurveTangent = (Owner->JnctState.TransitionPoints[SnapIdx + 1]
+				- Owner->JnctState.TransitionPoints[SnapIdx]).GetSafeNormal2D();
+			const FVector VehicleFwd = Owner->GetPawn()->GetActorForwardVector();
+			const float HeadingDot = FVector::DotProduct(
+				FVector(VehicleFwd.X, VehicleFwd.Y, 0.0f).GetSafeNormal(), CurveTangent);
+			const float SnapDist = FVector::Dist(
+				Owner->GetPawn()->GetActorLocation(),
+				Owner->JnctState.TransitionPoints[SnapIdx]);
+
+			constexpr float MaxSnapDistCm = 600.0f;
+			if (HeadingDot < 0.0f || SnapDist > MaxSnapDistCm)
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("Junction curve entry aborted — heading dot %.2f, snap dist %.0f cm. Despawning. Pawn=%s Jnct=%d"),
+					HeadingDot, SnapDist,
+					Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("null"),
+					Owner->JnctState.JunctionId);
+
+				Owner->bPendingRecoveryDespawn = true;
+				if (UWorld* W = Owner->GetWorld())
+				{
+					if (UTrafficSubsystem* Sub = W->GetSubsystem<UTrafficSubsystem>())
+					{
+						Sub->RequestDespawn(Owner,
+							FString::Printf(TEXT("bad junction curve entry (dot=%.2f dist=%.0f)"),
+								HeadingDot, SnapDist));
+					}
+				}
+				return;
+			}
+		}
 	}
 
 	if (Owner->JnctState.TransitionPoints.Num() >= 3)
 	{
-		const int32 CurveStart = FMath::Clamp(Owner->JnctState.CurveStartIndex, 0, Owner->JnctState.TransitionPoints.Num() - 3);
+		const int32 CurveStart = Owner->JnctState.CurveStartIndex;
 		float TotalAngleDeg = 0.0f;
 		float TotalArcLength = 0.0f;
+		float MinTurnRadius = TNumericLimits<float>::Max();
 		for (int32 i = CurveStart + 1; i < Owner->JnctState.TransitionPoints.Num() - 1; ++i)
 		{
 			const FVector Seg0 = Owner->JnctState.TransitionPoints[i] - Owner->JnctState.TransitionPoints[i - 1];
 			const FVector Seg1 = Owner->JnctState.TransitionPoints[i + 1] - Owner->JnctState.TransitionPoints[i];
 			TotalArcLength += Seg0.Size();
+			const float CrossMag = FMath::Abs(FVector::CrossProduct(Seg0, Seg1).Z);
+			if (CrossMag > KINDA_SMALL_NUMBER)
+			{
+				const float ChordLength = FVector::Dist(
+					Owner->JnctState.TransitionPoints[i - 1],
+					Owner->JnctState.TransitionPoints[i + 1]);
+				const float Numerator = Seg0.Size() * Seg1.Size() * ChordLength;
+				if (Numerator > KINDA_SMALL_NUMBER)
+				{
+					const float RadiusCm = Numerator / (2.0f * CrossMag);
+					if (RadiusCm > 0.0f)
+					{
+						MinTurnRadius = FMath::Min(MinTurnRadius, RadiusCm);
+					}
+				}
+			}
 			const FVector Dir0 = Seg0.GetSafeNormal();
 			const FVector Dir1 = Seg1.GetSafeNormal();
 			if (!Dir0.IsNearlyZero() && !Dir1.IsNearlyZero())
@@ -737,10 +791,13 @@ void FLaneTransitionEngine::CheckTransition()
 		}
 		TotalArcLength += (Owner->JnctState.TransitionPoints.Last() - Owner->JnctState.TransitionPoints[Owner->JnctState.TransitionPoints.Num() - 2]).Size();
 		const float TotalAngleRad = FMath::DegreesToRadians(FMath::Max(TotalAngleDeg, 1.0f));
-		const float TurnRadius = FMath::Max(TotalArcLength / TotalAngleRad, 50.0f);
+		const float AvgTurnRadius = FMath::Max(TotalArcLength / TotalAngleRad, 50.0f);
+		const float TurnRadius = MinTurnRadius == TNumericLimits<float>::Max()
+			? AvgTurnRadius
+			: MinTurnRadius;
 
 		UE_LOG(LogAAATraffic, Warning,
-			TEXT("JNCT PATH-PROFILE: Pawn='%s' JunctionId=%d Path=%s From=%d To=%d Pts=%d CurveStart=%d Arc=%.0f Angle=%.1f R=%.0f"),
+			TEXT("JNCT PATH-PROFILE: Pawn='%s' JunctionId=%d Path=%s From=%d To=%d Pts=%d CurveStart=%d Arc=%.0f Angle=%.1f AvgR=%.0f MinR=%.0f"),
 			Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
 			Owner->JnctState.JunctionId,
 			Owner->JnctState.bTransitionPathFromProvider ? TEXT("PROVIDER") : TEXT("SYNTH"),
@@ -750,6 +807,7 @@ void FLaneTransitionEngine::CheckTransition()
 			Owner->JnctState.CurveStartIndex,
 			TotalArcLength,
 			TotalAngleDeg,
+			AvgTurnRadius,
 			TurnRadius);
 	}
 

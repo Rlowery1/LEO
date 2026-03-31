@@ -126,6 +126,9 @@ void URoadBLDReflectionProvider::Deinitialize()
 	CachedIntersectionMasks.Empty();
 	IntersectionGroupCentroids.Empty();
 	RoadTotalWidthMap.Empty();
+	RoadClassificationMap.Empty();
+	FleetMinTurnRadiusCm = 0.0f;
+	FleetMaxHalfWidthCm = 100.0f;
 	bCached = false;
 
 	DynRoadClass = nullptr;
@@ -193,13 +196,33 @@ void URoadBLDReflectionProvider::OnWorldBeginPlay(UWorld& InWorld)
 
 	if (!bCached || RoadHandleMap.IsEmpty())
 	{
-		UE_LOG(LogAAATraffic, Warning,
-			TEXT("RoadBLDReflectionProvider: No roads found — provider will NOT register."));
+		// WorldPartition may not have streamed DynamicRoad actors yet.
+		// Schedule a deferred retry on the next tick.
+		if (DeferredDiscoveryRetryCount < 5)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("RoadBLDReflectionProvider: No roads found (attempt %d) — scheduling deferred retry."),
+				DeferredDiscoveryRetryCount + 1);
+			if (UWorld* World = GetWorld())
+			{
+				World->GetTimerManager().SetTimerForNextTick(
+					FTimerDelegate::CreateUObject(this, &URoadBLDReflectionProvider::DeferredRoadDiscovery));
+			}
+		}
+		else
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("RoadBLDReflectionProvider: No roads found after %d attempts — provider will NOT register."),
+				DeferredDiscoveryRetryCount);
+		}
 		return;
 	}
 
 	// ── Detect reversed lanes on 2-way roads ─────────────────────
 	RunDiagPhase(TEXT("DetectReversedLanes"), [&]() { DetectReversedLanes(); });
+
+	// ── Detect closed-loop roads (start ≈ end) ───────────────────
+	RunDiagPhase(TEXT("DetectClosedLoopRoads"), [&]() { DetectClosedLoopRoads(); });
 
 	// ── Build same-road lane adjacency (left/right neighbors) ────
 	RunDiagPhase(TEXT("BuildLaneAdjacency"), [&]() { BuildLaneAdjacency(); });
@@ -242,6 +265,76 @@ void URoadBLDReflectionProvider::OnWorldBeginPlay(UWorld& InWorld)
 			RoadHandleMap.Num(), LaneHandleMap.Num());
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Deferred road discovery retry — handles WorldPartition late-loading.
+// When OnWorldBeginPlay fires before DynamicRoad actors are streamed in,
+// this retries CacheRoadData on the next tick.  If roads are found, it runs
+// the full initialization sequence and registers with TrafficSubsystem.
+// ---------------------------------------------------------------------------
+
+void URoadBLDReflectionProvider::DeferredRoadDiscovery()
+{
+	++DeferredDiscoveryRetryCount;
+
+	UWorld* World = GetWorld();
+	if (!World) { return; }
+
+	// Reset cache state so CacheRoadData can run fresh.
+	bCached = false;
+	RoadHandleMap.Reset();
+	LaneHandleMap.Reset();
+	LaneToHandleMap.Reset();
+	RoadToLaneHandles.Reset();
+	LaneToRoadHandleMap.Reset();
+
+	CacheRoadData(World);
+
+	if (!bCached || RoadHandleMap.IsEmpty())
+	{
+		if (DeferredDiscoveryRetryCount < 5)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("RoadBLDReflectionProvider: Deferred retry %d — still 0 roads. Will retry next tick."),
+				DeferredDiscoveryRetryCount);
+			World->GetTimerManager().SetTimerForNextTick(
+				FTimerDelegate::CreateUObject(this, &URoadBLDReflectionProvider::DeferredRoadDiscovery));
+		}
+		else
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("RoadBLDReflectionProvider: No roads found after %d attempts — provider will NOT register."),
+				DeferredDiscoveryRetryCount);
+		}
+		return;
+	}
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("RoadBLDReflectionProvider: Deferred retry %d found %d roads — running full initialization."),
+		DeferredDiscoveryRetryCount, RoadHandleMap.Num());
+
+	// Run the remaining initialization phases (same as OnWorldBeginPlay).
+	DetectReversedLanes();
+	DetectClosedLoopRoads();
+	BuildLaneAdjacency();
+	CacheLaneEndpoints();
+	BuildLaneConnectivity(World);
+	BuildMaskBasedIntersections(World);
+	DetectAndSplitThroughRoads();
+	BuildProximityConnections();
+	BuildJunctionGrouping();
+	PrecomputeJunctionMap();
+
+	UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>();
+	if (TrafficSub)
+	{
+		TrafficSub->RegisterProvider(this);
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider: Deferred registration complete — %d roads, %d lanes cached."),
+			RoadHandleMap.Num(), LaneHandleMap.Num());
+	}
+}
+
 TArray<FTrafficRoadHandle> URoadBLDReflectionProvider::GetAllRoads()
 {
 	TArray<FTrafficRoadHandle> Result;
