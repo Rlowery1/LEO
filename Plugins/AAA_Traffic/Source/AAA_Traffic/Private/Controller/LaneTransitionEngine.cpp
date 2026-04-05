@@ -141,11 +141,11 @@ void FLaneTransitionEngine::InitializeLane(const FTrafficLaneHandle& InLane)
 		const float LaneSpeedLimit = Provider->GetLaneSpeedLimit(Owner->CurrentLane);
 		if (LaneSpeedLimit > 0.0f)
 		{
-			Owner->TargetSpeed = LaneSpeedLimit;
+			Owner->TargetSpeed = LaneSpeedLimit * Owner->SpeedVariationFactor;
 		}
 		else if (Owner->DefaultSpeedLimit > 0.0f)
 		{
-			Owner->TargetSpeed = Owner->DefaultSpeedLimit;
+			Owner->TargetSpeed = Owner->DefaultSpeedLimit * Owner->SpeedVariationFactor;
 		}
 		if (Owner->BaseTargetSpeed <= 0.0f)
 		{
@@ -708,6 +708,26 @@ void FLaneTransitionEngine::CheckTransition()
 				}
 			}
 			Owner->JnctState.TransitionIndex = BestIdx;
+		}
+
+		// ── Degenerate curve rejection ───────────────────────────
+		// A self-referential provider curve (FromLane == ToLane) traces
+		// along the approach lane itself.  Its tangent direction can
+		// reverse relative to the vehicle's heading, causing false
+		// wrong-way detection via JunctionCurveDirection.
+		// Clear the curve so the vehicle drives through on lane points.
+		if (CanonicalMovement->FromLane.HandleId == CanonicalMovement->ToLane.HandleId)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JNCT DEGENERATE-CURVE-SKIP: Pawn='%s' JunctionId=%d "
+					 "FromLane==%d==ToLane — clearing curve (%d pts) to avoid "
+					 "self-referential traversal"),
+				Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("null"),
+				Owner->JnctState.JunctionId,
+				CanonicalMovement->FromLane.HandleId,
+				Owner->JnctState.TransitionPoints.Num());
+			Owner->JnctState.TransitionPoints.Empty();
+			Owner->JnctState.TransitionIndex = 0;
 		}
 	}
 

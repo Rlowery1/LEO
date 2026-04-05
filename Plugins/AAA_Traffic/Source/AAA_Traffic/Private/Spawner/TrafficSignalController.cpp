@@ -234,19 +234,23 @@ bool ATrafficSignalController::IsLaneGreen(const FTrafficLaneHandle& Lane) const
 {
 	const bool bShouldLog = (GTrafficJunctionDiagnostics >= 2);
 
-	// Non-Signal modes: Yield returns true for priority lanes; others always red.
+	// Yield mode: priority lanes are always green; non-priority must yield.
+	if (ControlMode == EJunctionControlMode::Yield)
+	{
+		const bool bPriority = PriorityLaneIds.Contains(Lane.HandleId);
+		if (bShouldLog)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("SIGNAL IsLaneGreen: Signal='%s' Lane=%d Yield mode — %s"),
+				*GetName(), Lane.HandleId,
+				bPriority ? TEXT("PRIORITY (GREEN)") : TEXT("NON-PRIORITY (RED)"));
+		}
+		return bPriority;
+	}
+
+	// Other non-Signal modes always return false — vehicles must stop.
 	if (ControlMode != EJunctionControlMode::Signal)
 	{
-		if (ControlMode == EJunctionControlMode::Yield && PriorityLaneIds.Contains(Lane.HandleId))
-		{
-			if (bShouldLog)
-			{
-				UE_LOG(LogAAATraffic, Log,
-					TEXT("SIGNAL IsLaneGreen: Signal='%s' Lane=%d ControlMode=Yield — returning GREEN (priority lane)"),
-					*GetName(), Lane.HandleId);
-			}
-			return true;
-		}
 		if (bShouldLog)
 		{
 			UE_LOG(LogAAATraffic, Log,

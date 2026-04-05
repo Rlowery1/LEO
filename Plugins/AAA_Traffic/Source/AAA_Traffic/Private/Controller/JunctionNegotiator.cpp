@@ -98,6 +98,35 @@ bool FJunctionNegotiator::TickApproach(int32 ClosestIndex, float AbsSpeed, float
 			Owner->JnctState.ApproachSpeedLimitCmPerSec = FMath::Sqrt(
 				FMath::Max(2.0f * Owner->ApproachDecelCmPerSec2 * SafeDist, 0.0f));
 
+			// Proximity-conflict junction full-stop: when the junction has
+			// converging exit/approach lanes AND is currently occupied, use
+			// an enlarged margin so the approaching vehicle fully stops
+			// before the lane-overlap zone.  The speed limit is set negative
+			// to signal SpeedEnvelope to bypass its 100 cm/s floor.
+			if (UWorld* ProxWorld = Owner->GetWorld())
+			{
+				if (const UTrafficSubsystem* ProxSub = ProxWorld->GetSubsystem<UTrafficSubsystem>())
+				{
+					const bool bJnctOccupied = ProxSub->IsJunctionOccupied(ScanResult.JunctionId);
+					bool bJnctProximity = false;
+					if (bJnctOccupied)
+					{
+						const TArray<int32>& MvIds = ProxSub->GetCanonicalMovementsForJunction(ScanResult.JunctionId);
+						for (int32 MvId : MvIds)
+						{
+							if (const FCanonicalMovementRecord* Mv = ProxSub->GetCanonicalMovement(MvId))
+							{
+								if (Mv->bHasProximityConflicts) { bJnctProximity = true; break; }
+							}
+						}
+						if (bJnctProximity)
+						{
+							Owner->JnctState.ApproachSpeedLimitCmPerSec = -1.0f;
+						}
+					}
+				}
+			}
+
 			const float AbsSpeedNow = FMath::Abs(CurrentSpeed);
 			bApproachBraking = (AbsSpeedNow > Owner->JnctState.ApproachSpeedLimitCmPerSec + 50.0f) ||
 									   (Owner->JnctState.ApproachDistanceCm < Owner->LookAheadDistance * 3.0f);
@@ -808,11 +837,18 @@ bool FJunctionNegotiator::TickTraverse(const FVector& VehicleLocation, int32 Clo
 	}
 
 	// Advance along junction points based on proximity or forward progress.
+	// Guard: only allow relative-distance advancement when the vehicle is
+	// within meaningful range of the curve.  Without this, a vehicle that
+	// is far from ALL curve points (e.g. at the start of a long approach
+	// lane) can complete the entire curve in a single tick because the
+	// small inter-point spacing makes DistToNextSq < DistToCurrentSq true
+	// for every consecutive pair.
+	constexpr float kMaxRelativeAdvanceDistSq = 1000.0f * 1000.0f; // 10 m
 	while (Owner->JnctState.TransitionIndex < Owner->JnctState.TransitionPoints.Num() - 1)
 	{
 		const float DistToCurrentSq = FVector::DistSquared(VehicleLocation, Owner->JnctState.TransitionPoints[Owner->JnctState.TransitionIndex]);
 		const float DistToNextSq = FVector::DistSquared(VehicleLocation, Owner->JnctState.TransitionPoints[Owner->JnctState.TransitionIndex + 1]);
-		if (DistToCurrentSq < 10000.0f || DistToNextSq < DistToCurrentSq)
+		if (DistToCurrentSq < 10000.0f || (DistToCurrentSq < kMaxRelativeAdvanceDistSq && DistToNextSq < DistToCurrentSq))
 		{
 			++Owner->JnctState.TransitionIndex;
 		}
@@ -831,8 +867,54 @@ bool FJunctionNegotiator::TickTraverse(const FVector& VehicleLocation, int32 Clo
 			if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
 			{
 				CheckJunctionOccupancyContract(TEXT("TickTraverse.EarlyRelease"), Owner->GetPawn(), Owner->JnctState.JunctionId, Owner->JnctState.Phase, Owner->JnctState.bOwnsJunctionOccupancy, TrafficSub, Owner);
-				TrafficSub->ReleaseJunction(Owner->JnctState.JunctionId, Owner);
-				Owner->JnctState.bOwnsJunctionOccupancy = false;
+
+				// Check if exit lane is a short dead-end. On short dead-ends
+				// the vehicle stops inside the junction area before clearing
+				// it, so defer the release to prevent collisions. Long dead-
+				// ends are safe because the vehicle drives away quickly.
+				// Also defer for proximity-conflict movements where approach/
+				// exit lanes are physically close, requiring clearance distance
+				// before another vehicle enters.
+				const FTrafficLaneHandle EarlyExitLane = Owner->JnctState.ToLane;
+				const bool bEarlyExitDeadEnd = EarlyExitLane.IsValid()
+					&& Owner->CachedProvider
+					&& Owner->CachedProvider->GetConnectedLanes(EarlyExitLane).Num() == 0
+					&& Owner->CachedProvider->GetLaneLength(EarlyExitLane) < 2000.0f;
+
+				bool bProximityDefer = false;
+				if (const FCanonicalMovementRecord* MvRec = TrafficSub->GetCanonicalMovement(Owner->JnctState.CanonicalMovementId))
+				{
+					bProximityDefer = MvRec->bHasProximityConflicts;
+				}
+
+				if (bEarlyExitDeadEnd || bProximityDefer)
+				{
+					// Proximity-conflict exits: defer until the vehicle clears the
+					// entire exit lane.  The approach lane of the conflicting
+					// movement overlaps the exit lane's full length, so 3000 cm
+					// was insufficient (Lane 77 ≈ 4270 cm in ActiveSegments map).
+					const float ProxDeferDist = (bProximityDefer && Owner->CachedProvider)
+						? Owner->CachedProvider->GetLaneLength(EarlyExitLane)
+						: 3000.0f;
+					const float DeferDist = bProximityDefer ? ProxDeferDist : 1500.0f;
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT EARLY-RELEASE-DEFERRED: Pawn='%s' junction %d — "
+							 "ExitLane=%d %s, deferring release (dist=%.0f)"),
+						Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+						Owner->JnctState.JunctionId, EarlyExitLane.HandleId,
+						bEarlyExitDeadEnd ? TEXT("is dead-end") : TEXT("has proximity conflicts"),
+						DeferDist);
+					Owner->bDeferredJunctionRelease = true;
+					Owner->DeferredJunctionReleaseId = Owner->JnctState.JunctionId;
+					Owner->DeferredJunctionReleaseOrigin = VehicleLocation;
+					Owner->DeferredJunctionReleaseDistCm = DeferDist;
+					Owner->JnctState.bOwnsJunctionOccupancy = false;
+				}
+				else
+				{
+					TrafficSub->ReleaseJunction(Owner->JnctState.JunctionId, Owner);
+					Owner->JnctState.bOwnsJunctionOccupancy = false;
+				}
 			}
 		}
 	}
@@ -874,14 +956,53 @@ bool FJunctionNegotiator::TickTraverse(const FVector& VehicleLocation, int32 Clo
 			{
 				if (UTrafficSubsystem* TrafficSub = World->GetSubsystem<UTrafficSubsystem>())
 				{
-					CheckJunctionOccupancyContract(TEXT("TickTraverse.PreRelease"), Owner->GetPawn(), Owner->JnctState.JunctionId, Owner->JnctState.Phase, Owner->JnctState.bOwnsJunctionOccupancy, TrafficSub, Owner);
+					// Skip contract check when deferred release is active — the
+					// local token was intentionally cleared by PATH1 while the
+					// subsystem record persists until the deferred release fires.
+					if (!(Owner->bDeferredJunctionRelease && Owner->DeferredJunctionReleaseId == ReleasedJunctionId))
+					{
+						CheckJunctionOccupancyContract(TEXT("TickTraverse.PreRelease"), Owner->GetPawn(), Owner->JnctState.JunctionId, Owner->JnctState.Phase, Owner->JnctState.bOwnsJunctionOccupancy, TrafficSub, Owner);
+					}
 					if (Owner->JnctState.bOwnsJunctionOccupancy)
 					{
-						UE_LOG(LogAAATraffic, Warning,
-							TEXT("JNCT RELEASE-PATH2-FIRE: Pawn='%s' RELEASING junction %d (curve complete)"),
-							Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
-							ReleasedJunctionId);
-						TrafficSub->ReleaseJunction(ReleasedJunctionId, Owner);
+						// Check if exit lane is a short dead-end. Same logic
+						// as the early release path — only defer for short
+						// dead-ends where vehicles stop inside the junction.
+						// Also defer for proximity-conflict movements.
+						const bool bExitLaneDeadEnd = ExitLane.IsValid()
+							&& Owner->CachedProvider
+							&& Owner->CachedProvider->GetConnectedLanes(ExitLane).Num() == 0
+							&& Owner->CachedProvider->GetLaneLength(ExitLane) < 2000.0f;
+
+						bool bProximityDefer = false;
+						if (const FCanonicalMovementRecord* MvRec = TrafficSub->GetCanonicalMovement(Owner->JnctState.CanonicalMovementId))
+						{
+							bProximityDefer = MvRec->bHasProximityConflicts;
+						}
+
+						if (bExitLaneDeadEnd || bProximityDefer)
+						{
+							const float DeferDist = bProximityDefer ? 3000.0f : 1500.0f;
+							UE_LOG(LogAAATraffic, Warning,
+								TEXT("JNCT RELEASE-PATH2-DEFERRED: Pawn='%s' junction %d — "
+									 "ExitLane=%d %s, deferring release (dist=%.0f)"),
+								Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+								ReleasedJunctionId, ExitLane.HandleId,
+								bExitLaneDeadEnd ? TEXT("is dead-end") : TEXT("has proximity conflicts"),
+								DeferDist);
+							Owner->bDeferredJunctionRelease = true;
+							Owner->DeferredJunctionReleaseId = ReleasedJunctionId;
+							Owner->DeferredJunctionReleaseOrigin = VehicleLocation;
+							Owner->DeferredJunctionReleaseDistCm = DeferDist;
+						}
+						else
+						{
+							UE_LOG(LogAAATraffic, Warning,
+								TEXT("JNCT RELEASE-PATH2-FIRE: Pawn='%s' RELEASING junction %d (curve complete)"),
+								Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("NULL"),
+								ReleasedJunctionId);
+							TrafficSub->ReleaseJunction(ReleasedJunctionId, Owner);
+						}
 					}
 					else
 					{
@@ -903,6 +1024,40 @@ bool FJunctionNegotiator::TickTraverse(const FVector& VehicleLocation, int32 Clo
 				(int32)Owner->JnctState.Phase,
 				ReleasedJunctionId);
 			Owner->JnctState.Reset();
+		}
+
+		// ── Degenerate curve check ──
+		// A self-referential provider curve (From==To) traces along the
+		// approach lane itself.  The vehicle naturally "completes" it
+		// while still far from the curve's endpoint.  Switching to the
+		// exit lane would place CurrentLane on a distant road, causing
+		// wrong-way detection before despawn can clean up.
+		// Guard: if the vehicle is too far from the curve endpoint,
+		// skip the exit-lane switch and despawn on the current lane.
+		constexpr float MaxCurveEndGapCm = 2000.0f; // 20 m
+		const float DistFromCurveEndSq = FVector::DistSquared2D(VehicleLocation, TransitionEndPoint);
+		if (DistFromCurveEndSq > MaxCurveEndGapCm * MaxCurveEndGapCm)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JNCT DEGENERATE-CURVE: Pawn='%s' Lane=%d dist=%.0f cm "
+					 "from curve endpoint — skipping exit-lane switch, despawning."),
+				Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("null"),
+				Owner->CurrentLane.HandleId,
+				FMath::Sqrt(DistFromCurveEndSq));
+			Owner->bPendingRecoveryDespawn = true;
+			if (UWorld* W = Owner->GetWorld())
+			{
+				if (UTrafficSubsystem* Sub = W->GetSubsystem<UTrafficSubsystem>())
+				{
+					Sub->RequestDespawn(Owner,
+						FString::Printf(TEXT("degenerate junction curve (%.0f cm from curve end)"),
+							FMath::Sqrt(DistFromCurveEndSq)));
+				}
+			}
+			OutTargetPoint = Owner->LanePoints.IsValidIndex(Owner->LastClosestIndex)
+				? Owner->LanePoints[Owner->LastClosestIndex]
+				: VehicleLocation;
+			return true;
 		}
 
 		// ── Transition to exit lane ──
@@ -996,22 +1151,77 @@ bool FJunctionNegotiator::TickTraverse(const FVector& VehicleLocation, int32 Clo
 			const FVector& ClosestLanePt = Owner->LanePoints[Owner->LastClosestIndex];
 			const float DistToLaneSq = FVector::DistSquared2D(VehicleLocation, ClosestLanePt);
 			const float SnapThresholdCm = Owner->LaneWidth * 1.5f;
-			if (DistToLaneSq > SnapThresholdCm * SnapThresholdCm)
+			const float MaxSnapCm = Owner->LaneWidth * 5.0f;
+
+			// Proximity-conflict exits: if the vehicle lands far from the
+			// exit lane center, either CTE correction swerves through the
+			// overlapping approach lane or a TeleportPhysics snap desyncs
+			// ChaosVehicle sub-bodies (doors) causing phantom collisions.
+			// Despawn instead — cleanest recovery for both failure modes.
+			const float ProxDespawnThreshCm = Owner->LaneWidth * 0.3f; // ~105 cm
+			if (Owner->bDeferredJunctionRelease
+				&& DistToLaneSq > ProxDespawnThreshCm * ProxDespawnThreshCm)
 			{
-				APawn* Pawn = Owner->GetPawn();
-				if (Pawn)
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JNCT EXIT-PROX-DESPAWN: Pawn='%s' Lane=%d dist=%.0f cm "
+						 "from lane center on proximity-conflict exit — despawning."),
+					Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("null"),
+					Owner->CurrentLane.HandleId,
+					FMath::Sqrt(DistToLaneSq));
+				Owner->bPendingRecoveryDespawn = true;
+				if (UWorld* W = Owner->GetWorld())
 				{
-					const FVector SnapTarget(ClosestLanePt.X, ClosestLanePt.Y, VehicleLocation.Z);
-					Pawn->SetActorLocation(SnapTarget, /*bSweep=*/ false,
-						/*OutSweepHitResult=*/ nullptr, ETeleportType::TeleportPhysics);
-					EffectiveVehicleLocation = SnapTarget;
+					if (UTrafficSubsystem* Sub = W->GetSubsystem<UTrafficSubsystem>())
+					{
+						Sub->RequestDespawn(Owner,
+							FString::Printf(TEXT("proximity-exit CTE=%.0f cm"),
+								FMath::Sqrt(DistToLaneSq)));
+					}
+				}
+			}
+			else if (DistToLaneSq > SnapThresholdCm * SnapThresholdCm)
+			{
+				// If the vehicle is catastrophically far from the lane,
+				// snapping would teleport it to a mismatched position
+				// (potentially facing the wrong direction). Skip the snap
+				// and let the off-road despawn mechanism handle cleanup.
+				if (DistToLaneSq > MaxSnapCm * MaxSnapCm)
+				{
 					UE_LOG(LogAAATraffic, Warning,
-						TEXT("JNCT EXIT-SNAP: Pawn='%s' Lane=%d snapped %.0f cm to lane "
-							 "(threshold=%.0f cm)"),
-						*Pawn->GetName(),
+						TEXT("JNCT EXIT-SNAP-SKIP: Pawn='%s' Lane=%d dist=%.0f cm "
+							 "exceeds max snap (%.0f cm) — requesting recovery despawn."),
+						Owner->GetPawn() ? *Owner->GetPawn()->GetName() : TEXT("null"),
 						Owner->CurrentLane.HandleId,
 						FMath::Sqrt(DistToLaneSq),
-						SnapThresholdCm);
+						MaxSnapCm);
+					Owner->bPendingRecoveryDespawn = true;
+					if (UWorld* W = Owner->GetWorld())
+					{
+						if (UTrafficSubsystem* Sub = W->GetSubsystem<UTrafficSubsystem>())
+						{
+							Sub->RequestDespawn(Owner,
+								FString::Printf(TEXT("EXIT-SNAP-SKIP dist=%.0f cm"),
+									FMath::Sqrt(DistToLaneSq)));
+						}
+					}
+				}
+				else
+				{
+					APawn* Pawn = Owner->GetPawn();
+					if (Pawn)
+					{
+						const FVector SnapTarget(ClosestLanePt.X, ClosestLanePt.Y, VehicleLocation.Z);
+						Pawn->SetActorLocation(SnapTarget, /*bSweep=*/ false,
+							/*OutSweepHitResult=*/ nullptr, ETeleportType::TeleportPhysics);
+						EffectiveVehicleLocation = SnapTarget;
+						UE_LOG(LogAAATraffic, Warning,
+							TEXT("JNCT EXIT-SNAP: Pawn='%s' Lane=%d snapped %.0f cm to lane "
+								 "(threshold=%.0f cm)"),
+							*Pawn->GetName(),
+							Owner->CurrentLane.HandleId,
+							FMath::Sqrt(DistToLaneSq),
+							SnapThresholdCm);
+					}
 				}
 			}
 		}

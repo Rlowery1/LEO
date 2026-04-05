@@ -298,6 +298,7 @@ bool UTrafficSubsystem::TryOccupyJunction(int32 JunctionId,
 	ATrafficVehicleController* Controller,
 	int32 MovementId)
 {
+	SCOPE_CYCLE_COUNTER(STAT_AAATraffic_TryOccupyJunction);
 	if (JunctionId == 0 || !Controller)
 	{
 		UE_LOG(LogAAATraffic, Warning,
@@ -1241,8 +1242,8 @@ void UTrafficSubsystem::BuildJunctionSurvey()
 		TArray<int32>* MovementIds = JunctionToMovementIds.Find(JunctionId);
 		if (!MovementIds || MovementIds->IsEmpty())
 		{
-			UE_LOG(LogAAATraffic, Error,
-				TEXT("CANONICAL COMPILE: Junction=%d compiled to zero valid movements"),
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("CANONICAL COMPILE: Junction=%d compiled to zero valid movements (skipped)"),
 				JunctionId);
 			continue;
 		}
@@ -1263,13 +1264,19 @@ void UTrafficSubsystem::BuildJunctionSurvey()
 					continue;
 				}
 
-				if (!Provider->DoJunctionPathsConflict(RecordA->FromLane, RecordA->ToLane, RecordB->FromLane, RecordB->ToLane))
+				bool bProximityConflict = false;
+				if (!Provider->DoJunctionPathsConflict(RecordA->FromLane, RecordA->ToLane, RecordB->FromLane, RecordB->ToLane, &bProximityConflict))
 				{
 					continue;
 				}
 
 				RecordA->ConflictMovementIds.Add(RecordB->MovementId);
 				RecordB->ConflictMovementIds.Add(RecordA->MovementId);
+				if (bProximityConflict)
+				{
+					RecordA->bHasProximityConflicts = true;
+					RecordB->bHasProximityConflicts = true;
+				}
 			}
 		}
 

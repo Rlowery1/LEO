@@ -28,6 +28,7 @@
 #include "Core/TrafficRoadProvider.h"
 #include "Core/TrafficRoadQueryLibrary.h"
 #include "Controller/TrafficVehicleController.h"
+#include "Controller/LaneChangeCoordinator.h"
 #include "Subsystem/TrafficSubsystem.h"
 
 // ────────────────────────────────────────────────────────────────
@@ -43,6 +44,12 @@ static const TArray<FString> GTestMapPaths = {
 	TEXT("/Game/Test_Maps/Test_Map_Short_Road_With_2Intersections"),
 	TEXT("/Game/Test_Maps/Test_Map_Road_That_Loops_Into_Itself_With_Intersection"),
 	TEXT("/Game/Test_Maps/Test_Map_5+_Connecting_Roads_To_Single_Intersection"),
+	// Phase 3 stress-test maps
+	TEXT("/Game/Test_Maps/Test_Map_Overtaking_2Way_Straight"),
+	TEXT("/Game/Test_Maps/Test_Maps_Overtaking_2Way_Curves"),
+	TEXT("/Game/Test_Maps/Test_Map_Mixed_Lane_Types"),
+	TEXT("/Game/Test_Maps/Test_Map_Road_With_ActiveSegments"),
+	TEXT("/Game/Test_Maps/Test_Map_Personality_Mix_MultiLane"),
 };
 
 // ────────────────────────────────────────────────────────────────
@@ -89,9 +96,13 @@ struct FVehicleTestRecord
 	 *  (Approaching, Waiting, or Traversing)? */
 	bool bEverInJunction = false;
 
-	/** Seconds since the vehicle was last in Traversing phase.
-	 *  Used to provide a collision grace window after exiting a junction. */
-	float SecondsSinceTraversal = TNumericLimits<float>::Max();
+	// ── Phase 3 feature-exercise tracking ──────────────────
+	/** Did this vehicle ever enter an overtake phase (PullingOut/Passing/PullingIn)? */
+	bool bEverOvertook = false;
+
+	/** Target speed assigned to this vehicle (cm/s), for variation detection. */
+	float AssignedTargetSpeed = 0.0f;
+
 };
 
 // ────────────────────────────────────────────────────────────────
@@ -111,7 +122,7 @@ public:
 		{
 			for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
 			{
-				if (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE)
+				if (Ctx.World() && (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE))
 				{
 					World = Ctx.World();
 					break;
@@ -144,12 +155,39 @@ private:
 };
 
 // ────────────────────────────────────────────────────────────────
+// Maps where specific Phase 3 features MUST exercise to pass.
+// ────────────────────────────────────────────────────────────────
+
+/** Returns true if this map name requires at least one overtake to fire. */
+static bool MapRequiresOvertaking(const FString& MapName)
+{
+	return MapName.Contains(TEXT("Overtaking"));
+}
+
+/** Returns true if this map name requires measurable speed variation. */
+static bool MapRequiresSpeedVariation(const FString& MapName)
+{
+	return MapName.Contains(TEXT("Personality")) || MapName.Contains(TEXT("MultiLane"));
+}
+
+// ────────────────────────────────────────────────────────────────
 // Latent command: run simulation for N seconds, sampling state.
 // ────────────────────────────────────────────────────────────────
 
-DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FRunSimulationAndValidate,
-	FAutomationTestBase*, Test,
-	float, SimulationDurationSec);
+class FRunSimulationAndValidate : public IAutomationLatentCommand
+{
+public:
+	FRunSimulationAndValidate(FAutomationTestBase* InTest, float InDuration, const FString& InMapName)
+		: Test(InTest), SimulationDurationSec(InDuration), MapName(InMapName)
+	{}
+
+	virtual bool Update() override;
+
+private:
+	FAutomationTestBase* Test;
+	float SimulationDurationSec;
+	FString MapName;
+};
 
 bool FRunSimulationAndValidate::Update()
 {
@@ -158,7 +196,7 @@ bool FRunSimulationAndValidate::Update()
 	{
 		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
 		{
-			if (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE)
+			if (Ctx.World() && (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE))
 			{
 				World = Ctx.World();
 				break;
@@ -195,6 +233,17 @@ bool FRunSimulationAndValidate::Update()
 
 	ElapsedTime += DeltaTime;
 	SampleTimer += DeltaTime;
+
+	// ── Warmup: skip sampling for the first 2 seconds ──────
+	// After a map transition, remnant actors from the previous
+	// world may survive for a few frames before being cleaned
+	// up by the engine. Sampling during this window incorrectly
+	// attributes stale actor state to the new test.
+	constexpr float WarmupSec = 2.0f;
+	if (ElapsedTime < WarmupSec)
+	{
+		return false;
+	}
 
 	// ── Sample every 0.5 seconds ───────────────────────────
 	constexpr float SampleIntervalSec = 0.5f;
@@ -234,7 +283,6 @@ bool FRunSimulationAndValidate::Update()
 			{
 				Record.bEverTraversed = true;
 				Record.bWasTraversing = true;
-				Record.SecondsSinceTraversal = 0.0f;
 			}
 			else
 			{
@@ -243,25 +291,30 @@ bool FRunSimulationAndValidate::Update()
 					Record.bCompletedTurn = true;
 				}
 				Record.bWasTraversing = false;
-				Record.SecondsSinceTraversal += SampleIntervalSec;
 			}
 
 			Record.bCurrentlyWaiting =
 				(Diag.JunctionPhase == EJunctionPhase::Waiting ||
 				 Diag.JunctionPhase == EJunctionPhase::Approaching);
 
+			const bool bTraversingJunction =
+				(Diag.JunctionPhase == EJunctionPhase::Traversing);
+
+			// ── Phase 3 feature-exercise sampling ──────────
+			if (Diag.OvertakePhase != EOvertakePhase::None)
+			{
+				Record.bEverOvertook = true;
+			}
+			if (Record.AssignedTargetSpeed == 0.0f && Diag.TargetSpeedCmPerSec > 0.0f)
+			{
+				Record.AssignedTargetSpeed = Diag.TargetSpeedCmPerSec;
+			}
+
 			// ── Condition 5: Collision detection ───────────
 			// Only flag vehicle-vehicle collisions. Road geometry
 			// scrapes (curbs/barriers) are not simulation failures.
-			// Also exempt vehicles on a junction curve (Traversing)
-			// or within 2 seconds of exiting one.
-			constexpr float PostTraversalGraceSec = 2.0f;
-			const bool bRecentlyTraversed =
-				Record.SecondsSinceTraversal < PostTraversalGraceSec;
 			if (Diag.CollisionBrakeTimer > 0.0f
-				&& Diag.bCollisionWithVehicle
-				&& Diag.JunctionPhase != EJunctionPhase::Traversing
-				&& !bRecentlyTraversed)
+				&& Diag.bCollisionWithVehicle)
 			{
 				if (!Record.bHadCollision)
 				{
@@ -287,75 +340,105 @@ bool FRunSimulationAndValidate::Update()
 			}
 
 			// ── Condition 3: Off-road detection ────────────
-			// Skip during Traversing — the vehicle is deliberately
-			// off regular road lanes while following the junction curve.
-			// Post-exit alignment is handled by EXIT-SNAP; non-Traversing
-			// off-road detection catches any persistent deviation.
-			const bool bTraversingJunction =
-				(Diag.JunctionPhase == EJunctionPhase::Traversing);
-			if (!Record.bWentOffRoad && !bTraversingJunction)
+			// Check distance to the active path:
+			//   - During junction traversal → distance to junction curve
+			//   - Otherwise → distance to nearest lane centerline
+			if (!Record.bWentOffRoad)
 			{
-				const FTrafficLaneHandle NearLane =
-					UTrafficRoadQueryLibrary::GetLaneAtLocation(World, VehiclePos);
-				if (NearLane.IsValid())
+				const bool bOnJunctionCurve =
+					(Diag.JunctionPhase == EJunctionPhase::Traversing
+					 && Diag.JunctionCurveDistanceCm > 0.0f);
+
+				if (bOnJunctionCurve)
 				{
-					TArray<FVector> LanePoints;
-					float LaneWidth = 0.0f;
-					if (UTrafficRoadQueryLibrary::GetLanePath(World, NearLane, LanePoints, LaneWidth))
+					// Junction curve off-road: LaneWidth/2 + 200cm margin.
+					const float LaneW = Controller->GetLaneWidth();
+					const float Threshold = (LaneW * 0.5f) + 200.0f;
+					if (Diag.JunctionCurveDistanceCm > Threshold)
 					{
-						// Find closest point on polyline.
-						float MinDistSq = TNumericLimits<float>::Max();
-						for (const FVector& LP : LanePoints)
-						{
-							const float D = FVector::DistSquared2D(VehiclePos, LP);
-							if (D < MinDistSq) { MinDistSq = D; }
-						}
-						const float Dist = FMath::Sqrt(MinDistSq);
-						const float Threshold = (LaneWidth * 0.5f) + 200.0f;
-						if (Dist > Threshold)
-						{
-							Test->AddError(FString::Printf(
-								TEXT("OFF-ROAD: '%s' at (%.0f, %.0f, %.0f) — %.0f cm from lane centerline (threshold=%.0f)"),
-								*Record.PawnName, VehiclePos.X, VehiclePos.Y, VehiclePos.Z,
-								Dist, Threshold));
-							Record.bWentOffRoad = true;
-						}
+						Test->AddError(FString::Printf(
+							TEXT("OFF-ROAD: '%s' at (%.0f, %.0f, %.0f) — %.0f cm from junction curve (threshold=%.0f)"),
+							*Record.PawnName, VehiclePos.X, VehiclePos.Y, VehiclePos.Z,
+							Diag.JunctionCurveDistanceCm, Threshold));
+						Record.bWentOffRoad = true;
 					}
 				}
 				else
 				{
-					// No lane found at all near this position.
-					Test->AddError(FString::Printf(
-						TEXT("OFF-ROAD: '%s' at (%.0f, %.0f, %.0f) — no lane found at location"),
-						*Record.PawnName, VehiclePos.X, VehiclePos.Y, VehiclePos.Z));
-					Record.bWentOffRoad = true;
+					const FTrafficLaneHandle NearLane =
+						UTrafficRoadQueryLibrary::GetLaneAtLocation(World, VehiclePos);
+					if (NearLane.IsValid())
+					{
+						TArray<FVector> LanePoints;
+						float LaneWidth = 0.0f;
+						if (UTrafficRoadQueryLibrary::GetLanePath(World, NearLane, LanePoints, LaneWidth))
+						{
+							float MinDistSq = TNumericLimits<float>::Max();
+							for (const FVector& LP : LanePoints)
+							{
+								const float D = FVector::DistSquared2D(VehiclePos, LP);
+								if (D < MinDistSq) { MinDistSq = D; }
+							}
+							const float Dist = FMath::Sqrt(MinDistSq);
+							const float Threshold = (LaneWidth * 0.5f) + 200.0f;
+							if (Dist > Threshold)
+							{
+								Test->AddError(FString::Printf(
+									TEXT("OFF-ROAD: '%s' at (%.0f, %.0f, %.0f) — %.0f cm from lane centerline (threshold=%.0f)"),
+									*Record.PawnName, VehiclePos.X, VehiclePos.Y, VehiclePos.Z,
+									Dist, Threshold));
+								Record.bWentOffRoad = true;
+							}
+						}
+					}
+					else
+					{
+						Test->AddError(FString::Printf(
+							TEXT("OFF-ROAD: '%s' at (%.0f, %.0f, %.0f) — no lane found at location"),
+							*Record.PawnName, VehiclePos.X, VehiclePos.Y, VehiclePos.Z));
+						Record.bWentOffRoad = true;
+					}
 				}
 			}
 
 			// ── Condition 7: Wrong-way detection ───────────
-			// Exempt vehicles traversing junction curves — they can
-			// momentarily face away from the lane direction during a turn.
-			if (!Record.bWrongWay && !Record.bCurrentlyWaiting && !bTraversingJunction)
+			// Check heading against the active path direction:
+			//   - During junction traversal → junction curve tangent
+			//   - Otherwise → nearest lane segment direction
+			if (!Record.bWrongWay && !Record.bCurrentlyWaiting)
 			{
-				const TArray<FVector>& LanePts = Controller->GetLanePoints();
-				if (LanePts.Num() >= 2)
+				FVector ReferenceDir = FVector::ZeroVector;
+
+				// Use junction curve direction if available.
+				if (!Diag.JunctionCurveDirection.IsNearlyZero())
 				{
-					// Find lane direction at the vehicle's nearest point.
-					float MinDistSq = TNumericLimits<float>::Max();
-					int32 NearestIdx = 0;
-					for (int32 Idx = 0; Idx < LanePts.Num(); ++Idx)
+					ReferenceDir = Diag.JunctionCurveDirection;
+				}
+				else
+				{
+					const TArray<FVector>& LanePts = Controller->GetLanePoints();
+					if (LanePts.Num() >= 2)
 					{
-						const float D = FVector::DistSquared2D(VehiclePos, LanePts[Idx]);
-						if (D < MinDistSq)
+						float MinDistSq = TNumericLimits<float>::Max();
+						int32 NearestIdx = 0;
+						for (int32 Idx = 0; Idx < LanePts.Num(); ++Idx)
 						{
-							MinDistSq = D;
-							NearestIdx = Idx;
+							const float D = FVector::DistSquared2D(VehiclePos, LanePts[Idx]);
+							if (D < MinDistSq)
+							{
+								MinDistSq = D;
+								NearestIdx = Idx;
+							}
 						}
+						const int32 DirIdx = FMath::Min(NearestIdx, LanePts.Num() - 2);
+						ReferenceDir = (LanePts[DirIdx + 1] - LanePts[DirIdx]).GetSafeNormal2D();
 					}
-					const int32 DirIdx = FMath::Min(NearestIdx, LanePts.Num() - 2);
-					const FVector LaneDir = (LanePts[DirIdx + 1] - LanePts[DirIdx]).GetSafeNormal2D();
+				}
+
+				if (!ReferenceDir.IsNearlyZero())
+				{
 					const float HeadingDot = FVector::DotProduct(
-						FVector(VehicleFwd.X, VehicleFwd.Y, 0.0f).GetSafeNormal(), LaneDir);
+						FVector(VehicleFwd.X, VehicleFwd.Y, 0.0f).GetSafeNormal(), ReferenceDir);
 
 					// Dot < -0.5 means > 120° off — definitively wrong way.
 					// Only flag if the vehicle is actually moving (speed > 100 cm/s).
@@ -383,7 +466,7 @@ bool FRunSimulationAndValidate::Update()
 				const float MovedCm = FVector::Dist2D(VehiclePos, OldPos);
 
 					// Exempt vehicles waiting at junctions, traversing curves,
-				// or stopped at a dead-end lane awaiting despawn.
+					// or stopped at a dead-end lane awaiting despawn.
 				if (MovedCm < 50.0f && !Record.bCurrentlyWaiting && !bTraversingJunction
 					&& !Controller->IsAtDeadEnd() && !Record.bWasStuck)
 				{
@@ -468,6 +551,81 @@ bool FRunSimulationAndValidate::Update()
 			Collisions, Flips, Stuck, OffRoad, WrongWay));
 	}
 
+	// ── Phase 3 feature-exercise validation ────────────────
+	// These are map-aware: only fail if the map is specifically designed
+	// to test a feature and that feature never fired.
+
+	// Overtaking: at least 1 vehicle must have entered an overtake phase.
+	int32 OvertakeCount = 0;
+	for (const auto& Pair : VehicleRecords)
+	{
+		if (Pair.Value.bEverOvertook) { ++OvertakeCount; }
+	}
+
+	if (MapRequiresOvertaking(MapName))
+	{
+		if (OvertakeCount == 0)
+		{
+			Test->AddError(TEXT("FAIL: Overtaking map but NO vehicle ever initiated an overtake."));
+		}
+		else
+		{
+			Test->AddInfo(FString::Printf(
+				TEXT("Overtaking exercised: %d vehicle(s) overtook during simulation."),
+				OvertakeCount));
+		}
+	}
+	else if (OvertakeCount > 0)
+	{
+		Test->AddInfo(FString::Printf(
+			TEXT("Overtaking observed: %d vehicle(s) overtook (not required for this map)."),
+			OvertakeCount));
+	}
+
+	// Speed variation: vehicles must have measurably different target speeds.
+	TArray<float> UniqueTargetSpeeds;
+	for (const auto& Pair : VehicleRecords)
+	{
+		if (Pair.Value.AssignedTargetSpeed > 0.0f)
+		{
+			bool bAlreadySeen = false;
+			for (float S : UniqueTargetSpeeds)
+			{
+				if (FMath::IsNearlyEqual(S, Pair.Value.AssignedTargetSpeed, 1.0f))
+				{
+					bAlreadySeen = true;
+					break;
+				}
+			}
+			if (!bAlreadySeen)
+			{
+				UniqueTargetSpeeds.Add(Pair.Value.AssignedTargetSpeed);
+			}
+		}
+	}
+
+	if (MapRequiresSpeedVariation(MapName))
+	{
+		if (UniqueTargetSpeeds.Num() < 2)
+		{
+			Test->AddError(FString::Printf(
+				TEXT("FAIL: Personality map but only %d distinct target speed(s) observed (need >=2)."),
+				UniqueTargetSpeeds.Num()));
+		}
+		else
+		{
+			Test->AddInfo(FString::Printf(
+				TEXT("Speed variation exercised: %d distinct target speeds observed across %d vehicles."),
+				UniqueTargetSpeeds.Num(), TotalVehicles));
+		}
+	}
+	else if (UniqueTargetSpeeds.Num() > 1)
+	{
+		Test->AddInfo(FString::Printf(
+			TEXT("Speed variation observed: %d distinct speeds (not required for this map)."),
+			UniqueTargetSpeeds.Num()));
+	}
+
 	// Reset static state for next test run.
 	bInitialized = false;
 	ElapsedTime = 0.0f;
@@ -503,16 +661,6 @@ bool FTrafficSimulationTest::RunTest(const FString& Parameters)
 
 	UE_LOG(LogAAATraffic, Log, TEXT("=== AUTOMATION TEST: Loading map '%s' ==="), *MapPath);
 
-	// Suppress LogAAATraffic Error messages (e.g. canonical-compile diagnostics,
-	// spawner config warnings) from failing the test.  The test has its own
-	// explicit AddError() calls for the 7 safety conditions.
-	// Suppress a bounded number of LogAAATraffic Error messages (e.g.
-	// canonical-compile diagnostics, spawner config warnings) from failing
-	// the test.  The test has its own explicit AddError() calls for the
-	// 7 safety conditions.  Unexpected errors beyond this count will still
-	// surface as test failures.
-	AddExpectedErrorPlain(TEXT("LogAAATraffic"), EAutomationExpectedErrorFlags::Contains, 50);
-
 	// Step 1: Load the map.
 	ADD_LATENT_AUTOMATION_COMMAND(FLoadGameMapCommand(MapPath));
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitForMapToLoadCommand());
@@ -521,7 +669,8 @@ bool FTrafficSimulationTest::RunTest(const FString& Parameters)
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitForVehicleSpawn(this));
 
 	// Step 3: Let the simulation run for 120 seconds (2 minutes), sampling every 0.5s.
-	ADD_LATENT_AUTOMATION_COMMAND(FRunSimulationAndValidate(this, 120.0f));
+	const FString MapName = FPaths::GetBaseFilename(MapPath);
+	ADD_LATENT_AUTOMATION_COMMAND(FRunSimulationAndValidate(this, 120.0f, MapName));
 
 	return true;
 }

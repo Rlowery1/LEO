@@ -193,6 +193,14 @@ struct FVehicleDiagnosticSnapshot
 	bool bCollisionWithVehicle = false;
 	/** Distance from vehicle to nearest junction curve point (cm). 0 if not traversing. */
 	float JunctionCurveDistanceCm = 0.0f;
+	/** Curve tangent direction at vehicle's current position on the junction curve.
+	 *  Zero vector if not traversing a junction curve. */
+	FVector JunctionCurveDirection = FVector::ZeroVector;
+
+	/** Current overtake phase (None if not overtaking). */
+	EOvertakePhase OvertakePhase = EOvertakePhase::None;
+	/** Vehicle's assigned target speed (cm/s), including per-vehicle variation. */
+	float TargetSpeedCmPerSec = 0.0f;
 };
 
 /**
@@ -227,6 +235,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	void SetTargetSpeed(float InSpeed);
 
+	/** Set the per-vehicle speed variation factor (1.0 = no variation). Persists across lane changes. */
+	void SetSpeedVariationFactor(float InFactor) { SpeedVariationFactor = FMath::Max(0.01f, InFactor); }
+
 	/** Set the random seed before possession (determines RandomStream). */
 	UFUNCTION(BlueprintCallable, Category = "Traffic")
 	void SetRandomSeed(int32 InSeed);
@@ -260,6 +271,37 @@ public:
 		S.StuckTimeAccumulator = StuckTimeAccumulator;
 		S.bCollisionWithVehicle = bCollisionWithVehicle;
 		S.JunctionCurveDistanceCm = LastDiagJunctionCurveDistanceCm;
+		// Compute junction curve tangent at the vehicle's current position.
+		// Only report when the tangent is roughly aligned with the vehicle
+		// heading.  A reversed tangent (e.g. from a misaligned or degenerate
+		// provider curve) is unreliable — returning ZeroVector lets the
+		// consumer fall back to lane segment direction.
+		if (JnctState.TransitionPoints.Num() >= 2
+			&& JnctState.TransitionIndex < JnctState.TransitionPoints.Num())
+		{
+			const int32 SegIdx = FMath::Clamp(
+				JnctState.TransitionIndex - 1, 0,
+				JnctState.TransitionPoints.Num() - 2);
+			const FVector CurveDir =
+				(JnctState.TransitionPoints[SegIdx + 1]
+				 - JnctState.TransitionPoints[SegIdx]).GetSafeNormal2D();
+			if (const APawn* DiagPawn = GetPawn())
+			{
+				const FVector Fwd2D = FVector(
+					DiagPawn->GetActorForwardVector().X,
+					DiagPawn->GetActorForwardVector().Y, 0.0f).GetSafeNormal();
+				if (FVector::DotProduct(Fwd2D, CurveDir) >= -0.5f)
+				{
+					S.JunctionCurveDirection = CurveDir;
+				}
+			}
+			else
+			{
+				S.JunctionCurveDirection = CurveDir;
+			}
+		}
+		S.OvertakePhase = LaneChangeCoord_.OvertakePhase;
+		S.TargetSpeedCmPerSec = TargetSpeed;
 		return S;
 	}
 
@@ -452,6 +494,18 @@ private:
 	/** Consolidated junction interaction state — single source of truth. */
 	FVehicleJunctionState JnctState;
 
+	/** True when junction occupancy release is deferred (exit lane not registered). */
+	bool bDeferredJunctionRelease = false;
+
+	/** Junction ID awaiting deferred release. */
+	int32 DeferredJunctionReleaseId = 0;
+
+	/** World position at the time of junction exit (for distance tracking). */
+	FVector DeferredJunctionReleaseOrigin = FVector::ZeroVector;
+
+	/** Distance (cm) the vehicle must travel before deferred release fires. */
+	float DeferredJunctionReleaseDistCm = 1500.0f;
+
 	/** Monotonically increasing index assigned by UTrafficSubsystem::RegisterVehicle.
 	 *  Used to guarantee deterministic iteration order across frames. */
 	int32 DeterministicSpawnIndex = -1;
@@ -562,6 +616,10 @@ private:
 
 	/** Base target speed before lane speed-limit adjustments. */
 	float BaseTargetSpeed = 0.0f;
+
+	/** Per-vehicle speed variation multiplier (set at spawn, persists across lane changes).
+	 *  1.0 = no variation. A value of 1.12 means +12% faster than the lane speed limit. */
+	float SpeedVariationFactor = 1.0f;
 
 	/** Single lane-decision trace record for forensic debugging. */
 	struct FLaneDecisionTrace
@@ -754,6 +812,63 @@ protected:
 	/** Minimum gap (cm) required on the target lane for a safe merge. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|LaneChange", meta = (ClampMin = "100"))
 	float LaneChangeGapRequired;
+
+	// ── Overtaking Tuning ────────────────────────────────────
+
+	/**
+	 * Time (seconds) stuck behind a slow leader before considering an overtake.
+	 * The vehicle must be below the lane-change speed threshold with a close
+	 * leader for this long before the overtake evaluation runs.
+	 * Default 4s.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Overtaking", meta = (ClampMin = "1.0", ClampMax = "15.0"))
+	float OvertakeStuckTimeSec;
+
+	/**
+	 * Minimum clear distance (cm) on the oncoming lane to begin an overtake.
+	 * Must account for combined closing speed (ego + oncoming).
+	 * Default 15000 = 150m (~5s at 108 km/h combined).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Overtaking", meta = (ClampMin = "5000"))
+	float OvertakeMinClearanceCm;
+
+	/**
+	 * Distance threshold (cm) for aborting an active overtake when oncoming
+	 * traffic closes in.  Default 5000 = 50m.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Overtaking", meta = (ClampMin = "2000"))
+	float OvertakeAbortClearanceCm;
+
+	/**
+	 * Temporary speed increase (%) during overtaking.
+	 * Helps the vehicle pass the slow leader decisively.
+	 * Default 15 = +15% above target speed.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Overtaking", meta = (ClampMin = "0", ClampMax = "50"))
+	float OvertakeSpeedBoostPct;
+
+	/**
+	 * Minimum forward distance (cm) traveled in the oncoming lane before
+	 * the vehicle is allowed to pull back into its lane.
+	 * Default 2000 = 20m.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Overtaking", meta = (ClampMin = "500"))
+	float OvertakeMinPassDistCm;
+
+	/**
+	 * Lateral blend distance (cm) for pulling out and pulling back in.
+	 * Controls how far the vehicle travels longitudinally during the
+	 * lateral transition.  Default 1200.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Overtaking", meta = (ClampMin = "500"))
+	float OvertakeBlendDistCm;
+
+	/**
+	 * Cooldown (seconds) between overtake maneuvers.
+	 * Prevents rapid repeated overtakes.  Default 20s.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Overtaking", meta = (ClampMin = "5"))
+	float OvertakeCooldownTimeSec;
 
 	/** Default speed limit (cm/s) used when the provider returns no speed data. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic", meta = (ClampMin = "0"))

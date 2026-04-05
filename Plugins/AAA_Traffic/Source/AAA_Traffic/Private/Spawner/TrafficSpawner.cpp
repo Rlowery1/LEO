@@ -37,6 +37,7 @@ ATrafficSpawner::ATrafficSpawner()
 	, SpawnSpacing(1500.f)
 	, SpeedVariation(15.f)
 	, LaneChangeAggression(0.5f)
+	, LaneChangeAggressionVariation(0.2f)
 	, bEnableRespawn(true)
 	, RespawnCheckInterval(2.0f)
 	, MinRespawnDistance(10000.f)
@@ -191,7 +192,7 @@ void ATrafficSpawner::ProcessInitialSpawnBatch()
 	for (; PendingInitialSpawnCursor < BatchEnd; ++PendingInitialSpawnCursor)
 	{
 		const FPendingInitialSpawn& Request = PendingInitialSpawns[PendingInitialSpawnCursor];
-		SpawnSingleVehicle(World, Provider, Request.Lane, Request.SlotIndex, Request.VehicleIndex);
+		SpawnSingleVehicle(World, Provider, Request.Lane, Request.SlotIndex, Request.VehicleIndex, Request.LaneStagger);
 	}
 
 	if (PendingInitialSpawnCursor >= PendingInitialSpawns.Num())
@@ -231,8 +232,9 @@ void ATrafficSpawner::FinalizeSpawnSetup(UWorld* World, UTrafficSubsystem* Traff
 }
 
 
-void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Provider,
-	const FTrafficLaneHandle& Lane, int32 SlotIndex, int32 VehicleIndex)
+bool ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Provider,
+	const FTrafficLaneHandle& Lane, int32 SlotIndex, int32 VehicleIndex,
+	float LaneStagger)
 {
 	TArray<FVector> LanePoints;
 	float LaneWidth;
@@ -241,15 +243,16 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 		UE_LOG(LogAAATraffic, Warning,
 			TEXT("TrafficSpawner: Could not get path for lane %d — skipping."),
 			Lane.HandleId);
-		return;
+		return false;
 	}
 
-	const float TargetOffset = SlotIndex * SpawnSpacing;
+	const float TargetOffset = SlotIndex * SpawnSpacing + LaneStagger;
 
 	// Walk along lane points to find the staggered spawn position.
 	FVector SpawnPos = LanePoints[0];
 	FVector SpawnDir = (LanePoints[1] - LanePoints[0]).GetSafeNormal();
 	float AccumulatedDist = 0.0f;
+	bool bFoundSpawnSegment = false;
 	for (int32 p = 0; p < LanePoints.Num() - 1; ++p)
 	{
 		const float SegLen = FVector::Dist(LanePoints[p], LanePoints[p + 1]);
@@ -258,13 +261,14 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 			const float Alpha = (TargetOffset - AccumulatedDist) / FMath::Max(SegLen, KINDA_SMALL_NUMBER);
 			SpawnPos = FMath::Lerp(LanePoints[p], LanePoints[p + 1], Alpha);
 			SpawnDir = (LanePoints[p + 1] - LanePoints[p]).GetSafeNormal();
+			bFoundSpawnSegment = true;
 			break;
 		}
 		AccumulatedDist += SegLen;
 	}
 
 	// If the requested offset exceeds the lane length, clamp to the lane end.
-	if (TargetOffset > AccumulatedDist && LanePoints.Num() >= 2)
+	if (!bFoundSpawnSegment && LanePoints.Num() >= 2)
 	{
 		const int32 LastIdx = LanePoints.Num() - 1;
 		SpawnPos = LanePoints[LastIdx];
@@ -311,7 +315,7 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 							 "spawn on tight curve (κ=%.5f, R≈%.0fm)."),
 						VehicleIndex, Lane.HandleId, Curvature,
 						Curvature > KINDA_SMALL_NUMBER ? 1.0f / Curvature / 100.0f : 999999.0f);
-					return;
+					return false;
 				}
 			}
 		}
@@ -322,21 +326,24 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 	const FTransform SpawnTransform(SpawnRotation, SpawnLocation);
 
 	// FIX (Phase 3): Pre-spawn overlap check — skip this slot if an existing
-	// traffic vehicle is already within SpawnSpacing. Without this, the
+	// traffic vehicle is already within the overlap radius. Without this, the
 	// AdjustIfPossibleButAlwaysSpawn policy can stack vehicles on top of each
 	// other, causing immediate physics explosions on spawn.
+	// Keep the radius small: adjacent lanes are 350+ cm apart and should not
+	// be rejected. This check only needs to prevent literal same-position stacking.
 	{
+		const float OverlapRadius = FMath::Max(LaneWidth * 0.5f, 200.0f);
 		UTrafficSubsystem* OverlapSub = World->GetSubsystem<UTrafficSubsystem>();
 		if (OverlapSub)
 		{
-			TArray<ATrafficVehicleController*> Nearby = OverlapSub->GetNearbyVehicles(SpawnLocation, SpawnSpacing);
+			TArray<ATrafficVehicleController*> Nearby = OverlapSub->GetNearbyVehicles(SpawnLocation, OverlapRadius);
 			if (Nearby.Num() > 0)
 			{
 				UE_LOG(LogAAATraffic, Log,
 					TEXT("TrafficSpawner: Skipping vehicle %d on lane %d — "
 						 "existing vehicle too close (within %.0f cm)."),
-					VehicleIndex, Lane.HandleId, SpawnSpacing);
-				return;
+					VehicleIndex, Lane.HandleId, OverlapRadius);
+				return false;
 			}
 		}
 	}
@@ -347,7 +354,7 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 	{
 		UE_LOG(LogAAATraffic, Warning,
 			TEXT("TrafficSpawner: No valid vehicle class for vehicle %d."), VehicleIndex);
-		return;
+		return false;
 	}
 
 	// Try to acquire from the vehicle pool first (I1: object pooling).
@@ -370,7 +377,7 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 	{
 		UE_LOG(LogAAATraffic, Warning,
 			TEXT("TrafficSpawner: Failed to spawn vehicle %d."), VehicleIndex);
-		return;
+		return false;
 	}
 
 	ATrafficVehicleController* Controller =
@@ -380,18 +387,32 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 		Controller->SetRandomSeed(SpawnSeed + VehicleIndex);
 
 		// Apply deterministic per-vehicle speed variation.
+		// Use a scrambled seed (prime multiplier) so consecutive vehicle
+		// indices don't produce correlated speed offsets.
 		float FinalSpeed = VehicleSpeed;
 		if (SpeedVariation > KINDA_SMALL_NUMBER)
 		{
 			constexpr int32 SpeedVariationSeedOffset = 10000;
-			FRandomStream SpeedRng(SpawnSeed + VehicleIndex + SpeedVariationSeedOffset);
+			FRandomStream SpeedRng(SpawnSeed + VehicleIndex * 7919 + SpeedVariationSeedOffset);
 			const float VariationFraction = SpeedVariation / 100.0f;
 			const float Offset = SpeedRng.FRandRange(-VariationFraction, VariationFraction);
 			FinalSpeed = VehicleSpeed * (1.0f + Offset);
 			FinalSpeed = FMath::Max(FinalSpeed, 0.0f);
+			Controller->SetSpeedVariationFactor(1.0f + Offset);
 		}
 		Controller->SetTargetSpeed(FinalSpeed);
-		Controller->SetLaneChangeAggression(LaneChangeAggression);
+
+		// Per-vehicle aggression variation (like speed variation).
+		float FinalAggression = LaneChangeAggression;
+		if (LaneChangeAggressionVariation > KINDA_SMALL_NUMBER)
+		{
+			constexpr int32 AggressionVariationSeedOffset = 20000;
+			FRandomStream AggrRng(SpawnSeed + VehicleIndex * 7919 + AggressionVariationSeedOffset);
+			const float AggrOffset = AggrRng.FRandRange(
+				-LaneChangeAggressionVariation, LaneChangeAggressionVariation);
+			FinalAggression = FMath::Clamp(LaneChangeAggression + AggrOffset, 0.0f, 1.0f);
+		}
+		Controller->SetLaneChangeAggression(FinalAggression);
 
 		// Per-road speed limit: check the override map via the subsystem,
 		// falling back to the spawner's DefaultSpeedLimit (UrbanSpeed by default).
@@ -441,6 +462,8 @@ void ATrafficSpawner::SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Pr
 				Controller->GetPawn() ? TEXT("Yes") : TEXT("No"));
 		}
 	}
+
+	return true;
 }
 
 void ATrafficSpawner::OnVehicleDespawned(ATrafficVehicleController* Controller, const FTrafficLaneHandle& Lane)
@@ -527,15 +550,49 @@ void ATrafficSpawner::CheckRespawn()
 			continue;
 		}
 
+		// Reject if any active vehicle is already travelling on this lane.
+		// Respawn always targets position 0 (lane start). If another vehicle
+		// is anywhere on the lane, spawning here risks a rear-end collision
+		// because leader detection range at initial speed (floor 1500 cm) may
+		// not cover the full lane length.
+		{
+			bool bLaneOccupied = false;
+			for (const auto& WeakVehicle : TrafficSub->GetActiveVehicles())
+			{
+				if (const ATrafficVehicleController* Other = WeakVehicle.Get())
+				{
+					if (Other->GetCurrentLane().HandleId == Lane.HandleId)
+					{
+						bLaneOccupied = true;
+						break;
+					}
+				}
+			}
+			if (bLaneOccupied)
+			{
+				Remaining.Add(Lane);
+				continue;
+			}
+		}
+
 		++RespawnCounter;
 		const int32 VehicleIdx = TotalVehiclesSpawned++;
 		// Always spawn at lane start (SlotIndex=0). The pre-spawn overlap
 		// check inside SpawnSingleVehicle prevents stacking.
-		SpawnSingleVehicle(World, Provider, Lane, 0, VehicleIdx);
+		const bool bSpawned = SpawnSingleVehicle(World, Provider, Lane, 0, VehicleIdx);
 
-		UE_LOG(LogAAATraffic, Log,
-			TEXT("TrafficSpawner: Respawned vehicle on lane %d (respawn #%d)."),
-			Lane.HandleId, RespawnCounter);
+		if (bSpawned)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("TrafficSpawner: Respawned vehicle on lane %d (respawn #%d)."),
+				Lane.HandleId, RespawnCounter);
+		}
+		else
+		{
+			// Spawn failed (overlap or other). Re-queue for next interval
+			// so the vehicle slot isn't permanently lost.
+			Remaining.Add(Lane);
+		}
 	}
 
 	RespawnQueue = MoveTemp(Remaining);
@@ -675,7 +732,7 @@ void ATrafficSpawner::SpawnVehicles()
 		// Aggregate fleet-worst (LARGEST minimum turn radius across all
 		// vehicle classes) so junction curves are safe for every vehicle.
 		float WorstMinTurnRadius = 0.0f;
-		float WorstMaxHalfWidth = 100.0f; // conservative default
+		float WorstMaxHalfWidth = 150.0f; // conservative sedan default (~300cm total width)
 
 		auto ScanVehicleClass = [&](TSubclassOf<APawn> PawnClass)
 		{
@@ -829,6 +886,46 @@ void ATrafficSpawner::SpawnVehicles()
 			UE_LOG(LogAAATraffic, Log,
 				TEXT("TrafficSpawner: Filtered %d stub lanes (< %.0f cm) from spawn pool (%d -> %d)."),
 				StubsRemoved, MinSpawnLaneLengthCm, PreStubCount, AllLanes.Num());
+		}
+	}
+
+	// Filter out lanes on non-drivable road types (Walkway, Railway, etc.).
+	{
+		const int32 PreRoadTypeCount = AllLanes.Num();
+		AllLanes.RemoveAll([Provider](const FTrafficLaneHandle& Lane)
+		{
+			const FTrafficRoadHandle Road = Provider->GetRoadForLane(Lane);
+			if (!Road.IsValid()) { return false; }
+			const ETrafficRoadType RoadType = Provider->GetRoadType(Road);
+			return RoadType != ETrafficRoadType::Normal;
+		});
+		const int32 RoadTypeFiltered = PreRoadTypeCount - AllLanes.Num();
+		if (RoadTypeFiltered > 0)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("TrafficSpawner: Filtered %d lanes on non-drivable road types (%d -> %d)."),
+				RoadTypeFiltered, PreRoadTypeCount, AllLanes.Num());
+		}
+	}
+
+	// Filter out lanes whose primary type is non-drivable (Parking, Shoulder, Median, etc.).
+	{
+		const int32 PreLaneTypeCount = AllLanes.Num();
+		AllLanes.RemoveAll([Provider](const FTrafficLaneHandle& Lane)
+		{
+			const TArray<FTrafficLaneSection> Sections = Provider->GetLaneSections(Lane);
+			if (Sections.IsEmpty()) { return false; } // No section data — keep
+			const ETrafficLaneType PrimaryType = Sections[0].Type;
+			// Normal and CenterTurn lanes are drivable; all others are not.
+			return PrimaryType != ETrafficLaneType::Normal
+				&& PrimaryType != ETrafficLaneType::CenterTurn;
+		});
+		const int32 LaneTypeFiltered = PreLaneTypeCount - AllLanes.Num();
+		if (LaneTypeFiltered > 0)
+		{
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("TrafficSpawner: Filtered %d non-drivable lane-type lanes (%d -> %d)."),
+				LaneTypeFiltered, PreLaneTypeCount, AllLanes.Num());
 		}
 	}
 
@@ -994,14 +1091,59 @@ void ATrafficSpawner::SpawnVehicles()
 
 	for (int32 i = 0; i < SpawnCount; ++i)
 	{
-		const FTrafficLaneHandle& Lane = SpawnLanes[i % SpawnLanes.Num()];
+		const int32 LaneIdx = i % SpawnLanes.Num();
+		const FTrafficLaneHandle& Lane = SpawnLanes[LaneIdx];
 		const int32 SlotIndex = LaneOccupancy.FindOrAdd(Lane.HandleId, 0);
 		LaneOccupancy[Lane.HandleId] = SlotIndex + 1;
+
+		// Stagger vehicles across lanes so adjacent-lane vehicles don't
+		// spawn at the same longitudinal position and collide.
+		const float Stagger = LaneIdx * (SpawnSpacing / FMath::Max(1.0f, static_cast<float>(SpawnLanes.Num())));
 
 		FPendingInitialSpawn& Request = PendingInitialSpawns.Emplace_GetRef();
 		Request.Lane = Lane;
 		Request.SlotIndex = SlotIndex;
 		Request.VehicleIndex = i;
+		Request.LaneStagger = Stagger;
+	}
+
+	// Shuffle slot positions within each lane so that speed (seeded from
+	// VehicleIndex) does not correlate with physical position.  Without
+	// this, sequential FRandomStream seeds produce monotonically
+	// increasing speeds, placing the fastest vehicle at the front of
+	// every lane — making overtaking impossible.
+	{
+		FRandomStream ShuffleRng(SpawnSeed + 30000);
+
+		TMap<int32, TArray<int32>> LaneGroups;
+		for (int32 j = 0; j < PendingInitialSpawns.Num(); ++j)
+		{
+			LaneGroups.FindOrAdd(PendingInitialSpawns[j].Lane.HandleId).Add(j);
+		}
+
+		for (auto& Pair : LaneGroups)
+		{
+			TArray<int32>& Indices = Pair.Value;
+			if (Indices.Num() < 2) { continue; }
+
+			TArray<int32> Slots;
+			Slots.Reserve(Indices.Num());
+			for (int32 Idx : Indices)
+			{
+				Slots.Add(PendingInitialSpawns[Idx].SlotIndex);
+			}
+
+			for (int32 k = Slots.Num() - 1; k > 0; --k)
+			{
+				const int32 SwapIdx = ShuffleRng.RandHelper(k + 1);
+				Slots.Swap(k, SwapIdx);
+			}
+
+			for (int32 k = 0; k < Indices.Num(); ++k)
+			{
+				PendingInitialSpawns[Indices[k]].SlotIndex = Slots[k];
+			}
+		}
 	}
 
 	TotalVehiclesSpawned = SpawnCount;

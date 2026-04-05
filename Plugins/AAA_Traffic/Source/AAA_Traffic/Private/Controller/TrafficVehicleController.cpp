@@ -247,6 +247,13 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, LaneChangeCooldownTime(5.0f)
 	, LaneChangeSpeedThreshold(0.6f)
 	, LaneChangeGapRequired(800.f)
+	, OvertakeStuckTimeSec(2.0f)
+	, OvertakeMinClearanceCm(3000.0f)
+	, OvertakeAbortClearanceCm(3000.0f)
+	, OvertakeSpeedBoostPct(15.0f)
+	, OvertakeMinPassDistCm(2000.0f)
+	, OvertakeBlendDistCm(1200.0f)
+	, OvertakeCooldownTimeSec(20.0f)
 	, DefaultSpeedLimit(0.0f)
 	, JunctionScanMaxDistanceCm(50000.0f)
 	, MaxJunctionScanHops(10)
@@ -263,6 +270,15 @@ ATrafficVehicleController::ATrafficVehicleController()
 	LaneChangeCoord_.Owner = this;
 	TransitionEngine_.Owner = this;
 	JunctionNeg_.Owner = this;
+
+	// Sync overtaking config to coordinator.
+	LaneChangeCoord_.OvertakeStuckTimeSec    = OvertakeStuckTimeSec;
+	LaneChangeCoord_.OvertakeMinClearanceCm  = OvertakeMinClearanceCm;
+	LaneChangeCoord_.OvertakeAbortClearanceCm = OvertakeAbortClearanceCm;
+	LaneChangeCoord_.OvertakeSpeedBoostPct   = OvertakeSpeedBoostPct;
+	LaneChangeCoord_.OvertakeMinPassDistCm   = OvertakeMinPassDistCm;
+	LaneChangeCoord_.OvertakeBlendDistCm     = OvertakeBlendDistCm;
+	LaneChangeCoord_.OvertakeCooldownTimeSec = OvertakeCooldownTimeSec;
 }
 
 void ATrafficVehicleController::SetTargetSpeed(float InSpeed)
@@ -343,11 +359,35 @@ ETurnSignalState ATrafficVehicleController::GetSelectedTurnDirection() const
 
 bool ATrafficVehicleController::IsUsableExitLane(const FTrafficLaneHandle& Lane) const
 {
-	// Any valid lane is a usable exit.  Dead-end lanes (those without
-	// downstream connectivity to another junction) are explicitly included:
-	// vehicles that reach the end of a dead-end road are recycled by the
-	// dead-end despawn system.
-	return Lane.IsValid();
+	if (!Lane.IsValid()) { return false; }
+
+	// Reject lanes on non-drivable road types (Walkway, Railway, etc.).
+	if (CachedProvider)
+	{
+		const FTrafficRoadHandle Road = CachedProvider->GetRoadForLane(Lane);
+		if (Road.IsValid())
+		{
+			const ETrafficRoadType RoadType = CachedProvider->GetRoadType(Road);
+			if (RoadType != ETrafficRoadType::Normal)
+			{
+				return false;
+			}
+		}
+
+		// Reject lanes whose primary type is non-drivable.
+		const TArray<FTrafficLaneSection> Sections = CachedProvider->GetLaneSections(Lane);
+		if (!Sections.IsEmpty())
+		{
+			const ETrafficLaneType PrimaryType = Sections[0].Type;
+			if (PrimaryType != ETrafficLaneType::Normal
+				&& PrimaryType != ETrafficLaneType::CenterTurn)
+			{
+				return false;
+			}
+		}
+	}
+
+	return true;
 }
 
 
@@ -659,6 +699,17 @@ void ATrafficVehicleController::OnUnPossess()
 					(int32)JnctState.Phase);
 			}
 			TrafficSub->UnregisterVehicle(this);
+			// Release any deferred junction occupancy before cleanup.
+			if (bDeferredJunctionRelease)
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("JNCT DEFERRED-RELEASE-UNPOSSESS: Pawn='%s' junction %d — releasing on despawn"),
+					GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+					DeferredJunctionReleaseId);
+				TrafficSub->ReleaseJunction(DeferredJunctionReleaseId, this);
+				bDeferredJunctionRelease = false;
+				DeferredJunctionReleaseId = 0;
+			}
 			if (JnctState.IsActive())
 			{
 				JnctState.Reset();
@@ -692,9 +743,7 @@ void ATrafficVehicleController::HandleActorHit(
 		Impulse);
 	CollisionBrakeTimer = FMath::Max(CollisionBrakeTimer, BrakeTime);
 
-	// Latch for the duration of the current brake window by OR-ing with
-	// the existing flag.  A subsequent geometry hit must not clear a prior
-	// vehicle-vehicle collision while CollisionBrakeTimer is still active.
+	// Track whether this was a vehicle-vehicle collision (other actor is a Pawn).
 	bCollisionWithVehicle = bCollisionWithVehicle || OtherActor->IsA<APawn>();
 
 	UE_LOG(LogAAATraffic, Warning,
@@ -787,6 +836,28 @@ void ATrafficVehicleController::Tick(float DeltaSeconds)
 		{
 			CurrentLOD = TrafficSub->GetVehicleLOD(this);
 			TrafficSub->UpdateVehiclePosition(this, GetPawn()->GetActorLocation());
+		}
+	}
+
+	// ── Deferred junction release ──
+	// When a vehicle exits a junction onto a lane not registered in the
+	// junction system, occupancy release is deferred until the vehicle
+	// clears the junction area (distance-based).
+	if (bDeferredJunctionRelease && TrafficSub && GetPawn())
+	{
+		const float DistSq = FVector::DistSquared(GetPawn()->GetActorLocation(), DeferredJunctionReleaseOrigin);
+		if (DistSq > DeferredJunctionReleaseDistCm * DeferredJunctionReleaseDistCm)
+		{
+			UE_LOG(LogAAATraffic, Warning,
+				TEXT("JNCT DEFERRED-RELEASE-FIRE: Pawn='%s' junction %d — "
+					 "traveled %.0f cm from exit, releasing"),
+				*GetPawn()->GetName(), DeferredJunctionReleaseId,
+				FMath::Sqrt(DistSq));
+			TrafficSub->ReleaseJunction(DeferredJunctionReleaseId, this);
+			bDeferredJunctionRelease = false;
+			DeferredJunctionReleaseId = 0;
+			DeferredJunctionReleaseOrigin = FVector::ZeroVector;
+			DeferredJunctionReleaseDistCm = 1500.0f;
 		}
 	}
 

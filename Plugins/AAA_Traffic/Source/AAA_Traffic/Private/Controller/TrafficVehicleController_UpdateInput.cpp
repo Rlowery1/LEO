@@ -21,6 +21,7 @@ extern int32 GTrafficJunctionDiagnostics;
 extern int32 GTrafficDebugDraw;
 void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 {
+	SCOPE_CYCLE_COUNTER(STAT_AAATraffic_UpdateVehicleInput);
 	APawn* ControlledPawn = GetPawn();
 	if (!ControlledPawn)
 	{
@@ -138,11 +139,12 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 	DbgStoppingDist = (FMath::Abs(CurrentSpeed) * FMath::Abs(CurrentSpeed)) / (2.0f * ApproachDecelCmPerSec2);
 #endif
 
+	// Save pre-tick location BEFORE updating PreviousVehicleLocation,
+	// so the displacement guard later can compare against the real previous frame.
+	const FVector PreTickLocation = PreviousVehicleLocation;
+
 	// Track cumulative distance traveled on this lane to prevent short-lane transition loops.
 	DistanceThisTick = 0.0f;
-	// Snapshot for end-of-tick displacement guard (must be saved BEFORE
-	// PreviousVehicleLocation is updated to the current frame).
-	const FVector PreTickLocation = PreviousVehicleLocation;
 	if (!PreviousVehicleLocation.IsZero())
 	{
 		DistanceThisTick = FVector::Dist(PreviousVehicleLocation, VehicleLocation);
@@ -152,6 +154,7 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 
 	// Tick lane-change cooldown + evaluate.
 	LaneChangeCoord_.TickCooldown(DeltaSeconds);
+	LaneChangeCoord_.TickOvertakeCooldown(DeltaSeconds);
 	if (LaneChangeCoord_.ShouldEvaluate())
 	{
 		// Assemble eval context.
@@ -171,8 +174,9 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		LCCtx.bJunctionApproaching = (JnctState.Phase == EJunctionPhase::Approaching);
 
 		// Pre-compute leader distance for lane-change evaluation.
-		float UnusedLeaderSpeed = 0.0f;
-		LCCtx.LeaderDist = GetLeaderDistance(UnusedLeaderSpeed);
+		float LeaderSpeedOut = 0.0f;
+		LCCtx.LeaderDist  = GetLeaderDistance(LeaderSpeedOut);
+		LCCtx.LeaderSpeed = LeaderSpeedOut;
 
 		LCCtx.RoadProvider = CachedProvider;
 		if (UWorld* W = GetWorld())
@@ -185,6 +189,29 @@ void ATrafficVehicleController::UpdateVehicleInput(float DeltaSeconds)
 		{
 			SetTurnSignal(LCResult.TurnSignal);
 		}
+		else if (!LaneChangeCoord_.IsOvertaking())
+		{
+			// No same-direction lane change accepted — evaluate overtaking.
+			LaneChangeCoord_.EvaluateOvertake(LCCtx, DeltaSeconds);
+		}
+	}
+
+	// Tick active overtake (phase advancement, safety checks, offset blending).
+	if (LaneChangeCoord_.IsOvertaking())
+	{
+		FLaneChangeEvalContext OTCtx;
+		OTCtx.VehicleLocation   = VehicleLocation;
+		OTCtx.EgoForward        = ControlledPawn->GetActorForwardVector();
+		OTCtx.DetectionDistance  = DetectionDistance;
+		{
+			float OTLeaderSpeed = 0.0f;
+			OTCtx.LeaderDist = GetLeaderDistance(OTLeaderSpeed);
+		}
+		if (UWorld* W = GetWorld())
+		{
+			OTCtx.TrafficSub = W->GetSubsystem<UTrafficSubsystem>();
+		}
+		LaneChangeCoord_.TickOvertake(DeltaSeconds, DistanceThisTick, OTCtx);
 	}
 
 	// Find where we are on the lane and where to aim
@@ -445,6 +472,20 @@ return;
 		TargetPoint = GetLookAheadPoint(VehicleLocation, ClosestIndex);
 	}
 
+	// Apply overtaking lateral offset to the steering target.
+	if (LaneChangeCoord_.IsOvertaking())
+	{
+		const float OTOffset = LaneChangeCoord_.GetOvertakeLateralOffset();
+		if (FMath::Abs(OTOffset) > KINDA_SMALL_NUMBER && CachedProvider)
+		{
+			const FVector LaneDir = CachedProvider->GetLaneDirection(CurrentLane);
+			const FVector LaneRight = FVector::CrossProduct(LaneDir, FVector::UpVector).GetSafeNormal();
+			// Left-side overtake = offset to driver's left (negative right).
+			const float OTSign = (LaneChangeCoord_.OvertakeSide == ETrafficLaneSide::Left) ? -1.0f : 1.0f;
+			TargetPoint += LaneRight * OTSign * OTOffset;
+		}
+	}
+
 	// --- Steering (delegated to FSteeringComputer) ---
 	// Resolve effective lane width from provider before calling.
 	float EffectiveLaneWidth = LaneWidth;
@@ -625,6 +666,13 @@ return;
 
 	const FSpeedEnvelopeOutput SpeedOut = SpeedEnvelope_.Compute(SpeedIn);
 	float EffectiveTargetSpeed = SpeedOut.EffectiveTargetSpeed;
+
+	// Overtaking speed boost: temporarily exceed target speed to pass decisively.
+	if (LaneChangeCoord_.IsOvertaking())
+	{
+		EffectiveTargetSpeed *= LaneChangeCoord_.GetOvertakeSpeedBoostFactor();
+	}
+
 	LastDiagJunctionCurveRadiusCm = SpeedOut.DbgJunctionTurnRadiusCm;
 	LastDiagJunctionCurveArcLengthCm = SpeedOut.DbgJunctionArcLengthCm;
 	LastDiagJunctionCurveAngleDeg = SpeedOut.DbgJunctionTotalAngleDeg;
@@ -1019,6 +1067,11 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 	// along each segment. Accumulate distance and return total
 	// on first hit.
 	const TArray<FVector>& Pts = *Polyline;
+	// Extend the budget to compensate for the self-collision offset
+	// on the first segment, so the total effective swept distance
+	// equals DetectionDistance (not DetectionDistance minus the buffer).
+	const float EffDetectionDist = DetectionDistance + SweepRadius + SelfCollisionBuffer;
+
 	float AccumDist = 0.0f;
 	FVector SegStart = VehicleLocation;
 	bool bFirstSeg = true;
@@ -1034,7 +1087,7 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 		}
 
 		const float SegLen = FVector::Dist(SegStart, SegEnd);
-		const float BudgetRemaining = DetectionDistance - AccumDist;
+		const float BudgetRemaining = EffDetectionDist - AccumDist;
 		if (BudgetRemaining <= 0.0f) break;
 
 		// On the first segment, offset start past our own collision.
@@ -1078,7 +1131,7 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 	// end (e.g., entering a junction) are invisible to following vehicles
 	// -- the leading cause of rear-end collisions at junction entries.
 	{
-		const float ExtBudget = DetectionDistance - AccumDist;
+		const float ExtBudget = EffDetectionDist - AccumDist;
 		if (ExtBudget > 0.0f && Pts.Num() >= 2)
 		{
 			const FVector LastDir = (Pts.Last() - Pts[Pts.Num() - 2]).GetSafeNormal();
@@ -1108,6 +1161,42 @@ float ATrafficVehicleController::GetLeaderDistance(float& OutLeaderSpeed) const
 		}
 	}
 
-	return -1.0f; // No leader found within detection distance.
+	// Spatial fallback: if the physics sweep found nothing, query
+	// vehicles registered on the same lane. This mirrors the
+	// fallback in LeaderDetector::Detect() and covers channels
+	// the sweep sphere cannot reach (e.g. vehicle collision
+	// profiles that do not block ECC_Pawn).
+	if (UTrafficSubsystem* Sub = World->GetSubsystem<UTrafficSubsystem>())
+	{
+		const FVector VehicleFwd = ControlledPawn->GetActorForwardVector();
+		const TArray<TWeakObjectPtr<ATrafficVehicleController>>& LaneVehicles =
+			Sub->GetVehiclesOnLane(CurrentLane);
+		float BestDist = MAX_FLT;
+		float BestSpeed = 0.0f;
+		for (const TWeakObjectPtr<ATrafficVehicleController>& WeakVeh : LaneVehicles)
+		{
+			const ATrafficVehicleController* Veh = WeakVeh.Get();
+			if (!Veh || Veh == this) continue;
+			const APawn* VehPawn = Veh->GetPawn();
+			if (!VehPawn) continue;
+			// Heading alignment — reject oncoming.
+			if (FVector::DotProduct(VehPawn->GetActorForwardVector(), VehicleFwd) < 0.0f)
+				continue;
+			const FVector Delta = VehPawn->GetActorLocation() - VehicleLocation;
+			const float FwdDist = FVector::DotProduct(Delta, VehicleFwd);
+			if (FwdDist > 0.0f && FwdDist < DetectionDistance && FwdDist < BestDist)
+			{
+				BestDist = FwdDist;
+				BestSpeed = FVector::DotProduct(VehPawn->GetVelocity(), VehicleFwd);
+			}
+		}
+		if (BestDist < MAX_FLT)
+		{
+			OutLeaderSpeed = BestSpeed;
+			return BestDist;
+		}
+	}
+
+	return -1.0f;
 }
 

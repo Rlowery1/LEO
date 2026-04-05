@@ -644,15 +644,49 @@ static bool Segments2DIntersect(const FVector& A, const FVector& B,
 	const float T = (Cx * By - Cy * Bx) / Denom;
 	const float U = (Cx * Ay - Cy * Ax) / Denom;
 
-	// Strict interior intersection (excluding shared endpoints).
-	constexpr float Eps = 0.01f;
+	// Near-inclusive intersection (tiny margin prevents degenerate hits
+	// at truly shared endpoints handled by the caller's From/To checks).
+	constexpr float Eps = 1e-4f;
 	return (T > Eps && T < (1.0f - Eps)) && (U > Eps && U < (1.0f - Eps));
+}
+
+// Squared 2D distance from point P to segment S0-S1.
+static float PointSegDistSq2D(const FVector& P, const FVector& S0, const FVector& S1)
+{
+	const float Dx = S1.X - S0.X;
+	const float Dy = S1.Y - S0.Y;
+	const float LenSq = Dx * Dx + Dy * Dy;
+	if (LenSq < KINDA_SMALL_NUMBER)
+	{
+		const float Ex = P.X - S0.X;
+		const float Ey = P.Y - S0.Y;
+		return Ex * Ex + Ey * Ey;
+	}
+	const float T = FMath::Clamp(
+		((P.X - S0.X) * Dx + (P.Y - S0.Y) * Dy) / LenSq, 0.0f, 1.0f);
+	const float Qx = S0.X + T * Dx - P.X;
+	const float Qy = S0.Y + T * Dy - P.Y;
+	return Qx * Qx + Qy * Qy;
+}
+
+// Minimum squared 2D distance between segments AB and CD.
+static float Segments2DMinDistSq(const FVector& A, const FVector& B,
+	const FVector& C, const FVector& D)
+{
+	float MinSq = PointSegDistSq2D(A, C, D);
+	MinSq = FMath::Min(MinSq, PointSegDistSq2D(B, C, D));
+	MinSq = FMath::Min(MinSq, PointSegDistSq2D(C, A, B));
+	MinSq = FMath::Min(MinSq, PointSegDistSq2D(D, A, B));
+	return MinSq;
 }
 
 bool URoadBLDReflectionProvider::DoJunctionPathsConflict(
 	const FTrafficLaneHandle& FromA, const FTrafficLaneHandle& ToA,
-	const FTrafficLaneHandle& FromB, const FTrafficLaneHandle& ToB)
+	const FTrafficLaneHandle& FromB, const FTrafficLaneHandle& ToB,
+	bool* bOutProximityConflict)
 {
+	if (bOutProximityConflict) { *bOutProximityConflict = false; }
+
 	// Same approach or same exit → conflict (vehicles would merge).
 	if (FromA == FromB || ToA == ToB) { return true; }
 
@@ -681,13 +715,76 @@ bool URoadBLDReflectionProvider::DoJunctionPathsConflict(
 		PathB.Add(ToBCache->StartPos);
 	}
 
-	// Test all pairs of segments between PathA and PathB for 2D intersection.
+	// Test all pairs of segments between PathA and PathB for 2D intersection
+	// or proximity within vehicle-width clearance.
+	//
+	// Two-tier proximity check:
+	//  1. AbsoluteMinSeparation (~vehicle width): always flags conflict
+	//     regardless of relative angle — parallel paths this close WILL
+	//     produce physical overlap.
+	//  2. AngleMinSeparation (wider buffer): only flags when segments are
+	//     NOT roughly parallel (angle > ~30°).  Parallel movements at this
+	//     distance are safe (vehicles drive alongside each other).
+	constexpr float AbsoluteMinSeparationCm = 180.0f; // ~vehicle width
+	constexpr float AngleMinSeparationCm    = 250.0f; // wider for crossing paths
+	const float AbsMinSq = AbsoluteMinSeparationCm * AbsoluteMinSeparationCm;
+	const float AngMinSq = AngleMinSeparationCm * AngleMinSeparationCm;
+	constexpr float ParallelDotThreshold = 0.85f; // ~30°
+
+	// ── Exit/approach convergence check ────────────────────────────
+	// Junction path proximity is common (curves naturally converge inside
+	// junctions).  The DANGEROUS case is when the EXIT of one movement and
+	// the APPROACH of another are physically close in worldspace — meaning
+	// vehicles on their approach/exit LANES can collide outside the junction.
+	// PathA[0] = FromA.EndPos (approach of A), PathA.Last() = ToA.StartPos (exit of A)
+	// PathB[0] = FromB.EndPos (approach of B), PathB.Last() = ToB.StartPos (exit of B)
+	constexpr float ConvergenceCm = 200.0f;
+	const float ConvergenceSq = ConvergenceCm * ConvergenceCm;
+	bool bExitApproachConvergent = false;
+	if (bOutProximityConflict && PathA.Num() >= 2 && PathB.Num() >= 2)
+	{
+		const float DistAB = FVector::DistSquared2D(PathA.Last(), PathB[0]);
+		const float DistBA = FVector::DistSquared2D(PathB.Last(), PathA[0]);
+		bExitApproachConvergent = (DistAB < ConvergenceSq || DistBA < ConvergenceSq);
+	}
+
 	for (int32 i = 0; i < PathA.Num() - 1; ++i)
 	{
 		for (int32 j = 0; j < PathB.Num() - 1; ++j)
 		{
 			if (Segments2DIntersect(PathA[i], PathA[i + 1], PathB[j], PathB[j + 1]))
 			{
+				return true;
+			}
+
+			const float SegDistSq = Segments2DMinDistSq(
+				PathA[i], PathA[i + 1], PathB[j], PathB[j + 1]);
+
+			// Tier 1: unconditional – within vehicle width, always conflict.
+			if (SegDistSq < AbsMinSq)
+			{
+				if (bOutProximityConflict && bExitApproachConvergent) { *bOutProximityConflict = true; }
+				return true;
+			}
+
+			// Tier 2: angle-dependent – only for non-parallel segments.
+			if (SegDistSq < AngMinSq)
+			{
+				const FVector2D DirA(
+					(PathA[i + 1] - PathA[i]).X, (PathA[i + 1] - PathA[i]).Y);
+				const FVector2D DirB(
+					(PathB[j + 1] - PathB[j]).X, (PathB[j + 1] - PathB[j]).Y);
+				const float LenAB = DirA.Size() * DirB.Size();
+				if (LenAB > KINDA_SMALL_NUMBER)
+				{
+					const float DirDot = FMath::Abs(
+						FVector2D::DotProduct(DirA, DirB) / LenAB);
+					if (DirDot >= ParallelDotThreshold)
+					{
+						continue; // Parallel and beyond vehicle width — safe.
+					}
+				}
+				if (bOutProximityConflict && bExitApproachConvergent) { *bOutProximityConflict = true; }
 				return true;
 			}
 		}

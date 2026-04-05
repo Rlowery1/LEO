@@ -128,7 +128,7 @@ void URoadBLDReflectionProvider::Deinitialize()
 	RoadTotalWidthMap.Empty();
 	RoadClassificationMap.Empty();
 	FleetMinTurnRadiusCm = 0.0f;
-	FleetMaxHalfWidthCm = 100.0f;
+	FleetMaxHalfWidthCm = 150.0f;
 	bCached = false;
 
 	DynRoadClass = nullptr;
@@ -458,6 +458,40 @@ bool URoadBLDReflectionProvider::GetLanePath(
 				RefLine         ? TEXT("OK") : TEXT("NULL"),
 				Get3DPosFunc    ? TEXT("OK") : TEXT("NULL"),
 				ConvertDistFunc ? TEXT("OK") : TEXT("NULL"));
+		}
+	}
+
+	// ── DIAG: One-shot log of edge identity & first sample position per lane ──
+	{
+		static TSet<int32> DiagLoggedLanes;
+		if (!DiagLoggedLanes.Contains(Lane.HandleId))
+		{
+			DiagLoggedLanes.Add(Lane.HandleId);
+			if (bCanDoEdgeSampling)
+			{
+				const double D0 = 0.0;
+				const double LD0 = ConvertDistanceBetweenCurves(RoadActor, RefLine, LeftEdge, D0);
+				const double RD0 = ConvertDistanceBetweenCurves(RoadActor, RefLine, RightEdge, D0);
+				const FVector LP0 = Get3DPositionAtDistance(LeftEdge, RefLine, LD0);
+				const FVector RP0 = Get3DPositionAtDistance(RightEdge, RefLine, RD0);
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("RoadBLDReflectionProvider: DIAG lane %d — "
+						 "LeftEdge=%s(%p) RightEdge=%s(%p) RefLine=%s(%p) | "
+						 "D0: LeftPos=(%.1f,%.1f,%.1f) RightPos=(%.1f,%.1f,%.1f) Center=(%.1f,%.1f,%.1f)"),
+					Lane.HandleId,
+					LeftEdge  ? *LeftEdge->GetName()  : TEXT("null"), LeftEdge,
+					RightEdge ? *RightEdge->GetName() : TEXT("null"), RightEdge,
+					RefLine   ? *RefLine->GetName()   : TEXT("null"), RefLine,
+					LP0.X, LP0.Y, LP0.Z,
+					RP0.X, RP0.Y, RP0.Z,
+					(LP0.X+RP0.X)*0.5, (LP0.Y+RP0.Y)*0.5, (LP0.Z+RP0.Z)*0.5);
+			}
+			else
+			{
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("RoadBLDReflectionProvider: DIAG lane %d — FALLBACK path (no edge sampling)"),
+					Lane.HandleId);
+			}
 		}
 	}
 
@@ -912,17 +946,60 @@ FVector URoadBLDReflectionProvider::GetLaneDirectionAtDistance(
 float URoadBLDReflectionProvider::GetLaneWidthAtDistance(
 	const FTrafficLaneHandle& Lane, float Distance)
 {
-	// RoadBLD exposes a single width per lane via reflection.
-	// Variable-width support would require additional reflection calls
-	// to the edge curves.  For now, return the uniform cached width.
+	// Resolve effective lane ID through virtual-lane indirection.
+	int32 EffectiveId = Lane.HandleId;
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
+	{
+		EffectiveId = VInfo->OriginalLaneHandle;
+	}
+
+	// Base uniform width.
+	float BaseWidth = 350.0f;
 	const FLaneEndpointCache* Cached = LaneEndpointMap.Find(Lane.HandleId);
 	if (Cached)
 	{
-		return Cached->Width;
+		BaseWidth = Cached->Width;
 	}
-	// Fallback: fetch from lane metadata.
-	const FReflectionLaneData* Data = LaneHandleMap.Find(Lane.HandleId);
-	return Data ? Data->LaneWidth : 350.0f;
+	else if (const FReflectionLaneData* Data = LaneHandleMap.Find(EffectiveId))
+	{
+		BaseWidth = Data->LaneWidth;
+	}
+
+	// If active segments are available, compute width with transition
+	// interpolation.  Outside all active segments the lane has zero width
+	// (e.g. pre-merge or post-diverge zones).
+	const FReflectionLaneData* LData = LaneHandleMap.Find(EffectiveId);
+	if (LData && !LData->CachedActiveSegments.IsEmpty())
+	{
+		const double Dist = static_cast<double>(Distance);
+		for (const FTrafficLaneSegment& Seg : LData->CachedActiveSegments)
+		{
+			if (Dist < Seg.StartDistance || Dist > Seg.EndDistance)
+			{
+				continue;
+			}
+			// Inside this segment — check if in a transition zone.
+			const double DistFromStart = Dist - Seg.StartDistance;
+			const double DistFromEnd = Seg.EndDistance - Dist;
+			float WidthScale = 1.0f;
+			if (Seg.TransitionIn > 0.0 && DistFromStart < Seg.TransitionIn)
+			{
+				// Ramp from 0 to 1 over TransitionIn distance.
+				WidthScale = static_cast<float>(DistFromStart / Seg.TransitionIn);
+			}
+			if (Seg.TransitionOut > 0.0 && DistFromEnd < Seg.TransitionOut)
+			{
+				// Ramp from 1 to 0 over TransitionOut distance.
+				const float OutScale = static_cast<float>(DistFromEnd / Seg.TransitionOut);
+				WidthScale = FMath::Min(WidthScale, OutScale);
+			}
+			return BaseWidth * FMath::Clamp(WidthScale, 0.0f, 1.0f);
+		}
+		// Distance is outside all active segments — lane has no width here.
+		return 0.0f;
+	}
+
+	return BaseWidth;
 }
 
 // ---------------------------------------------------------------------------
@@ -932,9 +1009,17 @@ float URoadBLDReflectionProvider::GetLaneWidthAtDistance(
 float URoadBLDReflectionProvider::GetLaneCurvatureAtDistance(
 	const FTrafficLaneHandle& Lane, float Distance)
 {
-	// Compute Menger curvature κ from 3 polyline points surrounding the
-	// requested distance.  κ = 4·Area(triangle) / (|AB|·|BC|·|CA|).
+	// Compute curvature κ, preferring native turn radius from the road's
+	// spline when available, falling back to Menger curvature from polyline.
 	// Sign: positive = left turn, negative = right turn (Z-up right-hand).
+
+	// Resolve effective lane ID through virtual-lane indirection.
+	int32 EffectiveId = Lane.HandleId;
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
+	{
+		EffectiveId = VInfo->OriginalLaneHandle;
+	}
+
 	const FLaneEndpointCache* Cached = LaneEndpointMap.Find(Lane.HandleId);
 	if (!Cached || Cached->Polyline.Num() < 3)
 	{
@@ -942,11 +1027,12 @@ float URoadBLDReflectionProvider::GetLaneCurvatureAtDistance(
 	}
 
 	const TArray<FVector>& Pts = Cached->Polyline;
+	const int32 NumPts = Pts.Num();
 
 	// Find the index closest to the requested distance.
 	float Accumulated = 0.0f;
 	int32 MidIdx = 0;
-	for (int32 i = 0; i < Pts.Num() - 1; ++i)
+	for (int32 i = 0; i < NumPts - 1; ++i)
 	{
 		const float SegLen = FVector::Dist(Pts[i], Pts[i + 1]);
 		if (Accumulated + SegLen >= Distance)
@@ -958,18 +1044,52 @@ float URoadBLDReflectionProvider::GetLaneCurvatureAtDistance(
 		MidIdx = i + 1;
 	}
 
-	// Widen the point spacing to suppress 100cm sampling noise.
-	// Use half CurveScanWindowSize equivalent (≈2-3 points spread).
+	// Determine curvature sign from local polyline geometry (needed for
+	// both Menger and native-radius paths).
 	constexpr int32 Spread = 2;
 	const int32 IdxA = FMath::Max(0, MidIdx - Spread);
-	const int32 IdxC = FMath::Min(Pts.Num() - 1, MidIdx + Spread);
+	const int32 IdxC = FMath::Min(NumPts - 1, MidIdx + Spread);
 	const int32 IdxB = (IdxA + IdxC) / 2;
 
+	// Early-out if not enough geometry.
 	if (IdxA == IdxB || IdxB == IdxC)
 	{
 		return 0.0f;
 	}
 
+	// Try native turn radius from RoadBLD's spline — more accurate than
+	// polyline Menger curvature, especially on smooth curves.
+	if (GetPointTurnRadiusFunc)
+	{
+		const FTrafficRoadHandle Road = GetRoadForLane(Lane);
+		if (Road.IsValid())
+		{
+			// Approximate road point index from lane distance / total length.
+			const float LaneLength = GetLaneLength(Lane);
+			if (LaneLength > 0.0f && NumPts > 1)
+			{
+				const int32 PointIndex = FMath::Clamp(
+					FMath::RoundToInt32(Distance * (NumPts - 1) / LaneLength),
+					0, NumPts - 1);
+
+				double TurnRadius = 0.0;
+				if (GetPointTurnRadius(Road, PointIndex, TurnRadius)
+					&& TurnRadius > 0.0)
+				{
+					// Determine sign from polyline cross product.
+					const FVector& A = Pts[IdxA];
+					const FVector& B = Pts[IdxB];
+					const FVector& C = Pts[IdxC];
+					const float SignedArea2 = (B.X - A.X) * (C.Y - A.Y)
+						- (B.Y - A.Y) * (C.X - A.X);
+					const float Sign = (SignedArea2 >= 0.0f) ? 1.0f : -1.0f;
+					return Sign * static_cast<float>(1.0 / TurnRadius);
+				}
+			}
+		}
+	}
+
+	// Fallback: Menger curvature from polyline 3-point circumradius.
 	const FVector& A = Pts[IdxA];
 	const FVector& B = Pts[IdxB];
 	const FVector& C = Pts[IdxC];
@@ -984,8 +1104,8 @@ float URoadBLDReflectionProvider::GetLaneCurvatureAtDistance(
 		return 0.0f;
 	}
 
-	// Signed area of triangle (2D cross product / 2).
-	const float SignedArea2 = (B.X - A.X) * (C.Y - A.Y) - (B.Y - A.Y) * (C.X - A.X);
+	const float SignedArea2 = (B.X - A.X) * (C.Y - A.Y)
+		- (B.Y - A.Y) * (C.X - A.X);
 	return (2.0f * SignedArea2) / Denom;
 }
 
@@ -1000,4 +1120,116 @@ float URoadBLDReflectionProvider::GetLaneArcLength(const FTrafficLaneHandle& Lan
 	// GetCurveLength via reflection could yield slightly different values
 	// but would require additional reflection setup.
 	return GetLaneLength(Lane);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1A: New data plumbing query implementations
+// ---------------------------------------------------------------------------
+
+ETrafficRoadType URoadBLDReflectionProvider::GetRoadType(const FTrafficRoadHandle& Road)
+{
+	if (const uint8* Found = RoadTypeMap.Find(Road.HandleId))
+	{
+		const uint8 Val = *Found;
+		// ERoadType values: 0=Normal, 1=Walkway, 2=Railway, 3=Other
+		if (Val <= static_cast<uint8>(ETrafficRoadType::Other))
+		{
+			return static_cast<ETrafficRoadType>(Val);
+		}
+	}
+	return ETrafficRoadType::Normal;
+}
+
+TArray<FTrafficLaneSection> URoadBLDReflectionProvider::GetLaneSections(const FTrafficLaneHandle& Lane)
+{
+	int32 EffectiveId = Lane.HandleId;
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
+	{
+		EffectiveId = VInfo->OriginalLaneHandle;
+	}
+
+	const FReflectionLaneData* Data = LaneHandleMap.Find(EffectiveId);
+	if (!Data) { return {}; }
+
+	TArray<FTrafficLaneSection> Result;
+	Result.Reserve(Data->CachedLaneSections.Num());
+	for (const TPair<double, uint8>& Pair : Data->CachedLaneSections)
+	{
+		FTrafficLaneSection Sec;
+		Sec.StartDistance = Pair.Key;
+		// Map RoadBLD ELaneType ordinal → ETrafficLaneType
+		Sec.Type = (Pair.Value <= static_cast<uint8>(ETrafficLaneType::Median))
+			? static_cast<ETrafficLaneType>(Pair.Value)
+			: ETrafficLaneType::Normal;
+		Result.Add(Sec);
+	}
+	return Result;
+}
+
+TArray<FTrafficLaneSegment> URoadBLDReflectionProvider::GetLaneActiveSegments(const FTrafficLaneHandle& Lane)
+{
+	int32 EffectiveId = Lane.HandleId;
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
+	{
+		EffectiveId = VInfo->OriginalLaneHandle;
+	}
+
+	const FReflectionLaneData* Data = LaneHandleMap.Find(EffectiveId);
+	if (!Data) { return {}; }
+
+	return Data->CachedActiveSegments;
+}
+
+bool URoadBLDReflectionProvider::IsLaneOnLeftSide(const FTrafficLaneHandle& Lane)
+{
+	int32 EffectiveId = Lane.HandleId;
+	if (const FVirtualLaneInfo* VInfo = VirtualLaneMap.Find(Lane.HandleId))
+	{
+		EffectiveId = VInfo->OriginalLaneHandle;
+	}
+
+	const FReflectionLaneData* Data = LaneHandleMap.Find(EffectiveId);
+	return Data ? Data->bIsLeftLane : false;
+}
+
+TArray<FTrafficRoadHandle> URoadBLDReflectionProvider::GetSnappedRoads(const FTrafficRoadHandle& Road)
+{
+	const TArray<int32>* Snapped = RoadSnapMap.Find(Road.HandleId);
+	if (!Snapped) { return {}; }
+
+	TArray<FTrafficRoadHandle> Result;
+	Result.Reserve(Snapped->Num());
+	for (int32 Id : *Snapped)
+	{
+		Result.Add(FTrafficRoadHandle(Id));
+	}
+	return Result;
+}
+
+bool URoadBLDReflectionProvider::GetPointTurnRadius(
+	const FTrafficRoadHandle& Road, int32 PointIndex, double& OutRadius)
+{
+	if (!GetPointTurnRadiusFunc) { return false; }
+
+	const TWeakObjectPtr<UObject>* RoadObj = RoadHandleMap.Find(Road.HandleId);
+	if (!RoadObj || !RoadObj->IsValid()) { return false; }
+
+	// Call ADynamicRoad::GetPointTurnRadius(int32 PointIndex, double& OutTurnRadius) → bool
+	struct
+	{
+		int32 PointIndex;
+		double OutTurnRadius;
+		bool ReturnValue;
+	} Params;
+	Params.PointIndex = PointIndex;
+	Params.OutTurnRadius = 0.0;
+	Params.ReturnValue = false;
+
+	RoadObj->Get()->ProcessEvent(GetPointTurnRadiusFunc, &Params);
+
+	if (Params.ReturnValue)
+	{
+		OutRadius = Params.OutTurnRadius;
+	}
+	return Params.ReturnValue;
 }

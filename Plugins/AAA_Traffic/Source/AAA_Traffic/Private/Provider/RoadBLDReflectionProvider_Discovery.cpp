@@ -35,6 +35,14 @@ void URoadBLDReflectionProvider::CacheRoadData(UWorld* World)
 	GetWorldPosFunc = DynRoadClass->FindFunctionByName(TEXT("GetWorldPositionAtDistance"));
 	RefLineProp     = DynRoadClass->FindPropertyByName(TEXT("ReferenceLine"));
 
+	// Phase 1A: road-class property/function resolution
+	RoadTypeProp          = DynRoadClass->FindPropertyByName(TEXT("RoadType"));
+	StartSnappedRoadProp  = DynRoadClass->FindPropertyByName(TEXT("StartSnappedRoad"));
+	EndSnappedRoadProp    = DynRoadClass->FindPropertyByName(TEXT("EndSnappedRoad"));
+	LeftLanesProp         = DynRoadClass->FindPropertyByName(TEXT("LeftLanes"));
+	RightLanesProp        = DynRoadClass->FindPropertyByName(TEXT("RightLanes"));
+	GetPointTurnRadiusFunc = DynRoadClass->FindFunctionByName(TEXT("GetPointTurnRadius"));
+
 	if (!GetLengthFunc || !GetAllLanesFunc)
 	{
 		UE_LOG(LogAAATraffic, Warning,
@@ -71,6 +79,45 @@ void URoadBLDReflectionProvider::CacheRoadData(UWorld* World)
 
 		const int32 RoadId = NextHandleId++;
 		RoadHandleMap.Add(RoadId, RoadActor);
+
+		// ── Phase 1A: Read road type ────────────────────────────
+		if (RoadTypeProp)
+		{
+			int64 RoadTypeVal = 0;
+			if (FEnumProperty* EP = CastField<FEnumProperty>(RoadTypeProp))
+			{
+				FNumericProperty* Under = EP->GetUnderlyingProperty();
+				RoadTypeVal = Under->GetSignedIntPropertyValue(
+					RoadTypeProp->ContainerPtrToValuePtr<void>(RoadActor));
+			}
+			else if (FByteProperty* BP = CastField<FByteProperty>(RoadTypeProp))
+			{
+				RoadTypeVal = BP->GetPropertyValue(
+					RoadTypeProp->ContainerPtrToValuePtr<void>(RoadActor));
+			}
+			RoadTypeMap.Add(RoadId, static_cast<uint8>(RoadTypeVal));
+		}
+
+		// ── Phase 1A: Collect left-lane UObjects for side detection ─
+		TSet<UObject*> LeftLaneSet;
+		if (LeftLanesProp)
+		{
+			FArrayProperty* ArrProp = CastField<FArrayProperty>(LeftLanesProp);
+			if (ArrProp)
+			{
+				FScriptArrayHelper Arr(ArrProp,
+					LeftLanesProp->ContainerPtrToValuePtr<void>(RoadActor));
+				FObjectPropertyBase* InnerObj = CastField<FObjectPropertyBase>(ArrProp->Inner);
+				if (InnerObj)
+				{
+					for (int32 i = 0; i < Arr.Num(); ++i)
+					{
+						UObject* LaneObj = InnerObj->GetObjectPropertyValue(Arr.GetRawPtr(i));
+						if (LaneObj) { LeftLaneSet.Add(LaneObj); }
+					}
+				}
+			}
+		}
 
 		TArray<UObject*> Lanes = GetAllLanesForRoad(RoadActor);
 		// Filter null entries before sorting — GetAllLanes() can return nulls.
@@ -167,6 +214,10 @@ void URoadBLDReflectionProvider::CacheRoadData(UWorld* World)
 			LeftEdgeProp  = LaneClass->FindPropertyByName(TEXT("LeftEdgeCurve"));
 			RightEdgeProp = LaneClass->FindPropertyByName(TEXT("RightEdgeCurve"));
 			LaneWidthProp = LaneClass->FindPropertyByName(TEXT("LaneWidth"));
+
+			// Phase 1A: Resolve lane-class array properties
+			LaneSectionsProp  = LaneClass->FindPropertyByName(TEXT("LaneSections"));
+			ActiveSegmentsProp = LaneClass->FindPropertyByName(TEXT("ActiveSegments"));
 
 			// Resolve Get3DPositionAtDistance from the first non-null edge curve.
 			if (LeftEdgeProp)
@@ -277,6 +328,97 @@ void URoadBLDReflectionProvider::CacheRoadData(UWorld* World)
 				if (ObjP) { LData.RightEdge = ObjP->GetObjectPropertyValue_InContainer(LaneObj); }
 			}
 
+			// ── Phase 1A: Lane side detection ────────────────────
+			LData.bIsLeftLane = LeftLaneSet.Contains(LaneObj);
+
+			// ── Phase 1A: Cache per-section LaneTypes ────────────
+			if (LaneSectionsProp)
+			{
+				FArrayProperty* SectArrProp = CastField<FArrayProperty>(LaneSectionsProp);
+				if (SectArrProp)
+				{
+					FScriptArrayHelper Sections(SectArrProp,
+						SectArrProp->ContainerPtrToValuePtr<void>(LaneObj));
+					UScriptStruct* SectionStruct = CastField<FStructProperty>(SectArrProp->Inner)
+						? CastField<FStructProperty>(SectArrProp->Inner)->Struct : nullptr;
+					if (SectionStruct)
+					{
+						FProperty* SecDistProp = SectionStruct->FindPropertyByName(TEXT("SectionStartDistance"));
+						FProperty* SecTypeProp = SectionStruct->FindPropertyByName(TEXT("LaneType"));
+						for (int32 i = 0; i < Sections.Num(); ++i)
+						{
+							const uint8* ElemPtr = Sections.GetRawPtr(i);
+							double SectionDist = 0.0;
+							if (SecDistProp)
+							{
+								if (FDoubleProperty* DP = CastField<FDoubleProperty>(SecDistProp))
+								{
+									SectionDist = DP->GetPropertyValue(SecDistProp->ContainerPtrToValuePtr<void>(ElemPtr));
+								}
+							}
+							uint8 SectionType = 0; // Default: Normal
+							if (SecTypeProp)
+							{
+								if (FEnumProperty* EP = CastField<FEnumProperty>(SecTypeProp))
+								{
+									FNumericProperty* Under = EP->GetUnderlyingProperty();
+									SectionType = static_cast<uint8>(Under->GetSignedIntPropertyValue(
+										SecTypeProp->ContainerPtrToValuePtr<void>(ElemPtr)));
+								}
+								else if (FByteProperty* BP = CastField<FByteProperty>(SecTypeProp))
+								{
+									SectionType = BP->GetPropertyValue(
+										SecTypeProp->ContainerPtrToValuePtr<void>(ElemPtr));
+								}
+							}
+							LData.CachedLaneSections.Add(TPair<double, uint8>(SectionDist, SectionType));
+						}
+					}
+				}
+			}
+
+			// ── Phase 1A: Cache ActiveSegments ──────────────────
+			if (ActiveSegmentsProp)
+			{
+				FArrayProperty* SegArrProp = CastField<FArrayProperty>(ActiveSegmentsProp);
+				if (SegArrProp)
+				{
+					FScriptArrayHelper Segments(SegArrProp,
+						SegArrProp->ContainerPtrToValuePtr<void>(LaneObj));
+					UScriptStruct* SegStruct = CastField<FStructProperty>(SegArrProp->Inner)
+						? CastField<FStructProperty>(SegArrProp->Inner)->Struct : nullptr;
+					if (SegStruct)
+					{
+						FProperty* StartDistProp   = SegStruct->FindPropertyByName(TEXT("StartDistance"));
+						FProperty* EndDistProp     = SegStruct->FindPropertyByName(TEXT("EndDistance"));
+						FProperty* TransInProp     = SegStruct->FindPropertyByName(TEXT("TransitionIn"));
+						FProperty* TransOutProp    = SegStruct->FindPropertyByName(TEXT("TransitionOut"));
+						for (int32 i = 0; i < Segments.Num(); ++i)
+						{
+							const uint8* ElemPtr = Segments.GetRawPtr(i);
+							FTrafficLaneSegment Seg;
+							if (FDoubleProperty* DP = CastField<FDoubleProperty>(StartDistProp))
+							{
+								Seg.StartDistance = DP->GetPropertyValue(StartDistProp->ContainerPtrToValuePtr<void>(ElemPtr));
+							}
+							if (FDoubleProperty* DP = CastField<FDoubleProperty>(EndDistProp))
+							{
+								Seg.EndDistance = DP->GetPropertyValue(EndDistProp->ContainerPtrToValuePtr<void>(ElemPtr));
+							}
+							if (FDoubleProperty* DP = CastField<FDoubleProperty>(TransInProp))
+							{
+								Seg.TransitionIn = DP->GetPropertyValue(TransInProp->ContainerPtrToValuePtr<void>(ElemPtr));
+							}
+							if (FDoubleProperty* DP = CastField<FDoubleProperty>(TransOutProp))
+							{
+								Seg.TransitionOut = DP->GetPropertyValue(TransOutProp->ContainerPtrToValuePtr<void>(ElemPtr));
+							}
+							LData.CachedActiveSegments.Add(Seg);
+						}
+					}
+				}
+			}
+
 			// ── DIAG: Warn when a drivable lane has null edge curves ─
 			if (!LData.LeftEdge.Get() || !LData.RightEdge.Get())
 			{
@@ -296,6 +438,82 @@ void URoadBLDReflectionProvider::CacheRoadData(UWorld* World)
 	}
 
 	bCached = true;
+
+	// ── Phase 1A: Resolve road snap connections (second pass) ───
+	// All road handles are assigned now, so we can resolve SnappedRoad pointers.
+	if (StartSnappedRoadProp || EndSnappedRoadProp)
+	{
+		// Build reverse lookup: road actor → road handle ID
+		TMap<TWeakObjectPtr<UObject>, int32> RoadActorToHandle;
+		for (const auto& Pair : RoadHandleMap)
+		{
+			RoadActorToHandle.Add(Pair.Value, Pair.Key);
+		}
+
+		auto ExtractSnappedRoad = [&](FProperty* SnapProp, AActor* OwnerActor) -> int32
+		{
+			if (!SnapProp) { return 0; }
+			// FRoadSnap is a struct with SnappedRoad (ADynamicRoad*)
+			FStructProperty* StructProp = CastField<FStructProperty>(SnapProp);
+			if (!StructProp) { return 0; }
+			const void* StructPtr = SnapProp->ContainerPtrToValuePtr<void>(OwnerActor);
+			FProperty* SnappedRoadField = StructProp->Struct->FindPropertyByName(TEXT("SnappedRoad"));
+			if (!SnappedRoadField) { return 0; }
+			FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(SnappedRoadField);
+			if (!ObjProp) { return 0; }
+			UObject* SnappedObj = ObjProp->GetObjectPropertyValue(SnappedRoadField->ContainerPtrToValuePtr<void>(StructPtr));
+			if (!SnappedObj) { return 0; }
+			const int32* Found = RoadActorToHandle.Find(SnappedObj);
+			return Found ? *Found : 0;
+		};
+
+		for (const auto& Pair : RoadHandleMap)
+		{
+			AActor* RA = Cast<AActor>(Pair.Value.Get());
+			if (!RA) { continue; }
+			TArray<int32> Snapped;
+			int32 StartSnap = ExtractSnappedRoad(StartSnappedRoadProp, RA);
+			int32 EndSnap   = ExtractSnappedRoad(EndSnappedRoadProp, RA);
+			if (StartSnap != 0) { Snapped.AddUnique(StartSnap); }
+			if (EndSnap != 0)   { Snapped.AddUnique(EndSnap); }
+			if (Snapped.Num() > 0)
+			{
+				Snapped.Sort(); // Deterministic order
+				RoadSnapMap.Add(Pair.Key, MoveTemp(Snapped));
+			}
+		}
+	}
+
+	// ── Phase 1A: Summary logging ──────────────────────────────
+	{
+		int32 RoadsByType[4] = { 0, 0, 0, 0 };
+		for (const auto& Pair : RoadTypeMap)
+		{
+			if (Pair.Value < 4) { RoadsByType[Pair.Value]++; }
+		}
+		int32 LanesWithMultiSections = 0;
+		int32 LanesWithActiveSegments = 0;
+		int32 LeftLaneCount = 0;
+		int32 RightLaneCount = 0;
+		for (const auto& Pair : LaneHandleMap)
+		{
+			if (Pair.Value.CachedLaneSections.Num() > 1) { LanesWithMultiSections++; }
+			if (Pair.Value.CachedActiveSegments.Num() > 0) { LanesWithActiveSegments++; }
+			if (Pair.Value.bIsLeftLane) { LeftLaneCount++; } else { RightLaneCount++; }
+		}
+		int32 TotalSnaps = 0;
+		for (const auto& Pair : RoadSnapMap) { TotalSnaps += Pair.Value.Num(); }
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("RoadBLDReflectionProvider [Phase1A]: RoadTypes: Normal=%d Walkway=%d Railway=%d Other=%d | "
+				 "Lanes: Left=%d Right=%d MultiSection=%d WithActiveSegments=%d | "
+				 "RoadSnaps: %d roads have %d total connections | "
+				 "GetPointTurnRadiusFunc=%s"),
+			RoadsByType[0], RoadsByType[1], RoadsByType[2], RoadsByType[3],
+			LeftLaneCount, RightLaneCount, LanesWithMultiSections, LanesWithActiveSegments,
+			RoadSnapMap.Num(), TotalSnaps,
+			GetPointTurnRadiusFunc ? TEXT("OK") : TEXT("NULL"));
+	}
 
 	// ── DIAG: Post-cache edge sampling summary ──────────────────
 	{

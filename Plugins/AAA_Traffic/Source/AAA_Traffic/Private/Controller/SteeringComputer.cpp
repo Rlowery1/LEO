@@ -46,13 +46,31 @@ FSteeringOutput FSteeringComputer::Compute(const FSteeringInput& In)
 	Out.PurePursuitTerm = PurePursuitAngle / In.MaxSteerAngleRad;
 
 	// ── Cross-track error (CTE) ──────────────────────────────
-	// Suppress CTE during junction curve following: the vehicle is
-	// intentionally off the new lane's centerline while executing the turn.
+	// Compute CTE against the ACTIVE path — junction curve when
+	// traversing, road lane otherwise.  During junction traversal the
+	// vehicle must stay on the junction curve, not the road lane.
 	const bool bFollowingJunctionCurve = (In.JunctionCurvePoints.Num() > 0
 		&& In.JunctionCurveIndex < In.JunctionCurvePoints.Num() - 1);
 	Out.bFollowingJunctionCurve = bFollowingJunctionCurve;
 
-	if (!bFollowingJunctionCurve && In.LanePoints.Num() >= 2)
+	if (bFollowingJunctionCurve)
+	{
+		// CTE against the junction curve polyline.
+		// JunctionCurveIndex is the NEXT target point, so the vehicle
+		// is between [Index-1, Index].  Clamp to 0 for the first point.
+		const int32 SegIdx = FMath::Clamp(
+			In.JunctionCurveIndex - 1, 0, In.JunctionCurvePoints.Num() - 2);
+		const FVector& SegA = In.JunctionCurvePoints[SegIdx];
+		const FVector& SegB = In.JunctionCurvePoints[SegIdx + 1];
+		const FVector SegDir = (SegB - SegA).GetSafeNormal2D();
+		if (!SegDir.IsNearlyZero())
+		{
+			const FVector VehicleToSeg = In.VehicleLocation - SegA;
+			Out.SignedCTE = FVector2D::CrossProduct(
+				FVector2D(SegDir), FVector2D(VehicleToSeg));
+		}
+	}
+	else if (In.LanePoints.Num() >= 2)
 	{
 		const int32 SegIdx = FMath::Clamp(In.ClosestIndex, 0, In.LanePoints.Num() - 2);
 		const FVector& SegA = In.LanePoints[SegIdx];

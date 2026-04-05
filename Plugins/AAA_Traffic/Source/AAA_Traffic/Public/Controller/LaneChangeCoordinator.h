@@ -12,6 +12,15 @@ enum class ETurnSignalState : uint8;
 class ATrafficVehicleController;
 class UTrafficSubsystem;
 
+/** Phase of an overtaking maneuver (lateral offset, no actual lane change). */
+enum class EOvertakePhase : uint8
+{
+	None,       // No active overtake.
+	PullingOut, // Blending lateral offset toward oncoming lane.
+	Passing,    // Holding offset, traveling past the slow leader.
+	PullingIn   // Blending offset back to zero.
+};
+
 // ---------------------------------------------------------------------------
 // Input / output structs
 // ---------------------------------------------------------------------------
@@ -39,7 +48,8 @@ struct AAA_TRAFFIC_API FLaneChangeEvalContext
 	bool bJunctionApproaching = false;
 
 	// Leader info (caller must compute via GetLeaderDistance before calling)
-	float LeaderDist = -1.0f;
+	float LeaderDist  = -1.0f;
+	float LeaderSpeed = 0.0f;
 
 	// External dependencies (not owned)
 	ITrafficRoadProvider*  RoadProvider  = nullptr;
@@ -166,4 +176,57 @@ struct AAA_TRAFFIC_API FLaneChangeCoordinator
 
 	/** Clear only navigational pre-positioning state. */
 	void ClearNav();
+
+	// ── Overtaking ──
+	// Two modes: (a) lateral-offset into oncoming lane (legacy, disabled on 2-lane 2-way),
+	// (b) same-direction lane change tagged as overtake for tracking.
+
+	bool             bSameDirectionOvertake = false; // True when overtaking via same-dir lane change
+	EOvertakePhase   OvertakePhase        = EOvertakePhase::None;
+	float            OvertakeLateralOffset = 0.0f;   // Current smooth-blended offset (cm)
+	float            OvertakeBlendProgress = 0.0f;   // 0..1 for pull-out / pull-in
+	float            OvertakeStuckTimer    = 0.0f;   // Accumulated stuck-behind-leader time
+	float            OvertakePassDistAccum = 0.0f;   // Forward distance in Passing phase
+	float            OvertakeCooldownRemaining = 0.0f;
+	float            OvertakeTargetOffset  = 0.0f;   // Full offset magnitude (≈ lane width)
+	ETrafficLaneSide OvertakeSide  = ETrafficLaneSide::Left;
+	FTrafficLaneHandle OvertakeOncomingLane;
+
+	// Config (synced from controller UPROPERTYs)
+	float OvertakeStuckTimeSec    = 4.0f;     // Oncoming-lane overtake
+	float SameDirOvertakeStuckTimeSec = 1.5f; // Same-direction lane change
+	float OvertakeMinClearanceCm  = 5000.0f;  // 50m to start
+	float OvertakeAbortClearanceCm = 5000.0f;  // 50m to abort
+	float OvertakeSpeedBoostPct   = 15.0f;     // +15%
+	float OvertakeMinPassDistCm   = 2000.0f;   // 20m in Passing before pull-in
+	float OvertakeBlendDistCm     = 1200.0f;   // Lateral blend distance
+	float OvertakeCooldownTimeSec = 20.0f;
+
+	/** Decrement overtake cooldown. */
+	void TickOvertakeCooldown(float DeltaSeconds);
+
+	/** True if any overtake phase is active. */
+	bool IsOvertaking() const;
+
+	/** Current lateral offset (cm) for steering target adjustment. */
+	float GetOvertakeLateralOffset() const;
+
+	/** Speed boost factor (e.g. 1.15) while overtaking, 1.0 otherwise. */
+	float GetOvertakeSpeedBoostFactor() const;
+
+	/**
+	 * Accumulate stuck time and evaluate whether to begin an overtake.
+	 * Called from the controller's UpdateInput when no lane-change is active.
+	 */
+	void EvaluateOvertake(const FLaneChangeEvalContext& Ctx, float DeltaSeconds);
+
+	/**
+	 * Per-tick overtake phase advancement: blend offset, check clearance,
+	 * transition between phases.
+	 */
+	void TickOvertake(float DeltaSeconds, float DistanceThisTick,
+		const FLaneChangeEvalContext& Ctx);
+
+	/** Abort an active overtake — immediately begins pulling in. */
+	void AbortOvertake();
 };

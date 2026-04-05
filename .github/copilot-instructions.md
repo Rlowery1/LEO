@@ -117,6 +117,12 @@ Rule:
 - The only valid reason to modify a test check is if the check logic itself is genuinely wrong (e.g. measuring the wrong metric). Never modify it because the simulation fails the check.
 - No grace windows, no blanket error suppression, no threshold inflation to paper over bugs.
 
+## Subagent Verification (Non-Negotiable)
+- **Never trust subagent claims without proof.** When a subagent returns a number, file path, log line, or factual claim, verify it against the actual source (log file, code line, search result) before presenting it to the user.
+- **If a subagent report contains a specific number (e.g. "7 total lanes")**, grep the actual log or source file to confirm that exact text exists. If it doesn't exist, the claim is fabricated — discard it and say so.
+- **Never present subagent findings as "proven facts"** unless you can point to the exact file + line number where the evidence lives.
+- **When in doubt, say "I don't know" or "I can't verify that"** rather than relay an unverified subagent claim as truth.
+
 ## Change Discipline
 - Minimal diffs; no broad refactors unless explicitly requested.
 - If CI fails: fix the **first** compiler error with the smallest change; avoid rewrites.
