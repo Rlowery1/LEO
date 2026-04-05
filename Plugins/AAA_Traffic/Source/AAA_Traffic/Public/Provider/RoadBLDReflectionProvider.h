@@ -56,17 +56,31 @@ public:
 	virtual bool GetIntersectionEntryPoint(const FTrafficLaneHandle& ApproachLane, FVector& OutPoint) override;
 	virtual bool DoJunctionPathsConflict(
 		const FTrafficLaneHandle& FromA, const FTrafficLaneHandle& ToA,
-		const FTrafficLaneHandle& FromB, const FTrafficLaneHandle& ToB) override;
+		const FTrafficLaneHandle& FromB, const FTrafficLaneHandle& ToB,
+		bool* bOutProximityConflict = nullptr) override;
 	virtual float GetLaneLength(const FTrafficLaneHandle& Lane) override;
 	virtual FVector GetLaneDirectionAtDistance(const FTrafficLaneHandle& Lane, float Distance) override;
 	virtual float GetLaneWidthAtDistance(const FTrafficLaneHandle& Lane, float Distance) override;
 	virtual float GetLaneCurvatureAtDistance(const FTrafficLaneHandle& Lane, float Distance) override;
 	virtual float GetLaneArcLength(const FTrafficLaneHandle& Lane) override;
+	virtual bool IsRoadClosedLoop(const FTrafficRoadHandle& Road) override;
+	virtual ETrafficRoadClass GetRoadClass(const FTrafficRoadHandle& Road) override;
+	virtual void SetFleetVehicleConstraints(float MinTurnRadiusCm, float MaxHalfWidthCm) override;
+	virtual float GetFleetMinTurnRadiusCm() const override;
+	virtual float GetFleetMaxHalfWidthCm() const override;
 	virtual FJunctionScanResult GetDistanceToNextJunction(
 		const FTrafficLaneHandle& StartLane,
 		float RemainingDistOnCurrentLane,
 		float MaxSearchDistCm = 50000.0f,
 		int32 MaxHops = 10) override;
+
+	// Phase 1A: New data plumbing overrides
+	virtual ETrafficRoadType GetRoadType(const FTrafficRoadHandle& Road) override;
+	virtual TArray<FTrafficLaneSection> GetLaneSections(const FTrafficLaneHandle& Lane) override;
+	virtual TArray<FTrafficLaneSegment> GetLaneActiveSegments(const FTrafficLaneHandle& Lane) override;
+	virtual bool IsLaneOnLeftSide(const FTrafficLaneHandle& Lane) override;
+	virtual TArray<FTrafficRoadHandle> GetSnappedRoads(const FTrafficRoadHandle& Road) override;
+	virtual bool GetPointTurnRadius(const FTrafficRoadHandle& Road, int32 PointIndex, double& OutRadius) override;
 
 	/** Update classified speed tiers and rebuild RoadClassifiedSpeedLimits.
 	 *  Called by TrafficSpawner after provider is ready, before spawning vehicles.
@@ -98,6 +112,9 @@ private:
 	 *  and create virtual lane segments so vehicles can exit/enter at the intersection. */
 	void DetectAndSplitThroughRoads();
 
+	/** Identify roads whose spline forms a closed loop (start ≈ end within threshold). */
+	void DetectClosedLoopRoads();
+
 	/** Build proximity-based connections between lane endpoints on different roads. */
 	void BuildProximityConnections();
 
@@ -126,6 +143,10 @@ private:
 	/** Trigger RoadBLD incremental rebuild and dump diagnostic arrays (pre/post).
 	 *  Separated from BuildLaneConnectivity to keep connectivity logic focused. */
 	void TriggerRoadBLDRebuildAndDiagnostics(UWorld* World, AActor* NetworkActor);
+
+	/** Deferred retry for road discovery when WorldPartition hasn't streamed
+	 *  DynamicRoad actors by the time OnWorldBeginPlay runs. */
+	void DeferredRoadDiscovery();
 
 	// ── Reflection helpers ──────────────────────────────────
 
@@ -184,6 +205,15 @@ private:
 
 		/** The right edge curve UObject (UEdgeCurve). */
 		TWeakObjectPtr<UObject> RightEdge;
+
+		/** Cached per-section lane types: distance (cm) → ETrafficLaneType ordinal. */
+		TArray<TPair<double, uint8>> CachedLaneSections;
+
+		/** Cached active width segments. */
+		TArray<FTrafficLaneSegment> CachedActiveSegments;
+
+		/** Whether this lane is on the left side of its road. */
+		bool bIsLeftLane = false;
 	};
 
 	/** Cached lane endpoint geometry — computed once after CacheRoadData. */
@@ -275,6 +305,9 @@ private:
 	/** Lane handles whose travel direction is reversed relative to reference line. */
 	TSet<int32> ReversedLaneSet;
 
+	/** Road handles whose reference line forms a closed loop (start ≈ end). */
+	TSet<int32> ClosedLoopRoadHandles;
+
 	/** True once CacheRoadData() has successfully run. */
 	bool bCached = false;
 
@@ -318,6 +351,22 @@ private:
 	 *  5+ lanes  = highway (2906 cm/s ≈ 65 mph) */
 	TMap<int32, float> RoadClassifiedSpeedLimits;
 
+	/** Road handle ID → functional classification (Local/Collector/Arterial/Freeway).
+	 *  Populated by RebuildRoadSpeedClassification alongside the speed map. */
+	TMap<int32, ETrafficRoadClass> RoadClassificationMap;
+	/** Road handle ID \u2192 road type ordinal (ETrafficRoadType). */
+	TMap<int32, uint8> RoadTypeMap;
+
+	/** Road handle ID \u2192 connected road handle IDs (from StartSnappedRoad / EndSnappedRoad). */
+	TMap<int32, TArray<int32>> RoadSnapMap;
+	/** Worst-case minimum turn radius (cm) across all vehicle classes in the fleet.
+	 *  Set by the spawner via SetFleetVehicleConstraints before junction path
+	 *  generation.  Zero means not yet set (no constraint applied). */
+	float FleetMinTurnRadiusCm = 0.0f;
+
+	/** Worst-case lateral half-width (cm) across all vehicle classes. */
+	float FleetMaxHalfWidthCm = 150.0f;
+
 	/** Configurable speed tiers (cm/s) — updated via SetSpeedTiers(). */
 	float ConfiguredResidentialSpeed = 1118.0f;
 	float ConfiguredUrbanSpeed = 2012.0f;
@@ -360,6 +409,9 @@ private:
 	/** Curve class Get3DPositionAtDistance — resolved lazily from first edge. */
 	UFunction* Get3DPosFunc = nullptr;
 
+	/** How many deferred discovery retries have been attempted. */
+	int32 DeferredDiscoveryRetryCount = 0;
+
 	/** Lane class LeftEdgeCurve property. */
 	FProperty* LeftEdgeProp = nullptr;
 
@@ -368,4 +420,30 @@ private:
 
 	/** Lane class LaneWidth property. */
 	FProperty* LaneWidthProp = nullptr;
+
+	// ── Phase 1A: Additional reflection caches ─────────────────
+
+	/** DynamicRoad::RoadType property. */
+	FProperty* RoadTypeProp = nullptr;
+
+	/** DynamicRoad::StartSnappedRoad property. */
+	FProperty* StartSnappedRoadProp = nullptr;
+
+	/** DynamicRoad::EndSnappedRoad property. */
+	FProperty* EndSnappedRoadProp = nullptr;
+
+	/** DynamicRoad::LeftLanes property. */
+	FProperty* LeftLanesProp = nullptr;
+
+	/** DynamicRoad::RightLanes property. */
+	FProperty* RightLanesProp = nullptr;
+
+	/** Lane class LaneSections property (TArray<FLaneSection>). */
+	FProperty* LaneSectionsProp = nullptr;
+
+	/** Lane class ActiveSegments property (TArray<FLaneWidthSegment>). */
+	FProperty* ActiveSegmentsProp = nullptr;
+
+	/** DynamicRoad::GetPointTurnRadius() function. */
+	UFunction* GetPointTurnRadiusFunc = nullptr;
 };

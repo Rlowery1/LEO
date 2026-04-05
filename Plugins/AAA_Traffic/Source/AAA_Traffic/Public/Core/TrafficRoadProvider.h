@@ -17,6 +17,80 @@ enum class ETrafficLaneSide : uint8
 };
 
 /**
+ * Functional classification of a road, derived from lane count,
+ * road length, and connectivity.  Feeds speed defaults, signal
+ * placement weighting, and spawn-density targets.
+ */
+UENUM(BlueprintType)
+enum class ETrafficRoadClass : uint8
+{
+	Local       UMETA(ToolTip = "Residential / minor street, typically \u22642 lanes"),
+	Collector   UMETA(ToolTip = "Collector road, 2 lanes, longer with moderate connectivity"),
+	Arterial    UMETA(ToolTip = "Major road, 3-4 lanes"),
+	Freeway     UMETA(ToolTip = "Highway / expressway, 5+ lanes")
+};
+/** Physical road type — mirrors RoadBLD ERoadType. */
+UENUM(BlueprintType)
+enum class ETrafficRoadType : uint8
+{
+	Normal,
+	Walkway,
+	Railway,
+	Other
+};
+
+/** Lane type — mirrors RoadBLD ELaneType. */
+UENUM(BlueprintType)
+enum class ETrafficLaneType : uint8
+{
+	Normal,
+	None,
+	Parking,
+	Border,
+	Restricted,
+	Shoulder,
+	CenterTurn,
+	Median
+};
+
+/** A contiguous section of a lane where the lane type is constant. */
+USTRUCT(BlueprintType)
+struct AAA_TRAFFIC_API FTrafficLaneSection
+{
+	GENERATED_BODY()
+
+	/** Distance (cm) along the lane where this section starts. */
+	UPROPERTY()
+	double StartDistance = 0.0;
+
+	/** The lane type for this section. */
+	UPROPERTY()
+	ETrafficLaneType Type = ETrafficLaneType::Normal;
+};
+
+/** A segment where a lane is active (has full width). */
+USTRUCT(BlueprintType)
+struct AAA_TRAFFIC_API FTrafficLaneSegment
+{
+	GENERATED_BODY()
+
+	/** Distance (cm) where the active segment begins. */
+	UPROPERTY()
+	double StartDistance = 0.0;
+
+	/** Distance (cm) where the active segment ends. */
+	UPROPERTY()
+	double EndDistance = 0.0;
+
+	/** Transition-in distance (cm) at the start of the segment. */
+	UPROPERTY()
+	double TransitionIn = 0.0;
+
+	/** Transition-out distance (cm) at the end of the segment. */
+	UPROPERTY()
+	double TransitionOut = 0.0;
+};
+/**
  * Opaque handle to a road managed by a traffic road provider.
  * The handle ID is meaningful only to the adapter that created it.
  */
@@ -191,11 +265,15 @@ public:
 	 * @param ToA    Exit lane of vehicle A (post-junction free-flow lane).
 	 * @param FromB  Approach lane of vehicle B.
 	 * @param ToB    Exit lane of vehicle B.
+	 * @param bOutProximityConflict  If non-null, set to true when the
+	 *        conflict is due to path proximity (< vehicle width) rather
+	 *        than geometric intersection.
 	 * @return true if the movements conflict (default: conservative, always true).
 	 */
 	virtual bool DoJunctionPathsConflict(
 		const FTrafficLaneHandle& FromA, const FTrafficLaneHandle& ToA,
-		const FTrafficLaneHandle& FromB, const FTrafficLaneHandle& ToB) { return true; }
+		const FTrafficLaneHandle& FromB, const FTrafficLaneHandle& ToB,
+		bool* bOutProximityConflict = nullptr) { if (bOutProximityConflict) { *bOutProximityConflict = false; } return true; }
 
 	/**
 	 * Get the total polyline length of a lane (cm).
@@ -254,6 +332,86 @@ public:
 	 * @return Arc length in cm.
 	 */
 	virtual float GetLaneArcLength(const FTrafficLaneHandle& Lane) { return GetLaneLength(Lane); }
+
+	/**
+	 * Query whether a road's geometry forms a closed loop (start ≈ end).
+	 * Used by junction classification to identify residential loop roads
+	 * (minor roads) vs through roads (major roads).
+	 * Default returns false.
+	 */
+	virtual bool IsRoadClosedLoop(const FTrafficRoadHandle& Road) { return false; }
+
+	// ── Phase 1A: New data plumbing queries ─────────────────────
+
+	/**
+	 * Get the physical road type (Normal, Walkway, Railway, Other).
+	 * Maps to the road kit's native road type enum.
+	 * Default returns Normal.
+	 */
+	virtual ETrafficRoadType GetRoadType(const FTrafficRoadHandle& Road) { return ETrafficRoadType::Normal; }
+
+	/**
+	 * Get the per-section lane type array for a lane.
+	 * A lane may change type along its length (e.g. Normal → CenterTurn).
+	 * Each section specifies where it starts and what type it is.
+	 * Default returns empty (callers should treat as fully Normal).
+	 */
+	virtual TArray<FTrafficLaneSection> GetLaneSections(const FTrafficLaneHandle& Lane) { return {}; }
+
+	/**
+	 * Get the active (full-width) segments for a lane.
+	 * Used for variable-width lanes — segments define where the lane
+	 * transitions from inactive (no width) to active (full LaneWidth).
+	 * Default returns empty (callers should treat as fully active).
+	 */
+	virtual TArray<FTrafficLaneSegment> GetLaneActiveSegments(const FTrafficLaneHandle& Lane) { return {}; }
+
+	/**
+	 * Query whether a lane is on the left side of its owning road.
+	 * In RoadBLD, LeftLanes travel one direction and RightLanes the other.
+	 * Default returns false (unknown / right-side assumed).
+	 */
+	virtual bool IsLaneOnLeftSide(const FTrafficLaneHandle& Lane) { return false; }
+
+	/**
+	 * Get the road handles of roads snapped (connected) to the given road.
+	 * Uses the road kit's native snap/endpoint connection data.
+	 * Default returns empty (no connection data).
+	 */
+	virtual TArray<FTrafficRoadHandle> GetSnappedRoads(const FTrafficRoadHandle& Road) { return {}; }
+
+	/**
+	 * Get the native turn radius at a specific point index on a road's reference line.
+	 * @param Road        Handle to the road.
+	 * @param PointIndex  Index of the point on the road's reference polyline.
+	 * @param OutRadius   Filled with turn radius (cm) if the function returns true.
+	 * @return true if the road kit has turn radius data for this point.
+	 */
+	virtual bool GetPointTurnRadius(const FTrafficRoadHandle& Road, int32 PointIndex, double& OutRadius) { return false; }
+
+	/**
+	 * Get the functional classification of a road.
+	 * Derived from lane count, road length, and connectivity.
+	 * Default returns Local (safest assumption for unknown roads).
+	 */
+	virtual ETrafficRoadClass GetRoadClass(const FTrafficRoadHandle& Road) { return ETrafficRoadClass::Local; }
+
+	/**
+	 * Inform the provider of the fleet's worst-case vehicle dimensions.
+	 * Called by the spawner after scanning vehicle class CDOs so the provider
+	 * can generate junction paths that are physically feasible for every
+	 * vehicle in the fleet.
+	 *
+	 * @param MinTurnRadiusCm  Tightest turn circle across all vehicle classes.
+	 * @param MaxHalfWidthCm   Widest vehicle half-width across all classes.
+	 */
+	virtual void SetFleetVehicleConstraints(float MinTurnRadiusCm, float MaxHalfWidthCm) {}
+
+	/** Get the currently compiled fleet minimum turn radius in cm. */
+	virtual float GetFleetMinTurnRadiusCm() const { return 0.0f; }
+
+	/** Get the currently compiled fleet maximum half-width in cm. */
+	virtual float GetFleetMaxHalfWidthCm() const { return 150.0f; }
 
 	/**
 	 * Result of a multi-hop junction scan ahead of a given lane.

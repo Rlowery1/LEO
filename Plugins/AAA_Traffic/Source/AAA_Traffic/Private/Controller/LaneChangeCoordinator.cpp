@@ -39,7 +39,7 @@ void FLaneChangeCoordinator::SetAggression(float Aggression)
 
 	Distance       = FMath::Lerp(2500.0f, 800.0f,  Aggression);
 	CooldownTime   = FMath::Lerp(8.0f,    2.0f,    Aggression);
-	SpeedThreshold = FMath::Lerp(0.4f,     0.8f,    Aggression);
+	SpeedThreshold = FMath::Lerp(0.5f,     0.85f,   Aggression);
 	GapRequired    = FMath::Lerp(1200.0f,  500.0f,  Aggression);
 }
 
@@ -200,6 +200,28 @@ FLaneChangeEvalResult FLaneChangeCoordinator::Evaluate(const FLaneChangeEvalCont
 					TEXT("Opposite direction lane"));
 			}
 			continue;
+		}
+
+		// Lane type safety: don't change into non-drivable lanes.
+		{
+			const TArray<FTrafficLaneSection> CandidateSections =
+				Ctx.RoadProvider->GetLaneSections(CandidateLane);
+			if (!CandidateSections.IsEmpty())
+			{
+				const ETrafficLaneType CandidateType = CandidateSections[0].Type;
+				if (CandidateType != ETrafficLaneType::Normal
+					&& CandidateType != ETrafficLaneType::CenterTurn)
+				{
+					if (IsTraceEnabled(2) && Owner)
+					{
+						Owner->AddLaneDecisionTrace(TEXT("LaneChange.RejectLaneType"),
+							CandidateLane.HandleId,
+							static_cast<float>(CandidateType), 0.0f,
+							TEXT("Non-drivable lane type"));
+					}
+					continue;
+				}
+			}
 		}
 
 		// Gap check via per-lane registry.
@@ -513,6 +535,12 @@ FLaneChangeFinalizeResult FLaneChangeCoordinator::Finalize(
 		Result.NewTargetSpeed = BaseTargetSpeed;
 	}
 
+	// Preserve per-vehicle speed variation across lane changes.
+	if (Owner)
+	{
+		Result.NewTargetSpeed *= Owner->SpeedVariationFactor;
+	}
+
 	// Reset internal state.
 	State            = ELaneChangeState::None;
 	TargetLane       = FTrafficLaneHandle();
@@ -557,6 +585,14 @@ void FLaneChangeCoordinator::Abort()
 	bNavigationalLaneChange = false;
 	NavigationalTargetLane  = FTrafficLaneHandle();
 
+	// If this lane change was part of a same-direction overtake, cancel the overtake too.
+	if (bSameDirectionOvertake)
+	{
+		OvertakePhase = EOvertakePhase::None;
+		bSameDirectionOvertake = false;
+		OvertakeCooldownRemaining = OvertakeCooldownTimeSec;
+	}
+
 	if (Owner)
 	{
 		Owner->FlushLaneDecisionTrace(TEXT("LaneChangeAbort"), true);
@@ -573,6 +609,12 @@ void FLaneChangeCoordinator::Reset()
 	Progress = 0.0f;
 	SettleTimer = 0.0f;
 	TargetLanePoints.Empty();
+
+	if (bSameDirectionOvertake)
+	{
+		OvertakePhase = EOvertakePhase::None;
+		bSameDirectionOvertake = false;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -583,4 +625,456 @@ void FLaneChangeCoordinator::ClearNav()
 {
 	bNavigationalLaneChange = false;
 	NavigationalTargetLane  = FTrafficLaneHandle();
+}
+
+// ---------------------------------------------------------------------------
+// Overtaking — lateral offset maneuver
+// ---------------------------------------------------------------------------
+
+void FLaneChangeCoordinator::TickOvertakeCooldown(float DeltaSeconds)
+{
+	if (OvertakeCooldownRemaining > 0.0f)
+	{
+		OvertakeCooldownRemaining -= DeltaSeconds;
+	}
+}
+
+bool FLaneChangeCoordinator::IsOvertaking() const
+{
+	return OvertakePhase != EOvertakePhase::None;
+}
+
+float FLaneChangeCoordinator::GetOvertakeLateralOffset() const
+{
+	return OvertakeLateralOffset;
+}
+
+float FLaneChangeCoordinator::GetOvertakeSpeedBoostFactor() const
+{
+	if (OvertakePhase == EOvertakePhase::Passing
+		|| OvertakePhase == EOvertakePhase::PullingOut)
+	{
+		return 1.0f + OvertakeSpeedBoostPct / 100.0f;
+	}
+	return 1.0f;
+}
+
+void FLaneChangeCoordinator::EvaluateOvertake(
+	const FLaneChangeEvalContext& Ctx, float DeltaSeconds)
+{
+	// Guard: already overtaking, already changing lanes, or on cooldown.
+	if (OvertakePhase != EOvertakePhase::None) { return; }
+	if (State != ELaneChangeState::None) { return; }
+	if (OvertakeCooldownRemaining > 0.0f) { return; }
+
+	// Junction / curve / readiness guards (same as regular lane change).
+	if (!Ctx.RoadProvider || !Ctx.bLaneDataReady) { return; }
+	if (Ctx.bJunctionApproaching) { return; }
+	if (Ctx.LanePoints && Ctx.LanePoints->Num() >= 3)
+	{
+		const float CurCurvature = FMath::Abs(
+			FSteeringComputer::ComputeLocalCurvature(*Ctx.LanePoints, Ctx.LastClosestIndex));
+		if (CurCurvature > 0.002f) { return; }
+	}
+
+	const float EffectiveTarget = FMath::Max(Ctx.TargetSpeed, 1.0f);
+
+	// Stuck timer: vehicle must want to go faster than its leader.
+	// Two conditions: either (a) conventional speed-ratio check against
+	// SpeedThreshold, OR (b) the vehicle's target speed exceeds its
+	// leader's current speed by at least 2%. Condition (b) catches small
+	// differentials between adjacent platoon members that (a) misses.
+	const bool bSlowRatio = Ctx.CurrentSpeed / EffectiveTarget < SpeedThreshold;
+	const bool bFasterThanLeader = Ctx.LeaderSpeed > 1.0f
+		&& EffectiveTarget > Ctx.LeaderSpeed * 1.02f;
+	const bool bSlow = bSlowRatio || bFasterThanLeader;
+	const bool bLeaderClose = Ctx.LeaderDist > 0.0f
+		&& Ctx.LeaderDist < Ctx.DetectionDistance;
+
+	if (bSlow && bLeaderClose)
+	{
+		OvertakeStuckTimer += DeltaSeconds;
+	}
+	else
+	{
+		OvertakeStuckTimer = 0.0f;
+		return;
+	}
+
+	// Not stuck long enough yet — try same-direction first (shorter timer).
+	if (OvertakeStuckTimer >= SameDirOvertakeStuckTimeSec)
+	{
+
+	// ── Attempt 1: Same-direction lane change (preferred, safe). ──
+	const FVector MyDirection = Ctx.RoadProvider->GetLaneDirection(Ctx.CurrentLane);
+
+	for (ETrafficLaneSide Side : { ETrafficLaneSide::Left, ETrafficLaneSide::Right })
+	{
+		FTrafficLaneHandle Candidate = Ctx.RoadProvider->GetAdjacentLane(Ctx.CurrentLane, Side);
+		if (!Candidate.IsValid()) { continue; }
+		const FVector CandDir = Ctx.RoadProvider->GetLaneDirection(Candidate);
+		if (FVector::DotProduct(MyDirection, CandDir) < 0.0f) { continue; } // Oncoming, skip
+
+		// Gap check on the candidate same-direction lane.
+		if (!Ctx.TrafficSub) { continue; }
+		bool bGapClear = true;
+		const float EffectiveGap = FMath::Max(GapRequired,
+			Ctx.VehicleFrontExtent + Ctx.VehicleRearExtent + 100.0f);
+
+		const TArray<TWeakObjectPtr<ATrafficVehicleController>> Neighbors =
+			Ctx.TrafficSub->GetVehiclesOnLane(Candidate);
+		for (const TWeakObjectPtr<ATrafficVehicleController>& WeakNeighbor : Neighbors)
+		{
+			ATrafficVehicleController* Neighbor = WeakNeighbor.Get();
+			if (!Neighbor || Neighbor == Owner) { continue; }
+			const APawn* NeighborPawn = Neighbor->GetPawn();
+			if (!NeighborPawn) { continue; }
+			const float DistToNeighbor = FVector::Dist(
+				Ctx.VehicleLocation, NeighborPawn->GetActorLocation());
+			if (DistToNeighbor < EffectiveGap)
+			{
+				bGapClear = false;
+				break;
+			}
+		}
+		if (!bGapClear) { continue; }
+
+		// Lane path availability.
+		TArray<FVector> CandidatePoints;
+		float CandidateWidth;
+		if (!Ctx.RoadProvider->GetLanePath(Candidate, CandidatePoints, CandidateWidth)
+			|| CandidatePoints.Num() < 2)
+		{
+			continue;
+		}
+
+		// Same-direction lane is clear — initiate lane change and tag as overtake.
+		State            = ELaneChangeState::Executing;
+		TargetLane       = Candidate;
+		TargetLanePoints = MoveTemp(CandidatePoints);
+		TargetLaneWidth  = CandidateWidth;
+		Progress         = 0.0f;
+
+		bSameDirectionOvertake = true;
+		OvertakePhase          = EOvertakePhase::PullingOut;
+		OvertakePassDistAccum  = 0.0f;
+		OvertakeStuckTimer     = 0.0f;
+
+		UE_LOG(LogAAATraffic, Log,
+			TEXT("TrafficVehicleController: Beginning SAME-DIRECTION OVERTAKE from "
+				 "lane %d to lane %d (%s)."),
+			Ctx.CurrentLane.HandleId, Candidate.HandleId,
+			Side == ETrafficLaneSide::Left ? TEXT("left") : TEXT("right"));
+		if (Owner)
+		{
+			Owner->AddLaneDecisionTrace(TEXT("Overtake.SameDirBegin"),
+				Candidate.HandleId, EffectiveTarget, Ctx.LeaderSpeed,
+				Side == ETrafficLaneSide::Left ? TEXT("Left") : TEXT("Right"));
+		}
+		return;
+	}
+
+	} // end SameDirOvertakeStuckTimeSec gate
+
+	// Wait for the longer timer before attempting oncoming-lane overtake.
+	if (OvertakeStuckTimer < OvertakeStuckTimeSec) { return; }
+
+	// ── Attempt 2: Oncoming-lane lateral offset (only on roads with
+	//    both a same-direction neighbor and an oncoming lane). ──
+	const FVector MyDirection2 = Ctx.RoadProvider->GetLaneDirection(Ctx.CurrentLane);
+	FTrafficLaneHandle OncomingLane;
+	ETrafficLaneSide OncomingSide = ETrafficLaneSide::Left;
+	bool bHasSameDirectionNeighbor = false;
+
+	for (ETrafficLaneSide Side : { ETrafficLaneSide::Left, ETrafficLaneSide::Right })
+	{
+		FTrafficLaneHandle Candidate = Ctx.RoadProvider->GetAdjacentLane(Ctx.CurrentLane, Side);
+		if (!Candidate.IsValid()) { continue; }
+		const FVector CandDir = Ctx.RoadProvider->GetLaneDirection(Candidate);
+		const float DirDot = FVector::DotProduct(MyDirection2, CandDir);
+		if (DirDot >= 0.0f)
+		{
+			bHasSameDirectionNeighbor = true;
+		}
+		else
+		{
+			OncomingLane = Candidate;
+			OncomingSide = Side;
+		}
+	}
+
+	if (!OncomingLane.IsValid())
+	{
+		// No oncoming lane at all (one-way / boulevard) — no target
+		// lane available for overtaking.
+		OvertakeStuckTimer = 0.0f;
+		return;
+	}
+
+	// Check oncoming lane clearance via TrafficSubsystem registry.
+	if (!Ctx.TrafficSub) { return; }
+
+	const TArray<TWeakObjectPtr<ATrafficVehicleController>> OncomingVehicles =
+		Ctx.TrafficSub->GetVehiclesOnLane(OncomingLane);
+
+	for (const TWeakObjectPtr<ATrafficVehicleController>& WeakOncoming : OncomingVehicles)
+	{
+		ATrafficVehicleController* Oncoming = WeakOncoming.Get();
+		if (!Oncoming || Oncoming == Owner) { continue; }
+		const APawn* OncomingPawn = Oncoming->GetPawn();
+		if (!OncomingPawn) { continue; }
+
+		// Distance along our forward direction to the oncoming vehicle.
+		const FVector ToOncoming = OncomingPawn->GetActorLocation() - Ctx.VehicleLocation;
+		const float ForwardDist = FVector::DotProduct(ToOncoming, Ctx.EgoForward);
+
+		// Only care about vehicles ahead of us.
+		if (ForwardDist > 0.0f && ForwardDist < OvertakeMinClearanceCm)
+		{
+			// Not enough clearance.
+			if (IsTraceEnabled(2) && Owner)
+			{
+				Owner->AddLaneDecisionTrace(TEXT("Overtake.RejectClearance"),
+					OncomingLane.HandleId, ForwardDist, OvertakeMinClearanceCm,
+					TEXT("Oncoming vehicle too close"));
+			}
+			return;
+		}
+	}
+
+	// All clear — begin overtaking.
+	OvertakePhase       = EOvertakePhase::PullingOut;
+	OvertakeBlendProgress = 0.0f;
+	OvertakePassDistAccum = 0.0f;
+	OvertakeSide        = OncomingSide;
+	OvertakeOncomingLane = OncomingLane;
+
+	// Target offset ≈ lane width of own lane.
+	TArray<FVector> TempPath;
+	float TempWidth = 0.0f;
+	if (Ctx.RoadProvider->GetLanePath(Ctx.CurrentLane, TempPath, TempWidth)
+		&& TempWidth > 0.0f)
+	{
+		OvertakeTargetOffset = TempWidth;
+	}
+	else
+	{
+		OvertakeTargetOffset = 350.0f; // fallback 3.5m
+	}
+
+	OvertakeStuckTimer = 0.0f;
+
+	UE_LOG(LogAAATraffic, Log,
+		TEXT("TrafficVehicleController: Beginning OVERTAKE from lane %d via %s-side "
+			 "(oncoming lane %d, offset %.0f cm)."),
+		Ctx.CurrentLane.HandleId,
+		OncomingSide == ETrafficLaneSide::Left ? TEXT("left") : TEXT("right"),
+		OncomingLane.HandleId,
+		OvertakeTargetOffset);
+	if (Owner)
+	{
+		Owner->AddLaneDecisionTrace(TEXT("Overtake.Begin"),
+			OncomingLane.HandleId, OvertakeTargetOffset, 0.0f,
+			OncomingSide == ETrafficLaneSide::Left ? TEXT("Left") : TEXT("Right"));
+	}
+}
+
+void FLaneChangeCoordinator::TickOvertake(
+	float DeltaSeconds, float DistanceThisTick,
+	const FLaneChangeEvalContext& Ctx)
+{
+	if (OvertakePhase == EOvertakePhase::None) { return; }
+
+	// ── Same-direction overtake: lane change handles positioning, not lateral offset. ──
+	if (bSameDirectionOvertake)
+	{
+		switch (OvertakePhase)
+		{
+		case EOvertakePhase::PullingOut:
+			// Lane change is executing (State manages it).
+			// When the lane change completes (State returns to None), advance to Passing.
+			if (State == ELaneChangeState::None)
+			{
+				OvertakePhase = EOvertakePhase::Passing;
+				OvertakePassDistAccum = 0.0f;
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("TrafficVehicleController: Same-direction overtake — "
+						 "lane change complete, now passing."));
+			}
+			break;
+
+		case EOvertakePhase::Passing:
+			OvertakePassDistAccum += DistanceThisTick;
+			if (OvertakePassDistAccum >= OvertakeMinPassDistCm)
+			{
+				if (Ctx.LeaderDist < 0.0f
+					|| Ctx.LeaderDist > Ctx.DetectionDistance * 0.5f
+					|| OvertakePassDistAccum >= OvertakeMinPassDistCm * 3.0f)
+				{
+					OvertakePhase = EOvertakePhase::None;
+					bSameDirectionOvertake = false;
+					OvertakeCooldownRemaining = OvertakeCooldownTimeSec;
+					UE_LOG(LogAAATraffic, Log,
+						TEXT("TrafficVehicleController: Same-direction overtake COMPLETE "
+							 "(%.0f cm passed). Cooldown %.1f s."),
+						OvertakePassDistAccum, OvertakeCooldownTimeSec);
+					if (Owner)
+					{
+						Owner->AddLaneDecisionTrace(TEXT("Overtake.SameDirComplete"),
+							0, OvertakePassDistAccum, OvertakeCooldownTimeSec,
+							TEXT("Same-direction overtake finished"));
+					}
+				}
+			}
+			break;
+
+		default:
+			// PullingIn not used for same-direction overtakes.
+			OvertakePhase = EOvertakePhase::None;
+			bSameDirectionOvertake = false;
+			break;
+		}
+		return;
+	}
+
+	// ── Lateral-offset overtake (oncoming lane): continuous clearance check. ──
+	if (OvertakePhase != EOvertakePhase::PullingIn
+		&& Ctx.TrafficSub && OvertakeOncomingLane.IsValid())
+	{
+		const TArray<TWeakObjectPtr<ATrafficVehicleController>> OncomingVehicles =
+			Ctx.TrafficSub->GetVehiclesOnLane(OvertakeOncomingLane);
+
+		for (const TWeakObjectPtr<ATrafficVehicleController>& WeakOncoming : OncomingVehicles)
+		{
+			ATrafficVehicleController* Oncoming = WeakOncoming.Get();
+			if (!Oncoming || Oncoming == Owner) { continue; }
+			const APawn* OncomingPawn = Oncoming->GetPawn();
+			if (!OncomingPawn) { continue; }
+
+			const FVector ToOncoming = OncomingPawn->GetActorLocation() - Ctx.VehicleLocation;
+			const float ForwardDist = FVector::DotProduct(ToOncoming, Ctx.EgoForward);
+
+			if (ForwardDist > 0.0f && ForwardDist < OvertakeAbortClearanceCm)
+			{
+				UE_LOG(LogAAATraffic, Warning,
+					TEXT("TrafficVehicleController: OVERTAKE ABORT — oncoming vehicle "
+						 "at %.0f cm (threshold %.0f cm)."),
+					ForwardDist, OvertakeAbortClearanceCm);
+				if (Owner)
+				{
+					Owner->AddLaneDecisionTrace(TEXT("Overtake.AbortOncoming"),
+						OvertakeOncomingLane.HandleId, ForwardDist,
+						OvertakeAbortClearanceCm, TEXT("Oncoming too close — aborting"));
+				}
+				AbortOvertake();
+				return;
+			}
+		}
+	}
+
+	switch (OvertakePhase)
+	{
+	case EOvertakePhase::PullingOut:
+	{
+		const float BlendDelta = DistanceThisTick / FMath::Max(OvertakeBlendDistCm, 1.0f);
+		OvertakeBlendProgress = FMath::Min(OvertakeBlendProgress + BlendDelta, 1.0f);
+		const float Alpha = FMath::SmoothStep(0.0f, 1.0f, OvertakeBlendProgress);
+		OvertakeLateralOffset = OvertakeTargetOffset * Alpha;
+
+		if (OvertakeBlendProgress >= 1.0f)
+		{
+			OvertakePhase = EOvertakePhase::Passing;
+			OvertakePassDistAccum = 0.0f;
+			UE_LOG(LogAAATraffic, Verbose,
+				TEXT("TrafficVehicleController: Overtake pull-out complete, now passing."));
+		}
+		break;
+	}
+
+	case EOvertakePhase::Passing:
+	{
+		OvertakePassDistAccum += DistanceThisTick;
+		OvertakeLateralOffset = OvertakeTargetOffset; // Hold full offset.
+
+		if (OvertakePassDistAccum >= OvertakeMinPassDistCm)
+		{
+			// Check if we've actually passed the slow leader.
+			// If leader is no longer detected ahead (LeaderDist < 0 or very far),
+			// or we've traveled enough — begin pulling back in.
+			if (Ctx.LeaderDist < 0.0f || Ctx.LeaderDist > Ctx.DetectionDistance * 0.5f
+				|| OvertakePassDistAccum >= OvertakeMinPassDistCm * 3.0f)
+			{
+				OvertakePhase = EOvertakePhase::PullingIn;
+				OvertakeBlendProgress = 0.0f;
+				UE_LOG(LogAAATraffic, Log,
+					TEXT("TrafficVehicleController: Overtake passing complete "
+						 "(%.0f cm traveled), pulling back in."),
+					OvertakePassDistAccum);
+			}
+		}
+		break;
+	}
+
+	case EOvertakePhase::PullingIn:
+	{
+		const float BlendDelta = DistanceThisTick / FMath::Max(OvertakeBlendDistCm, 1.0f);
+		OvertakeBlendProgress = FMath::Min(OvertakeBlendProgress + BlendDelta, 1.0f);
+		const float Alpha = 1.0f - FMath::SmoothStep(0.0f, 1.0f, OvertakeBlendProgress);
+		OvertakeLateralOffset = OvertakeTargetOffset * Alpha;
+
+		if (OvertakeBlendProgress >= 1.0f)
+		{
+			// Overtake complete.
+			OvertakePhase = EOvertakePhase::None;
+			OvertakeLateralOffset = 0.0f;
+			OvertakeCooldownRemaining = OvertakeCooldownTimeSec;
+			OvertakeOncomingLane = FTrafficLaneHandle();
+			UE_LOG(LogAAATraffic, Log,
+				TEXT("TrafficVehicleController: Overtake COMPLETE — back on lane."));
+			if (Owner)
+			{
+				Owner->AddLaneDecisionTrace(TEXT("Overtake.Complete"),
+					0, OvertakePassDistAccum, OvertakeCooldownTimeSec,
+					TEXT("Overtake finished"));
+			}
+		}
+		break;
+	}
+
+	default:
+		break;
+	}
+}
+
+void FLaneChangeCoordinator::AbortOvertake()
+{
+	if (OvertakePhase == EOvertakePhase::None) { return; }
+
+	// Same-direction overtake: just clear the tag — lane change abort is separate.
+	if (bSameDirectionOvertake)
+	{
+		OvertakePhase = EOvertakePhase::None;
+		bSameDirectionOvertake = false;
+		OvertakeCooldownRemaining = OvertakeCooldownTimeSec;
+		if (Owner)
+		{
+			Owner->AddLaneDecisionTrace(TEXT("Overtake.SameDirAbort"),
+				0, 0.0f, 0.0f, TEXT("Same-direction overtake aborted"));
+		}
+		return;
+	}
+
+	// If already pulling in, let it finish.
+	if (OvertakePhase == EOvertakePhase::PullingIn) { return; }
+
+	// Transition to pulling in — smooth return.
+	OvertakePhase = EOvertakePhase::PullingIn;
+	OvertakeBlendProgress = 0.0f;
+
+	if (Owner)
+	{
+		Owner->AddLaneDecisionTrace(TEXT("Overtake.Abort"),
+			OvertakeOncomingLane.IsValid() ? OvertakeOncomingLane.HandleId : 0,
+			OvertakeLateralOffset, 0.0f, TEXT("Overtake aborted — pulling in"));
+	}
 }

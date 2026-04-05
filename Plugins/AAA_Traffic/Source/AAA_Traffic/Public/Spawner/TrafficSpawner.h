@@ -77,8 +77,9 @@ private:
 	 * @param SlotIndex    Position along the lane (multiplied by SpawnSpacing).
 	 * @param VehicleIndex Index for seed generation.
 	 */
-	void SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Provider,
-		const FTrafficLaneHandle& Lane, int32 SlotIndex, int32 VehicleIndex);
+	bool SpawnSingleVehicle(UWorld* World, ITrafficRoadProvider* Provider,
+		const FTrafficLaneHandle& Lane, int32 SlotIndex, int32 VehicleIndex,
+		float LaneStagger = 0.0f);
 
 	/** Called when a provider registers after BeginPlay (deferred retry). */
 	void OnProviderRegistered(ITrafficRoadProvider* Provider);
@@ -119,6 +120,7 @@ private:
 		FTrafficLaneHandle Lane;
 		int32 SlotIndex = 0;
 		int32 VehicleIndex = 0;
+		float LaneStagger = 0.0f;
 	};
 
 	/** Pending initial spawn requests processed over several frames. */
@@ -264,6 +266,15 @@ protected:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Lane Change", meta = (ClampMin = "0", ClampMax = "1"))
 	float LaneChangeAggression;
+
+	/**
+	 * Per-vehicle variation applied to LaneChangeAggression (0-1).
+	 * Each vehicle gets a deterministic random offset in
+	 * [-Variation, +Variation], clamped to [0, 1].
+	 * 0 = all vehicles identical.  Default 0.2 (±20%).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Lane Change", meta = (ClampMin = "0", ClampMax = "0.5"))
+	float LaneChangeAggressionVariation;
 
 	// ── Respawn ────────────────────────────────────────────────────
 

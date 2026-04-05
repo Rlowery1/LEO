@@ -84,7 +84,7 @@ void UTrafficSubsystem::RegisterProvider(UObject* InProvider)
 	UE_LOG(LogAAATraffic, Log, TEXT("TrafficSubsystem: Provider registered — %s"), *InProvider->GetName());
 
 	// Build the junction exit survey before notifying listeners.
-	BuildJunctionSurvey();
+	RebuildJunctionSurvey();
 
 	// Notify listeners (e.g. TrafficSpawner deferred retry).
 	OnProviderRegistered.Broadcast(Cast<ITrafficRoadProvider>(InProvider));
@@ -112,6 +112,17 @@ ITrafficRoadProvider* UTrafficSubsystem::GetProvider() const
 bool UTrafficSubsystem::HasProvider() const
 {
 	return ActiveProviderObject != nullptr;
+}
+
+void UTrafficSubsystem::RebuildJunctionSurvey()
+{
+	if (!GetProvider())
+	{
+		return;
+	}
+
+	ResetCanonicalMovementTable();
+	BuildJunctionSurvey();
 }
 
 void UTrafficSubsystem::RegisterVehicle(ATrafficVehicleController* InController)
@@ -247,6 +258,16 @@ bool UTrafficSubsystem::HasJunctionOccupancy(int32 JunctionId, const ATrafficVeh
 	return false;
 }
 
+bool UTrafficSubsystem::IsJunctionOccupied(int32 JunctionId) const
+{
+	if (JunctionId == 0) { return false; }
+	if (const TArray<FJunctionOccupant>* Occupants = JunctionOccupancy.Find(JunctionId))
+	{
+		return Occupants->Num() > 0;
+	}
+	return false;
+}
+
 TArray<TWeakObjectPtr<ATrafficVehicleController>> UTrafficSubsystem::GetVehiclesOnLane(const FTrafficLaneHandle& Lane) const
 {
 	if (const TArray<TWeakObjectPtr<ATrafficVehicleController>>* Vehicles = VehiclesByLane.Find(Lane.HandleId))
@@ -258,6 +279,7 @@ TArray<TWeakObjectPtr<ATrafficVehicleController>> UTrafficSubsystem::GetVehicles
 
 void UTrafficSubsystem::PerformDespawnSweep()
 {
+	SCOPE_CYCLE_COUNTER(STAT_AAATraffic_DespawnSweep);
 	UWorld* World = GetWorld();
 	if (!World) return;
 
@@ -517,13 +539,14 @@ ETrafficLOD UTrafficSubsystem::GetVehicleLOD(const ATrafficVehicleController* Co
 
 void UTrafficSubsystem::UpdateLODTiers(const TArray<FVector>& PlayerPositions)
 {
+	SCOPE_CYCLE_COUNTER(STAT_AAATraffic_UpdateLODTiers);
 	// LOD thresholds (cm) with hysteresis bands to prevent flickering
 	// at boundary distances. Promotion (closer) uses inner threshold,
 	// demotion (farther) uses outer threshold.
-	constexpr float LOD1PromoteSq = 10000.0f * 10000.0f;  // 100m — promote to Full
-	constexpr float LOD1DemoteSq  = 11000.0f * 11000.0f;  // 110m — demote from Full
-	constexpr float LOD2PromoteSq = 30000.0f * 30000.0f;  // 300m — promote to Reduced
-	constexpr float LOD2DemoteSq  = 33000.0f * 33000.0f;  // 330m — demote from Reduced
+	const float LOD1PromoteSq = FullLODPromoteDistance * FullLODPromoteDistance;
+	const float LOD1DemoteSq  = FullLODDemoteDistance * FullLODDemoteDistance;
+	const float LOD2PromoteSq = ReducedLODPromoteDistance * ReducedLODPromoteDistance;
+	const float LOD2DemoteSq  = ReducedLODDemoteDistance * ReducedLODDemoteDistance;
 
 	for (const TWeakObjectPtr<ATrafficVehicleController>& WeakVehicle : ActiveVehicles)
 	{

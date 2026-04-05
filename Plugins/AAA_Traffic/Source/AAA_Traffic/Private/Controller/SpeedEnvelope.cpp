@@ -84,7 +84,11 @@ FSpeedEnvelopeOutput FSpeedEnvelope::Compute(const FSpeedEnvelopeInput& In) cons
 	// Clamp DOWN only — never raise speed above current effective.
 	if (In.bApproachBraking)
 	{
-		const float ApproachCap = FMath::Max(In.ApproachSpeedLimitCmPerSec, 100.0f);
+		// Negative speed limit signals a full-stop request (proximity-conflict
+		// junction that is currently occupied).  Bypass the 100 cm/s floor.
+		const float ApproachCap = (In.ApproachSpeedLimitCmPerSec < 0.0f)
+			? 0.0f
+			: FMath::Max(In.ApproachSpeedLimitCmPerSec, 100.0f);
 		if (ApproachCap < Out.EffectiveTargetSpeed)
 		{
 			Out.EffectiveTargetSpeed = ApproachCap;
@@ -316,6 +320,62 @@ FSpeedEnvelopeOutput FSpeedEnvelope::Compute(const FSpeedEnvelopeInput& In) cons
 			if (EnvelopeSpeed < Out.EffectiveTargetSpeed)
 			{
 				Out.EffectiveTargetSpeed = EnvelopeSpeed;
+			}
+		}
+	}
+
+	// ── Merge zone deceleration ─────────────────────────────────
+	// If the current lane has active segments (variable-width zones),
+	// check whether the vehicle is approaching the end of its active
+	// region. When the lane is about to narrow to zero width (merge
+	// point), decelerate to give the vehicle time to lane-change.
+	if (In.RoadProvider && In.bLaneDataReady && In.CurrentJunctionId == 0
+		&& NumLanePts >= 2)
+	{
+		const TArray<FTrafficLaneSegment> ActiveSegs =
+			In.RoadProvider->GetLaneActiveSegments(In.CurrentLane);
+		if (!ActiveSegs.IsEmpty())
+		{
+			// Compute current distance along lane.
+			float DistAtVehicle = 0.0f;
+			const int32 VehIdx = FMath::Clamp(In.ClosestIndex, 0, NumLanePts - 1);
+			for (int32 i = 0; i < VehIdx && i < NumLanePts - 1; ++i)
+			{
+				DistAtVehicle += FVector::Dist(In.LanePoints[i], In.LanePoints[i + 1]);
+			}
+
+			// Find the nearest active-segment end that is ahead of us.
+			float NearestEndAhead = TNumericLimits<float>::Max();
+			for (const FTrafficLaneSegment& Seg : ActiveSegs)
+			{
+				const float SegEnd = static_cast<float>(Seg.EndDistance);
+				if (SegEnd > DistAtVehicle)
+				{
+					const float Ahead = SegEnd - DistAtVehicle;
+					if (Ahead < NearestEndAhead)
+					{
+						NearestEndAhead = Ahead;
+					}
+				}
+			}
+
+			if (NearestEndAhead < TNumericLimits<float>::Max())
+			{
+				// Apply braking envelope toward a low speed at the merge end.
+				// Use comfort deceleration for smooth merge behavior.
+				// Don't command a full stop — let the lane-change coordinator
+				// handle escape. Minimum speed 100 cm/s (walking pace).
+				constexpr float MergeEndMinSpeed = 100.0f;
+				const float Decel = In.ComfortDecelCmPerSec2;
+				const float MergeDist = FMath::Max(NearestEndAhead, 0.0f);
+				const float MergeEnvelopeSpeed = FMath::Sqrt(
+					MergeEndMinSpeed * MergeEndMinSpeed
+					+ 2.0f * Decel * MergeDist);
+
+				if (MergeEnvelopeSpeed < Out.EffectiveTargetSpeed)
+				{
+					Out.EffectiveTargetSpeed = MergeEnvelopeSpeed;
+				}
 			}
 		}
 	}

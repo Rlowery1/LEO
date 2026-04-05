@@ -39,59 +39,105 @@ FLeaderDetectorOutput FLeaderDetector::Detect(const FLeaderDetectorInput& In) co
 			Dist = SweepStraight(In, Speed);
 		}
 
-		// Spatial fallback: if physics sweep found nothing, query the
-		// spatial grid for nearby vehicles on the same or adjacent lanes.
-		// This catches cases where the sphere sweep is blocked by road
-		// geometry and also detects vehicles on adjacent lanes that
-		// physically overlap near junctions.
+		// Spatial fallback: if physics sweep found nothing, check for
+		// vehicles that the sweep missed.  Two stages:
+		//   Stage 1 — same-lane query (catches ECC_Pawn-invisible vehicles).
+		//   Stage 2 — cross-path spatial query (catches junction-crossing
+		//             vehicles on different lanes).  Filtered to heading
+		//             dot ≤ 0.7 to avoid false-detecting adjacent same-
+		//             direction lanes on multi-lane roads.
 		if (Dist < 0.0f && In.TrafficSubsystem)
 		{
-			TArray<ATrafficVehicleController*> Nearby =
-				In.TrafficSubsystem->GetNearbyVehicles(In.VehicleLocation, In.DetectionDistance);
-
 			float BestDist = MAX_FLT;
 			float BestSpeed = 0.0f;
 
-			for (const ATrafficVehicleController* Other : Nearby)
+			// Stage 1: same-lane vehicles.
+			if (In.CurrentLane.IsValid())
 			{
-				if (!Other || Other->GetPawn() == In.ControlledPawn) { continue; }
-				const APawn* OP = Other->GetPawn();
-				if (!OP) { continue; }
+				const TArray<TWeakObjectPtr<ATrafficVehicleController>>& LaneVehicles =
+					In.TrafficSubsystem->GetVehiclesOnLane(In.CurrentLane);
 
-				// Heading alignment — reject any vehicle facing the
-				// opposite direction (oncoming traffic). A leader is
-				// always travelling roughly the same way we are.
-				if (FVector::DotProduct(OP->GetActorForwardVector(),
-						In.VehicleForward) < 0.0f)
+				for (const TWeakObjectPtr<ATrafficVehicleController>& WeakOther : LaneVehicles)
 				{
-					continue;
-				}
+					const ATrafficVehicleController* Other = WeakOther.Get();
+					if (!Other || Other->GetPawn() == In.ControlledPawn) { continue; }
+					const APawn* OP = Other->GetPawn();
+					if (!OP) { continue; }
 
-				const FVector Delta = OP->GetActorLocation() - In.VehicleLocation;
-				const float D = Delta.Size();
-				if (D < KINDA_SMALL_NUMBER) { continue; }
-				if (FVector::DotProduct(Delta / D, In.VehicleForward) < 0.5f) { continue; }
-				if (D > In.DetectionDistance) { continue; }
-				if (D < BestDist)
-				{
-					BestDist = D;
-					if (const UPawnMovementComponent* OtherMC = OP->GetMovementComponent())
+					if (FVector::DotProduct(OP->GetActorForwardVector(),
+							In.VehicleForward) < 0.0f)
 					{
-						BestSpeed = FVector::DotProduct(OtherMC->Velocity, In.VehicleForward);
+						continue;
 					}
-					else
+
+					const FVector Delta = OP->GetActorLocation() - In.VehicleLocation;
+					const float D = Delta.Size();
+					if (D < KINDA_SMALL_NUMBER) { continue; }
+					if (FVector::DotProduct(Delta / D, In.VehicleForward) < 0.5f) { continue; }
+					if (D > In.DetectionDistance) { continue; }
+					if (D < BestDist)
 					{
-						BestSpeed = 0.0f;
+						BestDist = D;
+						if (const UPawnMovementComponent* OtherMC = OP->GetMovementComponent())
+						{
+							BestSpeed = FVector::DotProduct(OtherMC->Velocity, In.VehicleForward);
+						}
+						else
+						{
+							BestSpeed = 0.0f;
+						}
+					}
+				}
+			}
+
+			// Stage 2: cross-path vehicles (junction crossing detection).
+			// Only runs if Stage 1 found nothing.  Rejects vehicles heading
+			// nearly the same direction (dot > 0.7) because those are
+			// adjacent-lane vehicles, not cross-path.  Near junctions
+			// (JunctionId != 0) allow all headings so vehicles turning
+			// across our approach lane are still detected.
+			if (BestDist >= MAX_FLT)
+			{
+				const bool bNearJunction = (In.JunctionId != 0);
+				TArray<ATrafficVehicleController*> Nearby =
+					In.TrafficSubsystem->GetNearbyVehicles(In.VehicleLocation, In.DetectionDistance);
+
+				for (const ATrafficVehicleController* Other : Nearby)
+				{
+					if (!Other || Other->GetPawn() == In.ControlledPawn) { continue; }
+					const APawn* OP = Other->GetPawn();
+					if (!OP) { continue; }
+
+					const float HeadingDot = FVector::DotProduct(
+						OP->GetActorForwardVector(), In.VehicleForward);
+					if (HeadingDot < 0.0f) { continue; }
+					if (!bNearJunction && HeadingDot > 0.7f) { continue; }
+
+					const FVector Delta = OP->GetActorLocation() - In.VehicleLocation;
+					const float D = Delta.Size();
+					if (D < KINDA_SMALL_NUMBER) { continue; }
+					// At junctions, vehicles approach from all angles — skip the
+					// forward-cone check.  Away from junctions, require the other
+					// vehicle to be roughly ahead (within ~60° of forward).
+					if (!bNearJunction && FVector::DotProduct(Delta / D, In.VehicleForward) < 0.5f) { continue; }
+					if (D > In.DetectionDistance) { continue; }
+					if (D < BestDist)
+					{
+						BestDist = D;
+						if (const UPawnMovementComponent* OtherMC = OP->GetMovementComponent())
+						{
+							BestSpeed = FVector::DotProduct(OtherMC->Velocity, In.VehicleForward);
+						}
+						else
+						{
+							BestSpeed = 0.0f;
+						}
 					}
 				}
 			}
 
 			if (BestDist < MAX_FLT)
 			{
-				// Subtract ego rear extent as a proxy for leader rear extent
-				// (all vehicles currently share the same mesh dimensions).
-				// The shared bumper correction below subtracts VehicleFrontExtent,
-				// yielding an approximate front-bumper-to-rear-bumper gap.
 				Dist = BestDist - In.VehicleRearExtent;
 				Speed = BestSpeed;
 			}
@@ -107,17 +153,18 @@ FLeaderDetectorOutput FLeaderDetector::Detect(const FLeaderDetectorInput& In) co
 	}
 	else if (In.TickLOD == ETrafficLOD::Reduced)
 	{
-		// Reduced-LOD: analytical detection via spatial grid.
-		if (In.TrafficSubsystem)
+		// Reduced-LOD: analytical detection via same-lane query.
+		if (In.TrafficSubsystem && In.CurrentLane.IsValid())
 		{
-			TArray<ATrafficVehicleController*> Nearby =
-				In.TrafficSubsystem->GetNearbyVehicles(In.VehicleLocation, In.DetectionDistance);
+			const TArray<TWeakObjectPtr<ATrafficVehicleController>>& LaneVehicles =
+				In.TrafficSubsystem->GetVehiclesOnLane(In.CurrentLane);
 
 			float BestDist = MAX_FLT;
 			float BestSpeed = 0.0f;
 
-			for (const ATrafficVehicleController* Other : Nearby)
+			for (const TWeakObjectPtr<ATrafficVehicleController>& WeakOther : LaneVehicles)
 			{
+				const ATrafficVehicleController* Other = WeakOther.Get();
 				if (!Other || Other->GetPawn() == In.ControlledPawn) { continue; }
 				const APawn* OP = Other->GetPawn();
 				if (!OP) { continue; }

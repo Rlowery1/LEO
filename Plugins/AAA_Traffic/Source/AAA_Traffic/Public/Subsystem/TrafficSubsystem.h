@@ -96,6 +96,7 @@ struct FCanonicalMovementRecord
 	int32 TraversalReleaseIndex = INDEX_NONE;
 	int32 ExitLaneResumeIndex = INDEX_NONE;
 	TArray<int32> ConflictMovementIds;
+	bool bHasProximityConflicts = false;
 	uint32 ValidationFlags = 0;
 	ECanonicalMovementSourceKind SourceKind = ECanonicalMovementSourceKind::ProviderDerived;
 #if !UE_BUILD_SHIPPING
@@ -237,6 +238,9 @@ public:
 	/** Returns true if the given controller currently has an occupancy entry for JunctionId. */
 	bool HasJunctionOccupancy(int32 JunctionId, const ATrafficVehicleController* Controller) const;
 
+	/** Returns true if any vehicle currently occupies the given junction. */
+	bool IsJunctionOccupied(int32 JunctionId) const;
+
 	/**
 	 * Check whether any other vehicle approaching the same junction has a
 	 * conflicting path AND is going straight (higher priority than a turner).
@@ -276,6 +280,12 @@ public:
 
 	/** Get the sorted movement IDs compiled for an approach lane. */
 	const TArray<int32>& GetCanonicalMovementsForApproachLane(int32 ApproachLaneId) const;
+
+	/** Get read-only access to all canonical movements (for debug drawing). */
+	const TMap<int32, FCanonicalMovementRecord>& GetAllCanonicalMovements() const { return CanonicalMovementTable; }
+
+	/** Rebuild the junction survey and canonical movement table using the current provider state. */
+	void RebuildJunctionSurvey();
 
 	// --- Stop-Sign FIFO Queue ---
 
@@ -325,6 +335,24 @@ public:
 	/** If true, vehicles at a dead-end that have fully stopped will be despawned. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|Lifecycle")
 	bool bDespawnDeadEndVehicles;
+
+	// --- LOD configuration ---
+
+	/** Distance (cm) at which a vehicle is promoted to Full LOD (closest to player). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|LOD", meta = (ClampMin = "1000"))
+	float FullLODPromoteDistance = 10000.0f;
+
+	/** Distance (cm) beyond which a vehicle is demoted from Full LOD (hysteresis band). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|LOD", meta = (ClampMin = "1000"))
+	float FullLODDemoteDistance = 11000.0f;
+
+	/** Distance (cm) at which a vehicle is promoted to Reduced LOD. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|LOD", meta = (ClampMin = "5000"))
+	float ReducedLODPromoteDistance = 30000.0f;
+
+	/** Distance (cm) beyond which a vehicle is demoted to Minimal LOD (hysteresis band). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic|LOD", meta = (ClampMin = "5000"))
+	float ReducedLODDemoteDistance = 33000.0f;
 
 	/** Empty array returned by GetLegalExits when no data exists. */
 	static const TArray<FJunctionExitRule> EmptyExitRules;
