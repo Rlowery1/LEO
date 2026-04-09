@@ -453,6 +453,16 @@ void ATrafficVehicleController::OnPossess(APawn* InPawn)
 		// When the pawn physically hits another actor, start a brief
 		// full-braking period so the vehicle doesn't just keep pushing.
 		InPawn->OnActorHit.AddDynamic(this, &ATrafficVehicleController::HandleActorHit);
+
+		// Reset collision state and begin spawn grace window.
+		// Vehicles can spawn overlapping other actors, generating a
+		// physics impulse on the first frame.  Without the grace window
+		// this immediately triggers CollisionBrakeTimer, trapping the
+		// vehicle at zero throttle for up to 1 second and causing
+		// STUCK test failures.
+		CollisionBrakeTimer = 0.0f;
+		bCollisionWithVehicle = false;
+		SpawnGraceTimer = 0.5f;
 	}
 	else
 	{

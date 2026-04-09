@@ -121,8 +121,17 @@ FSteeringOutput FSteeringComputer::Compute(const FSteeringInput& In)
 
 	// ── Combine ──────────────────────────────────────────────
 	// CTE is SUBTRACTED — positive CTE (right of center) steers left.
+	//
+	// When the vehicle is far off-center, pure pursuit can fight the
+	// CTE correction (heading toward a target that appears to be on
+	// the opposite side from the lane center).  Attenuate the heading
+	// term as |CTE| grows so lane-centering takes priority over
+	// heading alignment during recovery.
+	const float AbsCTENorm = FMath::Abs(CTENormalized);
+	const float PPAttenuation = FMath::Clamp(1.0f - AbsCTENorm * 0.8f, 0.2f, 1.0f);
+
 	Out.SteeringInput = FMath::Clamp(
-		Out.FeedforwardTerm + Out.PurePursuitTerm - Out.CTETerm + Out.DerivativeTerm,
+		Out.FeedforwardTerm + Out.PurePursuitTerm * PPAttenuation - Out.CTETerm + Out.DerivativeTerm,
 		-1.0f, 1.0f);
 
 	return Out;

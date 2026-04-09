@@ -426,6 +426,12 @@ private:
 	/** Junction ID → vehicles currently traversing it (multi-vehicle). */
 	TMap<int32, TArray<FJunctionOccupant>> JunctionOccupancy;
 
+	/** Recent junction releases — used to enforce a brief cooldown before
+	 *  granting a conflicting movement, preventing the gap between junction
+	 *  release and physical body clearance from causing collisions.
+	 *  Key = JunctionId, Value = array of {MovementId, ReleaseTime}. */
+	TMap<int32, TArray<TPair<int32, double>>> JunctionReleaseCooldowns;
+
 	// --- Stop-sign FIFO queues ---
 
 	/** Junction ID → ordered list of vehicles that completed their mandatory stop.

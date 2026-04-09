@@ -866,6 +866,10 @@ return;
 
 	// Reactive collision handler -- if we physically collided, override to
 	// full braking for the duration of CollisionBrakeTimer.
+	if (SpawnGraceTimer > 0.0f)
+	{
+		SpawnGraceTimer -= DeltaSeconds;
+	}
 	if (CollisionBrakeTimer > 0.0f)
 	{
 		CollisionBrakeTimer -= DeltaSeconds;

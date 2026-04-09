@@ -413,6 +413,39 @@ bool UTrafficSubsystem::TryOccupyJunction(int32 JunctionId,
 		}
 	}
 
+	// Release cooldown: deny if a recently-released movement conflicts
+	// with the requesting movement.  This covers the gap between junction
+	// release and physical body clearance — the departed vehicle's rear
+	// may still be in the junction area for a fraction of a second.
+	constexpr double JunctionReleaseCooldownSec = 0.5;
+	if (TArray<TPair<int32, double>>* Cooldowns = JunctionReleaseCooldowns.Find(JunctionId))
+	{
+		// Purge expired entries.
+		Cooldowns->RemoveAll([NowSec, JunctionReleaseCooldownSec](const TPair<int32, double>& CD)
+		{
+			return (NowSec - CD.Value) >= JunctionReleaseCooldownSec;
+		});
+		if (Cooldowns->Num() == 0)
+		{
+			JunctionReleaseCooldowns.Remove(JunctionId);
+		}
+		else
+		{
+			for (const TPair<int32, double>& CD : *Cooldowns)
+			{
+				if (MovementRecord->ConflictMovementIds.Contains(CD.Key))
+				{
+					UE_LOG(LogAAATraffic, Warning,
+						TEXT("JNCT TryOccupy: JunctionId=%d Caller='%s' Movement=%d — "
+							 "DENIED (release cooldown: conflicting movement %d released %.2fs ago)"),
+						JunctionId, *CallerName, MovementRecord->MovementId,
+						CD.Key, NowSec - CD.Value);
+					return false;
+				}
+			}
+		}
+	}
+
 	// Queue spillback / "Don't Block the Box":
 	// If the exit lane is already congested, deny entry to prevent the
 	// vehicle from blocking the junction when it can't clear.
@@ -535,6 +568,17 @@ void UTrafficSubsystem::ReleaseJunction(int32 JunctionId, ATrafficVehicleControl
 
 	if (TArray<FJunctionOccupant>* Occupants = JunctionOccupancy.Find(JunctionId))
 	{
+		// Capture movement ID before removing so we can record cooldown.
+		int32 ReleasedMovementId = INDEX_NONE;
+		for (const FJunctionOccupant& O : *Occupants)
+		{
+			if (O.Controller.Get() == Controller)
+			{
+				ReleasedMovementId = O.MovementId;
+				break;
+			}
+		}
+
 		const int32 Removed = Occupants->RemoveAll([Controller](const FJunctionOccupant& O)
 		{
 			return O.Controller.Get() == Controller;
@@ -545,6 +589,15 @@ void UTrafficSubsystem::ReleaseJunction(int32 JunctionId, ATrafficVehicleControl
 			UE_LOG(LogAAATraffic, Warning,
 				TEXT("JNCT Release: JunctionId=%d Caller='%s' — RELEASED (%d remaining occupants)"),
 				JunctionId, *CallerName, Occupants->Num());
+
+			// Record cooldown so TryOccupyJunction can deny conflicting
+			// movements for a brief period after this release.
+			if (ReleasedMovementId != INDEX_NONE)
+			{
+				const double NowSec = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+				TArray<TPair<int32, double>>& Cooldowns = JunctionReleaseCooldowns.FindOrAdd(JunctionId);
+				Cooldowns.Emplace(ReleasedMovementId, NowSec);
+			}
 
 			// Clean up empty junctions.
 			if (Occupants->Num() == 0)

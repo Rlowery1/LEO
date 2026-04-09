@@ -995,6 +995,11 @@ protected:
 	/** True when the most recent collision was with another Pawn (vehicle-vehicle). */
 	bool bCollisionWithVehicle = false;
 
+	/** Remaining seconds of spawn grace — collisions are ignored during this
+	 *  window to prevent spawn overlaps from triggering the brake timer and
+	 *  trapping the vehicle at zero throttle. */
+	float SpawnGraceTimer = 0.0f;
+
 	// ── IDM Runtime State ───────────────────────────────────
 
 	/** IDM+ acceleration model — owns delay buffer, smoothing, personality. */

@@ -229,14 +229,14 @@ ATrafficVehicleController::ATrafficVehicleController()
 	, LookAheadTimeSec(0.6f)
 	, MinLookAheadDistanceCm(300.0f)
 	, SteeringDampingFactor(0.5f)
-	, CTECorrectionGain(0.3f)
+	, CTECorrectionGain(2.0f)
 	, LateralAccelBudgetCmPerSec2(294.0f)
 	, CurveSpeedSafetyFactor(0.85f)
 	, CurveScanWindowSize(5)
 	, FollowingTimeSec(1.5f)
 	, MinFollowingDistanceCm(200.0f)
 	, DetectionTimeSec(4.0f)
-	, MinDetectionDistanceCm(1500.0f)
+	, MinDetectionDistanceCm(2500.0f)
 	, IDMMaxAccelCmPerSec2(150.0f)
 	, IDMComfortDecelCmPerSec2(300.0f)
 	, IDMReactionDelaySec(0.3f)
@@ -727,8 +727,33 @@ void ATrafficVehicleController::HandleActorHit(
 	if (!OtherActor || OtherActor == SelfActor) return;
 
 	// Ignore physics debris (destructible pieces from vehicle damage).
-	// These are not traffic-relevant obstacles.
-	if (OtherActor->GetName().Contains(TEXT("DestructiblePiece"))) return;
+	// These are not traffic-relevant obstacles.  Catch both the legacy
+	// "DestructiblePiece" naming and the DD_Vehicles "DP_" prefix for
+	// detached doors/panels.
+	{
+		const FString& OtherName = OtherActor->GetName();
+		if (OtherName.Contains(TEXT("DestructiblePiece")) || OtherName.StartsWith(TEXT("DP_")))
+		{
+			return;
+		}
+	}
+
+	// Only brake for vehicle-vehicle collisions (other Pawns).
+	// Collisions with road geometry, guardrails, or static meshes should
+	// not trigger emergency braking — the steering PID handles recovery.
+	if (!OtherActor->IsA<APawn>()) return;
+
+	// Ignore collisions during spawn grace window. Vehicles can spawn
+	// overlapping other actors, generating impulses on the first frame
+	// that would trap the vehicle at zero throttle via CollisionBrakeTimer.
+	if (SpawnGraceTimer > 0.0f) return;
+
+	// If already collision-braking, ignore new impacts.  Without this,
+	// overlapping vehicles generate continuous impulses every physics
+	// frame, resetting CollisionBrakeTimer to 1.0 via the Max() below
+	// and preventing it from ever reaching zero — permanently trapping
+	// both vehicles at full brake.
+	if (CollisionBrakeTimer > 0.0f) return;
 
 	// Only react to meaningful impacts (impulse > 5 kN).
 	if (NormalImpulse.SizeSquared() < 5000.0f * 5000.0f) return;
@@ -741,7 +766,7 @@ void ATrafficVehicleController::HandleActorHit(
 		FVector2f(5000.0f, 50000.0f),
 		FVector2f(0.1f, 1.0f),
 		Impulse);
-	CollisionBrakeTimer = FMath::Max(CollisionBrakeTimer, BrakeTime);
+	CollisionBrakeTimer = BrakeTime;
 
 	// Track whether this was a vehicle-vehicle collision (other actor is a Pawn).
 	bCollisionWithVehicle = bCollisionWithVehicle || OtherActor->IsA<APawn>();

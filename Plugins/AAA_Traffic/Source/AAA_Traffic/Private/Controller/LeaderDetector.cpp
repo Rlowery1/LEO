@@ -208,9 +208,56 @@ FLeaderDetectorOutput FLeaderDetector::Detect(const FLeaderDetectorInput& In) co
 	}
 	else if (In.TickLOD == ETrafficLOD::Minimal)
 	{
-		// Minimal LOD: no leader detection to preserve frame budget.
-		Out.LeaderDist = -1.0f;
-		Out.LeaderSpeed = 0.0f;
+		// Minimal LOD: same-lane analytical detection (same as Reduced).
+		// Prevents rear-end collisions for vehicles far from the player camera.
+		if (In.TrafficSubsystem && In.CurrentLane.IsValid())
+		{
+			const TArray<TWeakObjectPtr<ATrafficVehicleController>>& LaneVehicles =
+				In.TrafficSubsystem->GetVehiclesOnLane(In.CurrentLane);
+
+			float BestDist = MAX_FLT;
+			float BestSpeed = 0.0f;
+
+			for (const TWeakObjectPtr<ATrafficVehicleController>& WeakOther : LaneVehicles)
+			{
+				const ATrafficVehicleController* Other = WeakOther.Get();
+				if (!Other || Other->GetPawn() == In.ControlledPawn) { continue; }
+				const APawn* OP = Other->GetPawn();
+				if (!OP) { continue; }
+
+				if (FVector::DotProduct(OP->GetActorForwardVector(),
+						In.VehicleForward) < 0.0f)
+				{
+					continue;
+				}
+
+				const FVector Delta = OP->GetActorLocation() - In.VehicleLocation;
+				const float Dist = Delta.Size();
+				if (Dist < KINDA_SMALL_NUMBER
+					|| FVector::DotProduct(Delta / Dist, In.VehicleForward) < 0.5f)
+				{
+					continue;
+				}
+				if (Dist < BestDist)
+				{
+					BestDist = Dist;
+					if (const UPawnMovementComponent* OtherMC = OP->GetMovementComponent())
+					{
+						BestSpeed = FVector::DotProduct(OtherMC->Velocity, In.VehicleForward);
+					}
+					else
+					{
+						BestSpeed = 0.0f;
+					}
+				}
+			}
+
+			if (BestDist < In.DetectionDistance)
+			{
+				Out.LeaderDist = FMath::Max(BestDist - In.VehicleFrontExtent - In.VehicleRearExtent, 1.0f);
+				Out.LeaderSpeed = BestSpeed;
+			}
+		}
 	}
 
 	// Brake-light perception.
